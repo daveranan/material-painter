@@ -47,6 +47,7 @@ mod project_io;
 mod shelf_previews;
 mod mode_icons;
 mod texture_sets;
+mod mesh_set;
 
 use export_ui::{ExportDialog, open_in_file_browser};
 use graph_ui::GraphStore;
@@ -527,6 +528,14 @@ pub struct PainterApp {
     project_path: Option<std::path::PathBuf>,
     /// Undo state at the last save (see `UndoStack::state_serial`).
     saved_serial: u64,
+    /// When the last paced frame began (see `pace_frame`).
+    frame_start: Instant,
+    /// Frames drawn since start (get_state: measures the frame rate).
+    frames: u64,
+    /// The last frame was paced (steady rate on, window focused).
+    paced: bool,
+    /// Other meshes sharing the layer stack (see `mesh_set`).
+    mesh_set: mesh_set::MeshSet,
     /// An action waiting for "save changes?" to be answered.
     confirm: Option<Action>,
     /// The window may close: changes were saved or discarded.
@@ -1695,6 +1704,10 @@ impl PainterApp {
             mcp_env_waiters: Vec::new(),
             project_path: None,
             saved_serial: 0,
+            frame_start: Instant::now(),
+            frames: 0,
+            paced: false,
+            mesh_set: Default::default(),
             confirm: None,
             allow_close: false,
             recent: project_io::load_recent(),
@@ -1892,11 +1905,40 @@ impl PainterApp {
         }
     }
 
+    /// Steady frame rate (Preferences > Performance): frames come at the
+    /// chosen rate (at most 30 fps while the window isn't focused), never faster (hover bursts
+    /// wait) and never slower (idle keeps drawing). Variable refresh
+    /// monitors follow the frame rate, and its jumps make them flicker.
+    fn pace_frame(&mut self, ctx: &egui::Context) {
+        let (focused, minimized) = ctx.input(|i| (i.viewport().focused.unwrap_or(true), i.viewport().minimized.unwrap_or(false)));
+        // In the background a slower steady rate still avoids bursts, for less work.
+        let fps = if focused { self.prefs.frame_rate } else { self.prefs.frame_rate.min(30) };
+        self.paced = fps > 0 && !minimized;
+        if !self.paced {
+            self.frame_start = Instant::now();
+            return;
+        }
+        let period = std::time::Duration::from_secs_f64(1.0 / fps as f64);
+        let next = self.frame_start + period;
+        let now = Instant::now();
+        if next > now {
+            std::thread::sleep(next - now);
+        }
+        // A frame that ran long starts the next period from now, not behind.
+        self.frame_start = if now > next + period { Instant::now() } else { next };
+        // The sleep above sets the pace; asking right away keeps it exact.
+        ctx.request_repaint();
+    }
+
     fn load_mesh(&mut self, mesh: Mesh, ctx: &egui::Context) {
         if self.stroke.is_some() {
             return;
         }
         self.mesh_source = Arc::new(mesh);
+        // A new mesh replaces the mesh set (a project restores its own after).
+        if self.mesh_set.is_on() {
+            self.mesh_set = Default::default();
+        }
         self.install_mesh(true, ctx);
         self.status = match self.mesh.sets.len() {
             1 => format!("Loaded '{}' ({} triangles).", self.mesh.name, self.mesh.triangle_count()),
@@ -6215,8 +6257,10 @@ impl PainterApp {
 
 impl eframe::App for PainterApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let start = Instant::now();
         let ctx = ui.ctx().clone();
+        self.pace_frame(&ctx);
+        self.frames += 1;
+        let start = Instant::now();
         self.ppp = ctx.pixels_per_point();
         { let t_ = Instant::now(); let _ = self.rs.device.poll(wgpu::PollType::Poll); if self.profile { self.prof.push(("rs.device.poll".into(), t_.elapsed().as_secs_f32() * 1000.0)); } }
         { let t_ = Instant::now(); self.undo.update(); if self.profile { self.prof.push(("undo.update".into(), t_.elapsed().as_secs_f32() * 1000.0)); } }

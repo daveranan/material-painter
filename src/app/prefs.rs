@@ -86,7 +86,14 @@ pub struct Preferences {
     pub mcp_port: u16,
     // Performance
     pub gpu: Gpu,
+    /// Frames per second drawn steadily (at most 30 in the background); 0
+    /// draws only when something changes. Steady frames keep variable
+    /// refresh (G-Sync, FreeSync) from flickering as the rate jumps.
+    pub frame_rate: u32,
 }
+
+/// The frame rates offered (0: only when something changes).
+pub const FRAME_RATES: [u32; 6] = [0, 30, 60, 90, 120, 144];
 
 impl Default for Preferences {
     fn default() -> Self {
@@ -125,6 +132,7 @@ impl Default for Preferences {
             show_welcome: true,
             mcp_port: crate::mcp::DEFAULT_PORT,
             gpu: Gpu::Auto,
+            frame_rate: 60,
         }
     }
 }
@@ -181,6 +189,7 @@ impl Preferences {
             "show_welcome": self.show_welcome,
             "mcp_port": self.mcp_port,
             "gpu": self.gpu.key(),
+            "frame_rate": self.frame_rate,
         })
     }
 
@@ -229,6 +238,7 @@ impl Preferences {
             mcp_on_start: b("mcp_on_start", d.mcp_on_start),
             show_welcome: b("show_welcome", d.show_welcome),
             mcp_port: u("mcp_port", d.mcp_port as u64, 1024, 65000) as u16,
+            frame_rate: v["frame_rate"].as_u64().map(|x| x as u32).filter(|x| FRAME_RATES.contains(x)).unwrap_or(d.frame_rate),
             gpu: v["gpu"].as_str().and_then(|k| Gpu::ALL.into_iter().find(|g| g.key() == k)).unwrap_or(d.gpu),
         }
     }
@@ -348,7 +358,7 @@ impl PainterApp {
                 (p.export_size, p.export_padding, p.export_open_folder) = (d.export_size, d.export_padding, d.export_open_folder);
             }
             Page::Agents => (p.mcp_on_start, p.mcp_port) = (d.mcp_on_start, d.mcp_port),
-            Page::Performance => p.gpu = d.gpu,
+            Page::Performance => (p.gpu, p.frame_rate) = (d.gpu, d.frame_rate),
         }
     }
 
@@ -468,6 +478,15 @@ impl PainterApp {
                 hint(ui, "Takes effect on the next start.");
                 let info = self.rs.adapter.get_info();
                 labeled(ui, "Current", |ui| ui.label(format!("{} ({:?})", info.name, info.backend)));
+                let fps_name = |r: u32| if r == 0 { "Only on change".to_string() } else { format!("Steady {r} fps") };
+                labeled(ui, "Frame rate", |ui| {
+                    egui::ComboBox::from_id_salt("pref fps").selected_text(fps_name(p.frame_rate)).width(240.0).show_ui(ui, |ui| {
+                        for r in FRAME_RATES {
+                            ui.selectable_value(&mut p.frame_rate, r, fps_name(r));
+                        }
+                    });
+                });
+                hint(ui, "At most 30 fps while the window is in the background. A steady rate stops G-Sync / FreeSync monitors flickering when hovering or idling; only on change uses the least power.");
             }
         }
     }

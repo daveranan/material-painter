@@ -667,6 +667,42 @@ pub(super) fn generator_from(v: &Value) -> Result<Generator, String> {
     })
 }
 
+/// A mesh's part of a project; `base` prefixes its files in a text project.
+fn mesh_json(w: &mut Writer, mesh: &Mesh, base: &str, auto_smooth: Option<f32>) -> Value {
+    json!({
+        "auto_smooth": auto_smooth,
+        "name": mesh.name,
+        "center": mesh.center.to_array(),
+        "scale": mesh.scale,
+        "vertices": w.blob(bytemuck::cast_slice(&mesh.vertices), &format!("{base}/vertices")),
+        "indices": w.blob(bytemuck::cast_slice(&mesh.indices), &format!("{base}/indices")),
+        "objects": mesh.objects,
+        "tri_object": w.blob(bytemuck::cast_slice(&mesh.tri_object), &format!("{base}/tri_object")),
+        "tri_color": mesh.tri_color.as_ref().map(|c| w.blob(bytemuck::cast_slice(c), &format!("{base}/tri_color"))),
+    })
+}
+
+/// A saved mesh (see `mesh_json`) from its decoded vertices and indices.
+fn mesh_from(r: &Reader, m: &Value, vertices: Vec<Vertex>, indices: Vec<u32>) -> Result<Mesh, String> {
+    let center = glam::Vec3::from_array(arr(m, "center", [0.0; 3]));
+    let tris = indices.len() / 3;
+    let mut mesh = Mesh::from_saved(s(m, "name").unwrap_or("Mesh").to_string(), vertices, indices, center, f(m, "scale", 1.0));
+    if let Some(names) = m["objects"].as_array() {
+        let tri_object: Vec<u32> = bytemuck::pod_collect_to_vec(&r.blob(&m["tri_object"])?);
+        if tri_object.len() == tris && tri_object.iter().all(|&o| (o as usize) < names.len()) {
+            mesh.objects = names.iter().map(|n| n.as_str().unwrap_or("").to_string()).collect();
+            mesh.tri_object = tri_object;
+        }
+    }
+    if !m["tri_color"].is_null() {
+        let colors: Vec<[u8; 3]> = r.blob(&m["tri_color"])?.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect();
+        if colors.len() == tris {
+            mesh.tri_color = Some(colors);
+        }
+    }
+    Ok(mesh)
+}
+
 impl PainterApp {
     /// `name` names the file in a text project, e.g. `set0/layer3_color`.
     fn tex_json(&self, w: &mut Writer, t: &Tex, name: &str) -> Value {
@@ -698,6 +734,108 @@ impl PainterApp {
             return Err(format!("{label} texture has the wrong size"));
         }
         Ok(self.engine.texture_from_bytes(label, format, w, h, &bytes))
+    }
+
+    /// The mesh set: each member's name, file and auto smooth; the others'
+    /// meshes and paint (the shown one's are the project's own).
+    fn mesh_set_json(&self, w: &mut Writer) -> Value {
+        const CHANNELS: [&str; 4] = ["color", "roughness", "metallic", "height"];
+        let ms = &self.mesh_set;
+        if !ms.is_on() {
+            return Value::Null;
+        }
+        let mut members = Vec::new();
+        for (k, m) in ms.members.iter().enumerate() {
+            let mut v = json!({"id": m.id, "name": m.name, "path": m.path, "auto_smooth": m.auto_smooth});
+            if k != ms.active {
+                let base = format!("meshset/m{}", m.id);
+                v["mesh"] = mesh_json(w, &m.source, &format!("{base}/mesh"), m.auto_smooth);
+                // Layers deleted since have nothing to keep.
+                let mut ids: Vec<u64> = m.uv.layers.keys().copied().filter(|id| self.engine.layers.iter().any(|l| l.id == *id)).collect();
+                ids.sort();
+                let mut layers = Vec::new();
+                for id in ids {
+                    let l = &m.uv.layers[&id];
+                    let lb = format!("{base}/layer{id}");
+                    let channels = l.channels.as_ref().map(|ch| {
+                        ch.iter()
+                            .zip(CHANNELS)
+                            .map(|(t, c)| t.as_ref().map_or(Value::Null, |t| self.tex_json(w, t, &format!("{lb}_{c}"))))
+                            .collect::<Vec<_>>()
+                    });
+                    let mask = l.mask.as_ref().map(|t| self.tex_json(w, t, &format!("{lb}_mask")));
+                    layers.push(json!({"id": id, "channels": channels, "mask": mask}));
+                }
+                v["layers"] = json!(layers);
+                let mut fixes = Vec::new();
+                for (i, t) in m.uv.map_fix.iter().flat_map(|f| f.iter().enumerate()) {
+                    if let Some(t) = t {
+                        fixes.push(json!({"map": i, "texture": self.tex_json(w, t, &format!("{base}/fix{i}"))}));
+                    }
+                }
+                v["map_fixes"] = json!(fixes);
+            }
+            members.push(v);
+        }
+        json!({"shown": ms.active, "next_id": ms.next_id, "members": members})
+    }
+
+    /// Restores a saved mesh set around the mesh just loaded (the shown member).
+    fn mesh_set_from(&mut self, r: &Reader, v: &Value) -> Result<(), String> {
+        use super::mesh_set::{Member, MeshSet};
+        use crate::engine::uv_data::{LayerUv, UvData};
+        let Some(list) = v["members"].as_array() else { return Ok(()) };
+        let shown = v["shown"].as_u64().unwrap_or(0) as usize;
+        let mut set = MeshSet { active: shown.min(list.len().saturating_sub(1)), ..Default::default() };
+        for (k, mv) in list.iter().enumerate() {
+            let id = mv["id"].as_u64().unwrap_or(k as u64);
+            let auto_smooth = mv["auto_smooth"].as_f64().map(|a| (a as f32).clamp(1.0, 180.0));
+            let name = s(mv, "name").unwrap_or("Mesh").to_string();
+            let path = s(mv, "path").map(PathBuf::from);
+            let (source, uv) = if k == set.active {
+                (self.mesh_source.clone(), UvData::default())
+            } else {
+                let m = &mv["mesh"];
+                let vertices: Vec<Vertex> = bytemuck::pod_collect_to_vec(&r.blob(&m["vertices"])?);
+                let indices: Vec<u32> = bytemuck::pod_collect_to_vec(&r.blob(&m["indices"])?);
+                if indices.iter().any(|&i| i as usize >= vertices.len()) {
+                    return Err(format!("mesh set member '{name}' is damaged"));
+                }
+                let mesh = mesh_from(r, m, vertices, indices)?;
+                let mut uv = UvData::default();
+                for lv in mv["layers"].as_array().into_iter().flatten() {
+                    let Some(lid) = lv["id"].as_u64() else { continue };
+                    let channels = match lv["channels"].as_array() {
+                        Some(ch) => {
+                            let mut out: [Option<crate::gpu::Tex>; 4] = Default::default();
+                            for (i, c) in ch.iter().enumerate().take(4) {
+                                if !c.is_null() {
+                                    out[i] = Some(self.tex_from(r, c, "paint")?);
+                                }
+                            }
+                            Some(out)
+                        }
+                        None => None,
+                    };
+                    let mask = if lv["mask"].is_null() { None } else { Some(self.tex_from(r, &lv["mask"], "mask")?) };
+                    uv.layers.insert(lid, LayerUv { channels, mask });
+                }
+                let mut fix: [Option<crate::gpu::Tex>; crate::engine::MAP_COUNT] = Default::default();
+                for fv in mv["map_fixes"].as_array().into_iter().flatten() {
+                    let map = fv["map"].as_u64().unwrap_or(u64::MAX) as usize;
+                    if map < fix.len() {
+                        fix[map] = Some(self.tex_from(r, &fv["texture"], "map fix")?);
+                    }
+                }
+                uv.map_fix = Some(fix);
+                (std::sync::Arc::new(mesh), uv)
+            };
+            set.next_id = set.next_id.max(id + 1);
+            set.members.push(Member { id, name, path, source, auto_smooth, uv });
+        }
+        set.next_id = set.next_id.max(v["next_id"].as_u64().unwrap_or(0));
+        self.mesh_set = set;
+        Ok(())
     }
 
     /// One texture set's part of a project; `set` is its index.
@@ -773,6 +911,7 @@ impl PainterApp {
         self.project_path = Some(path.to_path_buf());
         self.saved_serial = self.undo.state_serial();
         self.saved_auto_smooth = self.auto_smooth;
+        self.mesh_set.modified = false;
         self.status = format!("Saved {} ({:.1} MB).", path.display(), bytes as f64 / 1048576.0);
         self.remember_recent(path);
         remove_autosave();
@@ -801,18 +940,8 @@ impl PainterApp {
         let text = is_text_project(path);
         let mut w = Writer { blobs: Vec::new(), files: text.then(Vec::new) };
         // The imported mesh; auto smooth is a setting applied to it on open.
-        let mesh = &self.mesh_source;
-        let mesh_json = json!({
-            "auto_smooth": self.auto_smooth,
-            "name": mesh.name,
-            "center": mesh.center.to_array(),
-            "scale": mesh.scale,
-            "vertices": w.blob(bytemuck::cast_slice(&mesh.vertices), "mesh/vertices"),
-            "indices": w.blob(bytemuck::cast_slice(&mesh.indices), "mesh/indices"),
-            "objects": mesh.objects,
-            "tri_object": w.blob(bytemuck::cast_slice(&mesh.tri_object), "mesh/tri_object"),
-            "tri_color": mesh.tri_color.as_ref().map(|c| w.blob(bytemuck::cast_slice(c), "mesh/tri_color")),
-        });
+        let mesh_json = mesh_json(&mut w, &self.mesh_source, "mesh", self.auto_smooth);
+        let mesh_set = self.mesh_set_json(&mut w);
         // Every texture set: its layers, size and mesh-map corrections.
         let engines = super::texture_sets::engines(&self.engine, &self.sets, self.mesh.sets.len());
         let sets: Vec<Value> = self
@@ -878,6 +1007,7 @@ impl PainterApp {
             // 3: texture sets (layers, size and map fixes per set).
             "version": 3,
             "mesh": mesh_json,
+            "mesh_set": mesh_set,
             "texture_sets": sets,
             "active_set": self.sets.active,
             "graphs": self.graphs.to_json(&self.used_graphs()),
@@ -1076,22 +1206,7 @@ impl PainterApp {
         if indices.iter().any(|&i| i as usize >= vertices.len()) {
             return Err(bad());
         }
-        let center = glam::Vec3::from_array(arr(m, "center", [0.0; 3]));
-        let tris = indices.len() / 3;
-        let mut mesh = Mesh::from_saved(s(m, "name").unwrap_or("Mesh").to_string(), vertices, indices, center, f(m, "scale", 1.0));
-        if let Some(names) = m["objects"].as_array() {
-            let tri_object: Vec<u32> = bytemuck::pod_collect_to_vec(&r.blob(&m["tri_object"])?);
-            if tri_object.len() == tris && tri_object.iter().all(|&o| (o as usize) < names.len()) {
-                mesh.objects = names.iter().map(|n| n.as_str().unwrap_or("").to_string()).collect();
-                mesh.tri_object = tri_object;
-            }
-        }
-        if !m["tri_color"].is_null() {
-            let colors: Vec<[u8; 3]> = r.blob(&m["tri_color"])?.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect();
-            if colors.len() == tris {
-                mesh.tri_color = Some(colors);
-            }
-        }
+        let mut mesh = mesh_from(&r, m, vertices, indices)?;
         let bv = &manifest["bake"];
         let mut bs = crate::bake::BakeSettings::default();
         if let Some(q) = s(bv, "quality") {
@@ -1190,6 +1305,9 @@ impl PainterApp {
             self.selected = sv["selected"].as_u64().map_or(0, |x| x as usize).min(self.engine.layers.len().saturating_sub(1));
         }
         self.switch_set(manifest["active_set"].as_u64().map_or(0, |x| x as usize).min(set_count - 1));
+        if set_count == 1 {
+            self.mesh_set_from(&r, &manifest["mesh_set"])?;
+        }
         self.repush_graphs();
         self.view_from(&manifest["view"], ctx);
 
@@ -1275,7 +1393,7 @@ impl PainterApp {
 
     /// Unsaved edits since the last save or open.
     pub(super) fn is_modified(&self) -> bool {
-        self.undo.state_serial() != self.saved_serial || self.engine.has_uncommitted_props() || self.auto_smooth != self.saved_auto_smooth
+        self.undo.state_serial() != self.saved_serial || self.engine.has_uncommitted_props() || self.auto_smooth != self.saved_auto_smooth || self.mesh_set.modified
     }
 
     pub(super) fn save_dialog(&self) -> Option<PathBuf> {

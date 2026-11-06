@@ -180,14 +180,35 @@ impl PainterApp {
     /// The texture set list: click a set to edit it.
     pub(super) fn texture_set_list(&mut self, ui: &mut egui::Ui) {
         let mut pick = None;
+        let mut toggle = None;
+        let hidden: Vec<bool> = self.set_engines().iter().map(|e| e.hidden).collect();
         for (k, set) in self.mesh.sets.iter().enumerate() {
             let tris = set.tris.end - set.tris.start;
-            let row = theme::selectable(k == self.sets.active, &set.name).min_size(egui::vec2(ui.available_width(), 22.0));
-            let resp = ui
-                .add(row)
-                .on_hover_text(format!("{} ({tris} triangles). Click to paint this texture set.", set.name));
-            if resp.clicked() {
-                pick = Some(k);
+            ui.horizontal(|ui| {
+                let (icon, col) = if hidden[k] { (crate::icons::EYE_SLASH, theme::TEXT_DIM) } else { (crate::icons::EYE, theme::TEXT) };
+                let eye = ui
+                    .add(egui::Button::new(egui::RichText::new(icon).color(col)).frame(false).min_size(egui::vec2(22.0, 22.0)))
+                    .on_hover_text("Show / hide in the views (Ctrl+click: show only this one)");
+                if eye.clicked() {
+                    toggle = Some((k, ui.input(|i| i.modifiers.command)));
+                }
+                let row = theme::selectable(k == self.sets.active, &set.name).min_size(egui::vec2(ui.available_width(), 22.0));
+                let resp = ui
+                    .add(row)
+                    .on_hover_text(format!("{} ({tris} triangles). Click to paint this texture set.", set.name));
+                if resp.clicked() {
+                    pick = Some(k);
+                }
+            });
+        }
+        if let Some((k, only)) = toggle {
+            let n = self.mesh.sets.len();
+            let others_hidden = (0..n).filter(|&j| j != k).all(|j| hidden[j]);
+            for j in 0..n {
+                let h = if only { !(j == k || others_hidden) } else if j == k { !hidden[k] } else { hidden[j] };
+                if let Some(e) = self.set_engine_mut(j) {
+                    e.hidden = h;
+                }
             }
         }
         if let Some(k) = pick {

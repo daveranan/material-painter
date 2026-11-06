@@ -32,6 +32,7 @@ offscreen with egui_kittest into `target/bake_test/ui/`.
 | `src/app.rs` + `src/app/` | The UI shell: workspaces (Material Paint, Material Designer, Shader Maker), docking (`dock.rs`), panels, input, actions (`Action` enum, processed once per frame), projects (`project_io.rs`), preferences, export window, welcome window |
 | `src/engine.rs` | One texture set: layer stack (paint, fill, folder), masks and mask filters, GPU painting and compositing, undo hooks |
 | `src/app/texture_sets.rs` | Texture sets: one `Engine` per material of the mesh (`Mesh::sets`); the edited one is `PainterApp::engine`, the others are parked. Views, bakes, export and projects cover every set |
+| `src/app/mesh_set.rs` | Mesh sets: several single-set meshes sharing one layer stack, one shown at a time. Switching swaps the mesh (re-bake, usually from the bake cache) and the UV-bound data (`engine/uv_data.rs`: paint channels, paint masks, map fixes); fills, generators and settings stay shared. Saved under `mesh_set` in projects; MCP `mesh_set_add/switch/remove` |
 | `src/bake.rs` | Mesh-map baking: CPU scene prep on a worker thread, then GPU passes pumped a few tiles per frame |
 | `src/bake_cache.rs` | On-disk cache of baked maps, keyed by mesh, settings and the bake code itself |
 | `src/viewport.rs`, `src/post.rs`, `src/raytrace.rs` | 3D and 2D view rendering, post-processing, path-traced preview |

@@ -873,6 +873,38 @@ impl PainterApp {
                 self.run_unchecked(super::Action::Exit, ctx);
                 text("Closing.".to_string())
             }
+            "mesh_set_add" => {
+                let paths = args.get("paths").and_then(Value::as_array).ok_or("missing 'paths'")?;
+                let mut meshes = Vec::new();
+                for p in paths.iter().filter_map(Value::as_str) {
+                    let path = std::path::PathBuf::from(p);
+                    meshes.push((Mesh::load_file(&path)?, Some(path)));
+                }
+                self.mesh_set_add(meshes)?;
+                text(format!("{} {}", self.status, mesh_set_json(&self.mesh_set)))
+            }
+            "mesh_set_switch" | "mesh_set_remove" => {
+                if tool == "mesh_set_remove" && args.get("clear").and_then(Value::as_bool).unwrap_or(false) {
+                    self.mesh_set_clear();
+                    return Ok(text(self.status.clone()));
+                }
+                let ms = &self.mesh_set.members;
+                let k = match (args.get("index").and_then(Value::as_u64), str_arg(args, "name")) {
+                    (Some(i), _) => i as usize,
+                    (None, Some(n)) => ms.iter().position(|m| eq(&m.name, n)).ok_or(format!("no mesh set member '{n}'"))?,
+                    _ => return Err("give 'index' or 'name'".into()),
+                };
+                if k >= ms.len() {
+                    return Err(format!("the mesh set has {} members", ms.len()));
+                }
+                if tool == "mesh_set_remove" {
+                    self.mesh_set_remove(k, ctx);
+                    text(self.status.clone())
+                } else {
+                    self.mesh_set_switch(k, ctx);
+                    if self.bake_job.is_some() { Reply::AfterBake } else { text(self.status.clone()) }
+                }
+            }
             "set_auto_smooth" => {
                 let off = args.get("off").and_then(Value::as_bool).unwrap_or(false);
                 let angle = if off { None } else { Some(f32_arg(args, "angle").ok_or("pass an 'angle' in degrees, or off=true")?) };
@@ -1203,6 +1235,9 @@ impl PainterApp {
             "bake": self.bake_summary(),
             "baking": self.bake_job.is_some(),
             "auto_smooth": self.auto_smooth,
+            "mesh_set": mesh_set_json(&self.mesh_set),
+            "frames_drawn": self.frames,
+            "frame_pacing": {"fps": self.prefs.frame_rate, "active": self.paced},
             "baked_maps": MAPS.iter().map(|m| m.name).collect::<Vec<_>>(),
             "view": {
                 "mode": self.view.mode.name(),
@@ -1219,4 +1254,19 @@ impl PainterApp {
             "status": self.status,
         })
     }
+}
+
+/// The mesh set's members for get_state and tool replies (null: no set).
+fn mesh_set_json(ms: &super::mesh_set::MeshSet) -> Value {
+    if !ms.is_on() {
+        return Value::Null;
+    }
+    let members: Vec<Value> = ms
+        .members
+        .iter()
+        .enumerate()
+        .map(|(k, m)| json!({"index": k, "name": m.name, "path": m.path, "auto_smooth": m.auto_smooth, "shown": k == ms.active}))
+        .collect();
+    let mb = ms.members.iter().map(|m| m.uv.vram_bytes()).sum::<u64>() as f64 / 1048576.0;
+    json!({"shown": ms.active, "members": members, "stashed_paint_mb": (mb * 10.0).round() / 10.0})
 }

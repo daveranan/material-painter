@@ -16,6 +16,8 @@ pub(super) enum Pane {
     Properties,
     MeshMaps,
     TextureSet,
+    /// Meshes sharing the layer stack (`mesh_set`).
+    MeshSet,
     Preview,
     Shelf,
     /// Material Designer: the material on the mesh.
@@ -40,6 +42,7 @@ impl Pane {
             Pane::Properties => (i::GEAR, "Properties"),
             Pane::MeshMaps => (i::FIRE, "Mesh Maps"),
             Pane::TextureSet => (i::GRID_FOUR, "Texture Set"),
+            Pane::MeshSet => (i::CUBE_TRANSPARENT, "Mesh Set"),
             Pane::Preview => (i::APERTURE, "Preview"),
             Pane::Shelf => (i::IMAGES, "Shelf"),
             Pane::DesignView => (i::CUBE, "3D View"),
@@ -68,6 +71,7 @@ fn panes(ws: Workspace) -> &'static [Pane] {
             Pane::Properties,
             Pane::MeshMaps,
             Pane::TextureSet,
+            Pane::MeshSet,
             Pane::Preview,
             Pane::Shelf,
         ],
@@ -97,7 +101,7 @@ fn default_tree(ws: Workspace) -> Tree<Pane> {
             let left = t.insert_vertical_tile(vec![views, shelf]);
             share(&mut t, left, views, 4.0);
             share(&mut t, left, shelf, 1.0);
-            let stack: Vec<TileId> = [Pane::Layers, Pane::MeshMaps, Pane::TextureSet, Pane::Preview].map(|p| t.insert_pane(p)).to_vec();
+            let stack: Vec<TileId> = [Pane::Layers, Pane::MeshMaps, Pane::TextureSet, Pane::MeshSet, Pane::Preview].map(|p| t.insert_pane(p)).to_vec();
             let stack = t.insert_tab_tile(stack);
             let props = t.insert_pane(Pane::Properties);
             let props = t.insert_tab_tile(vec![props]);
@@ -215,6 +219,7 @@ impl Behavior<Pane> for DockBehavior<'_> {
             Pane::Properties => app.properties(ui),
             Pane::MeshMaps => app.mesh_maps_panel(ui),
             Pane::TextureSet => app.texture_set_panel(ui),
+            Pane::MeshSet => app.mesh_set_panel(ui),
             Pane::Preview => app.preview_panel(ui),
             Pane::Shelf => app.shelf_panel(ui),
             Pane::Graph => app.designer_graph_pane(ui),

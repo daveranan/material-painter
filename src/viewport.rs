@@ -936,7 +936,12 @@ impl ViewRenderer {
             pass.set_pipeline(&self.shadow);
             pass.set_vertex_buffer(0, mesh.vertices.slice(..));
             pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
-            pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+            // Hidden texture sets cast no shadow either.
+            for (set, engine) in mesh.sets.iter().zip(engines) {
+                if !engine.hidden {
+                    pass.draw_indexed(set.index_range(), 0, 0..1);
+                }
+            }
         }
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -967,7 +972,10 @@ impl ViewRenderer {
             pass.set_pipeline(self.custom_mesh.as_ref().filter(|_| settings.mode == ViewMode::Material).unwrap_or(&self.mesh));
             pass.set_vertex_buffer(0, mesh.vertices.slice(..));
             pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
-            for (set, bg) in mesh.sets.iter().zip(&bgs) {
+            for ((set, bg), engine) in mesh.sets.iter().zip(&bgs).zip(engines) {
+                if engine.hidden {
+                    continue;
+                }
                 pass.set_bind_group(0, bg, &[]);
                 pass.draw_indexed(set.index_range(), 0, 0..1);
             }

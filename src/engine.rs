@@ -160,6 +160,7 @@ pub const CUSTOM_MAP_VALUE: usize = 1000;
 
 /// Indices into [`GEN_INPUTS`].
 mod thumbs;
+pub mod uv_data;
 
 pub mod gin {
     pub const EDGE: usize = 0;
@@ -1046,6 +1047,9 @@ pub struct Engine {
     /// Composite at a fraction of the size (while a setting is being dragged):
     /// the whole stack in a few milliseconds instead of a full-size pass.
     pub draft: bool,
+    /// Hidden in the views (the texture set list's eye), so it doesn't block
+    /// the parts being worked on. Not saved; exports and bakes ignore it.
+    pub hidden: bool,
     draft_accum: Option<[[Tex; FINAL_CHANNELS]; 2]>,
     draft_below: Vec<[Tex; FINAL_CHANNELS]>,
     /// Which draft set holds the last draft result (none: show the full one).
@@ -1212,6 +1216,7 @@ impl Engine {
             highlight: 0.0,
             solo: None,
             draft: false,
+            hidden: false,
             draft_accum: None,
             draft_below: Vec::new(),
             draft_final: None,

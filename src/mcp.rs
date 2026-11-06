@@ -466,6 +466,21 @@ pub fn tool_list() -> Vec<Value> {
             "Auto smooth: rebuild the mesh's normals from its faces, smooth across edges meeting below `angle` degrees and hard above (tri-planar layers then follow each face). off=true restores the mesh's own normals. Keeps the layers; re-bakes the mesh maps and replies when done. Saved with the project.",
             schema(json!({"angle": {"type": "number", "minimum": 1, "maximum": 180}, "off": {"type": "boolean"}}), &[]),
         ),
+        tool(
+            "mesh_set_add",
+            "Mesh set: add meshes (single texture set each) painted with the current layer stack, one shown at a time. Starts a set with the current mesh when there is none. Fills, generators and settings are shared; each member keeps its own paint, paint masks, auto smooth and mesh maps. See get_state 'mesh_set'.",
+            schema(json!({"paths": {"type": "array", "items": {"type": "string"}}}), &["paths"]),
+        ),
+        tool(
+            "mesh_set_switch",
+            "Mesh set: show a member (by index or name): swaps in its mesh and paint, bakes its mesh maps (from the bake cache when it can) and replies when done. Clears undo history.",
+            schema(json!({"index": {"type": "integer"}, "name": {"type": "string"}}), &[]),
+        ),
+        tool(
+            "mesh_set_remove",
+            "Mesh set: remove a member (by index or name) and its paint; clear=true ends the set, keeping the shown mesh.",
+            schema(json!({"index": {"type": "integer"}, "name": {"type": "string"}, "clear": {"type": "boolean"}}), &[]),
+        ),
         tool("delete_layer", "Delete a layer.", schema(json!({"index": {"type": "integer"}}), &["index"])),
         tool("duplicate_layer", "Duplicate a layer.", schema(json!({"index": {"type": "integer"}}), &["index"])),
         tool(
