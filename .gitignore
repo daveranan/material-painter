@@ -2,3 +2,4 @@
 /dist
 /.playwright-mcp
 /target-agent
+__pycache__/

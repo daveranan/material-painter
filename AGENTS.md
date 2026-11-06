@@ -46,6 +46,7 @@ offscreen with egui_kittest into `target/bake_test/ui/`.
 | `src/undo.rs` | Undo/redo of every document edit |
 | `src/mcp.rs`, `src/app/mcp_tools.rs` | Optional MCP server so AI agents can drive the app (off by default) |
 | `src/theme.rs`, `src/icons.rs` | UI theme (sharp corners, grey palette, blue accent) and Phosphor icon glyphs |
+| `tools/`, `.claude/skills/` | Agent workflow outside the app: Python helpers (ID maps from AI-generated meshes, livery and strata/deposit masks, cliff kits, Blender parity renders) and the `material-painter-agent` / `pbr-texturing-craft` skills that explain driving MP through `mp` |
 
 ## Conventions (follow these)
 
