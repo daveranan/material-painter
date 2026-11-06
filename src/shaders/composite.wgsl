@@ -347,10 +347,15 @@ fn decode_normal(t: vec4<f32>) -> vec3<f32> {
 // `up` are the world directions of the image's right and up, `f` the face
 // direction. Rotating the image coordinates by the layer's rotation rotates
 // the slopes by the same angle.
-fn planar_normal(q: vec2<f32>, lod: f32, r: vec3<f32>, up: vec3<f32>, f: vec3<f32>) -> vec3<f32> {
+fn planar_normal(q: vec2<f32>, lod: f32, r: vec3<f32>, up: vec3<f32>, f: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
     let t = decode_normal(textureSampleLevel(l_normal, rsamp, rot2(q, u.img.y) + u.img.zw, lod));
     let xy = rot2(t.xy, u.img.y);
-    return r * xy.x + up * xy.y + f * t.z;
+    // Whiteout onto the surface normal, in this plane's frame: a flat image
+    // returns the surface normal itself. (Built around the plane's axis
+    // instead, every face not square to an axis came out tilted toward it.)
+    let ln = vec3<f32>(dot(n, r), dot(n, up), abs(dot(n, f)));
+    let o = vec3<f32>(xy + ln.xy, t.z * ln.z);
+    return r * o.x + up * o.y + f * o.z;
 }
 
 // The fill's normal image in this texel's tangent space (the frame the
@@ -373,18 +378,18 @@ fn fill_normal(c: vec2<i32>, uv: vec2<f32>, p: vec3<f32>, n: vec3<f32>, texel_wo
         let q = p * tiling;
         let s = sign(n + vec3<f32>(1e-6));
         // Image axes per projection match fill_image(): x (z, -y), y (x, z), z (x, -y).
-        nw = planar_normal(vec2<f32>(q.z, -q.y), lod, vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(s.x, 0.0, 0.0)) * w.x
-            + planar_normal(q.xz, lod, vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 0.0, -1.0), vec3<f32>(0.0, s.y, 0.0)) * w.y
-            + planar_normal(vec2<f32>(q.x, -q.y), lod, vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(0.0, 0.0, s.z)) * w.z;
+        nw = planar_normal(vec2<f32>(q.z, -q.y), lod, vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(s.x, 0.0, 0.0), n) * w.x
+            + planar_normal(q.xz, lod, vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 0.0, -1.0), vec3<f32>(0.0, s.y, 0.0), n) * w.y
+            + planar_normal(vec2<f32>(q.x, -q.y), lod, vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(0.0, 0.0, s.z), n) * w.z;
     } else if (mode <= 4) {
         let ext = max(max(u.bsize.x, u.bsize.y), max(u.bsize.z, 1e-4));
         let d = (p - (u.bmin.xyz + u.bsize.xyz * 0.5)) / ext;
         let lod = log2(max(texel_world * tiling * size / ext, 1.0));
         let s = sign(n + vec3<f32>(1e-6));
         switch mode {
-            case 2: { nw = planar_normal(vec2<f32>(-d.z, -d.y) * tiling, lod, vec3<f32>(0.0, 0.0, -1.0), vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(s.x, 0.0, 0.0)); }
-            case 3: { nw = planar_normal(vec2<f32>(d.x, d.z) * tiling, lod, vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 0.0, -1.0), vec3<f32>(0.0, s.y, 0.0)); }
-            default: { nw = planar_normal(vec2<f32>(d.x, -d.y) * tiling, lod, vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(0.0, 0.0, s.z)); }
+            case 2: { nw = planar_normal(vec2<f32>(-d.z, -d.y) * tiling, lod, vec3<f32>(0.0, 0.0, -1.0), vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(s.x, 0.0, 0.0), n); }
+            case 3: { nw = planar_normal(vec2<f32>(d.x, d.z) * tiling, lod, vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 0.0, -1.0), vec3<f32>(0.0, s.y, 0.0), n); }
+            default: { nw = planar_normal(vec2<f32>(d.x, -d.y) * tiling, lod, vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(0.0, 0.0, s.z), n); }
         }
     } else {
         // Spherical and cylindrical: no normal detail.

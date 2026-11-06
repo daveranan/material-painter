@@ -206,13 +206,16 @@ fn live_tri(t: texture_2d<f32>, p: vec3<f32>, n: vec3<f32>, s: LiveSlot, lod: f3
         + textureSampleLevel(t, live_samp, live_rot(vec2<f32>(q.x, -q.y), s.img.y) + s.img.zw, lod) * w.z;
 }
 
-fn live_plane_n(t: texture_2d<f32>, q: vec2<f32>, lod: f32, s: LiveSlot, r: vec3<f32>, up: vec3<f32>, f: vec3<f32>) -> vec3<f32> {
+fn live_plane_n(t: texture_2d<f32>, q: vec2<f32>, lod: f32, s: LiveSlot, r: vec3<f32>, up: vec3<f32>, f: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
     var m = textureSampleLevel(t, live_samp, live_rot(q, s.img.y) + s.img.zw, lod).xyz * 2.0 - 1.0;
     if (s.tri.z > 0.5) {
         m.y = -m.y;
     }
     let xy = live_rot(m.xy * s.tri.y, s.img.y);
-    return r * xy.x + up * xy.y + f * max(m.z, 1e-3);
+    // Whiteout onto the surface normal, as composite.wgsl's planar_normal.
+    let ln = vec3<f32>(dot(n, r), dot(n, up), abs(dot(n, f)));
+    let o = vec3<f32>(xy + ln.xy, max(m.z, 1e-3) * ln.z);
+    return r * o.x + up * o.y + f * o.z;
 }
 
 // World-space tri-planar normal, matching composite.wgsl's fill_normal.
@@ -220,9 +223,9 @@ fn live_tri_n(t: texture_2d<f32>, p: vec3<f32>, n: vec3<f32>, s: LiveSlot, lod: 
     let w = live_blend_w(n, s.tri.x);
     let q = p * max(s.img.x, 1e-3);
     let sg = sign(n + vec3<f32>(1e-6));
-    return live_plane_n(t, vec2<f32>(q.z, -q.y), lod, s, vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(sg.x, 0.0, 0.0)) * w.x
-        + live_plane_n(t, q.xz, lod, s, vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 0.0, -1.0), vec3<f32>(0.0, sg.y, 0.0)) * w.y
-        + live_plane_n(t, vec2<f32>(q.x, -q.y), lod, s, vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(0.0, 0.0, sg.z)) * w.z;
+    return live_plane_n(t, vec2<f32>(q.z, -q.y), lod, s, vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(sg.x, 0.0, 0.0), n) * w.x
+        + live_plane_n(t, q.xz, lod, s, vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 0.0, -1.0), vec3<f32>(0.0, sg.y, 0.0), n) * w.y
+        + live_plane_n(t, vec2<f32>(q.x, -q.y), lod, s, vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(0.0, 0.0, sg.z), n) * w.z;
 }
 
 // Mip levels of an image for this pixel (x) and for one texel of the texture
