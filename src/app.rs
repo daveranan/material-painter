@@ -45,6 +45,7 @@ mod mcp_tools;
 pub(crate) mod prefs;
 mod project_io;
 mod shelf_previews;
+mod mode_icons;
 mod texture_sets;
 
 use export_ui::{ExportDialog, open_in_file_browser};
@@ -446,6 +447,7 @@ pub struct PainterApp {
     shelf: Shelf,
     /// Renders the shelf thumbnails on a baked material ball; gone once done.
     shelf_previews: Option<shelf_previews::ShelfPreviews>,
+    mode_icons: mode_icons::ModeIcons,
     export: ExportDialog,
     prefs: Preferences,
     /// The preferences in effect (and saved); `prefs` is what the UI edits.
@@ -1632,6 +1634,7 @@ impl PainterApp {
             show_bake: false,
             shelf: Shelf { cat: ShelfCat::SmartMaterials, search: String::new(), kind: None, icon_size: 72.0, smart, materials, generators, brushes, textures },
             shelf_previews: None,
+            mode_icons: Default::default(),
             export: ExportDialog::new("MaterialBall".into()),
             prefs_applied: prefs.clone(),
             prefs,
@@ -2800,32 +2803,6 @@ impl PainterApp {
                         self.layout = l;
                     }
                 }
-                ui.separator();
-                egui::ComboBox::from_id_salt("viewmode")
-                    .selected_text(self.mode_name(self.view.mode))
-                    .width(130.0)
-                    .height(600.0)
-                    .show_ui(ui, |ui| {
-                        ui.label(egui::RichText::new("MATERIAL").small().color(theme::TEXT_DIM));
-                        for m in ViewMode::CHANNELS {
-                            ui.selectable_value(&mut self.view.mode, m, m.name());
-                        }
-                        ui.separator();
-                        ui.label(egui::RichText::new("MESH MAPS").small().color(theme::TEXT_DIM));
-                        for m in ViewMode::all().into_iter().skip(ViewMode::CHANNELS.len()) {
-                            ui.selectable_value(&mut self.view.mode, m, m.name());
-                        }
-                        if !self.bake_settings.custom.is_empty() {
-                            ui.separator();
-                            ui.label(egui::RichText::new("CUSTOM MAPS").small().color(theme::TEXT_DIM));
-                        }
-                        for c in &self.bake_settings.custom {
-                            ui.selectable_value(&mut self.view.mode, ViewMode::Custom(c.id), &c.name);
-                        }
-                    })
-                    .response
-                    .on_hover_text("What the views show (M: material, C: next channel)");
-                ui.label(egui::RichText::new("Display").color(theme::TEXT_DIM));
                 ui.separator();
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                     ui.set_clip_rect(ui.max_rect().intersect(ui.clip_rect()));

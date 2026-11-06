@@ -244,6 +244,13 @@ impl Behavior<Pane> for DockBehavior<'_> {
         pane.title().into()
     }
 
+    /// The display-mode spheres sit on the 3D view's own tab bar.
+    fn top_bar_right_ui(&mut self, tiles: &Tiles<Pane>, ui: &mut egui::Ui, _tile: TileId, tabs: &egui_tiles::Tabs, _scroll: &mut f32) {
+        if tabs.active.and_then(|id| tiles.get_pane(&id)) == Some(&Pane::View3d) {
+            self.app.view_mode_strip(ui);
+        }
+    }
+
     fn is_tab_closable(&self, _tiles: &Tiles<Pane>, _tile: TileId) -> bool {
         false
     }
