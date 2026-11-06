@@ -2070,6 +2070,7 @@ dependencies = [
 name = "material_painter"
 version = "0.1.5"
 dependencies = [
+ "ab_glyph",
  "bytemuck",
  "eframe",
  "egui_kittest",

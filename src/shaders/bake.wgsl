@@ -43,6 +43,10 @@ struct BakeU {
 @group(0) @binding(6) var<storage, read> tri_nrm: array<vec4<f32>>;
 @group(0) @binding(7) var<storage, read> parts: array<vec4<f32>>;
 @group(0) @binding(8) var<storage, read> ids: array<vec4<f32>>;
+// Per triangle (BVH order): which `parts` entry its part random and gradient
+// come from. The connected part (in tri_pos.w) unless the bake splits parts
+// at folds, so each panel of a one-piece mesh varies on its own.
+@group(0) @binding(38) var<storage, read> tri_vpart: array<u32>;
 @group(0) @binding(9) var surf_pos_w: texture_storage_2d<rgba32float, write>;
 @group(0) @binding(10) var surf_nrm_w: texture_storage_2d<rgba16float, write>;
 @group(0) @binding(11) var map_d_w: texture_storage_2d<rgba16float, write>;
@@ -609,7 +613,7 @@ fn cs_surface(@builtin(global_invocation_id) gid: vec3<u32>) {
     var geo = vec4<f32>(nh, -1.0);
     if (center_tri != NONE) {
         let pi = bitcast<u32>(tri_pos[center_tri * 3u].w);
-        let part = parts[pi];
+        let part = parts[tri_vpart[center_tri]];
         prand = part.x;
         pgrad = clamp((center_pos.y - part.y) / max(part.z, 1e-5), 0.0, 1.0);
         idc = ids[bitcast<u32>(tri_pos[center_tri * 3u + 1u].w)].xyz;

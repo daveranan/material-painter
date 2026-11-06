@@ -41,13 +41,40 @@ impl Tex {
         usage: wgpu::TextureUsages,
         samples: u32,
     ) -> Tex {
+        Self::create(device, label, width, height, format, usage, samples, 1)
+    }
+
+    /// A texture with `mips` levels; `view` and `srgb()` cover all of them.
+    pub fn new_mipped(
+        device: &wgpu::Device,
+        label: &str,
+        width: u32,
+        height: u32,
+        format: wgpu::TextureFormat,
+        usage: wgpu::TextureUsages,
+        mips: u32,
+    ) -> Tex {
+        Self::create(device, label, width, height, format, usage, 1, mips)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn create(
+        device: &wgpu::Device,
+        label: &str,
+        width: u32,
+        height: u32,
+        format: wgpu::TextureFormat,
+        usage: wgpu::TextureUsages,
+        samples: u32,
+        mips: u32,
+    ) -> Tex {
         let srgb = format == wgpu::TextureFormat::Rgba8Unorm;
         let view_formats: &[wgpu::TextureFormat] =
             if srgb { &[wgpu::TextureFormat::Rgba8UnormSrgb] } else { &[] };
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some(label),
             size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
-            mip_level_count: 1,
+            mip_level_count: mips,
             sample_count: samples,
             dimension: wgpu::TextureDimension::D2,
             format,
@@ -85,6 +112,19 @@ impl Tex {
 
     pub fn srgb(&self) -> &wgpu::TextureView {
         self.srgb_view.as_ref().unwrap_or(&self.view)
+    }
+
+    /// A view of one mip level, through the sRGB format when `srgb` (and the
+    /// texture has one), to render into or sample from.
+    pub fn mip_view(&self, level: u32, srgb: bool) -> wgpu::TextureView {
+        let srgb = srgb && self.srgb_view.is_some();
+        self.texture.create_view(&wgpu::TextureViewDescriptor {
+            format: srgb.then_some(wgpu::TextureFormat::Rgba8UnormSrgb),
+            usage: srgb.then(|| self.texture.usage() - wgpu::TextureUsages::STORAGE_BINDING),
+            base_mip_level: level,
+            mip_level_count: Some(1),
+            ..Default::default()
+        })
     }
 }
 

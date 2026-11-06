@@ -20,6 +20,9 @@ struct LayerU {
     gid: vec4<f32>,         // ID color, tolerance
     gx: vec4<f32>,          // baked edge max distance, unused, tri-planar sharpness
     img: vec4<f32>,         // image tiling, rotation (degrees), offset x, offset y
+    emis: vec4<f32>,        // emission: linear rgb times strength, strength
+    ex: vec4<f32>,          // normal on, emission on, normal strength, normal image is DirectX
+    dc: array<vec4<f32>, 4>, // decal box: center + depth, right/width + softness, up/height + facing cosine, normal
 };
 
 @group(0) @binding(0) var<uniform> u: LayerU;
@@ -41,6 +44,11 @@ struct LayerU {
 @group(0) @binding(16) var map_e: texture_2d<f32>;  // ID color
 @group(0) @binding(17) var samp: sampler;
 @group(0) @binding(18) var rsamp: sampler;  // tiling, mipmapped: fill images
+@group(0) @binding(19) var prev_normal: texture_2d<f32>;  // tangent-space xy at 0.5 + 0.5 n
+@group(0) @binding(20) var prev_emis: texture_2d<f32>;    // linear HDR rgb
+@group(0) @binding(21) var l_normal: texture_2d<f32>;     // fill: normal image; folder merge: stack below
+@group(0) @binding(22) var l_emis: texture_2d<f32>;       // fill: emission image; folder merge: stack below
+@group(0) @binding(23) var tan_map: texture_2d<f32>;      // MikkTSpace tangent, sign in alpha
 
 fn blend3(mode: i32, a: vec3<f32>, b: vec3<f32>) -> vec3<f32> {
     switch mode {
@@ -78,6 +86,12 @@ fn fill_image(t: texture_2d<f32>, uv: vec2<f32>, p: vec3<f32>, n: vec3<f32>, tex
     let size = f32(textureDimensions(t).x);
     let tiling = max(u.img.x, 1e-3);
     let mode = i32(u.var1.z + 0.5);
+    if (mode == 7) {
+        // Decal: the image spans the box once, upright.
+        let q = decal_coord(p);
+        let lod = log2(max(texel_world * size * length(u.dc[1].xyz), 1.0));
+        return textureSampleLevel(t, rsamp, vec2<f32>(q.x, 1.0 - q.y), lod);
+    }
     if (mode == 0) {
         let q = rot2(uv - 0.5, u.img.y) * tiling + 0.5 + u.img.zw;
         let lod = log2(max(tiling * size / f32(textureDimensions(prev_color).x), 1.0));
@@ -212,10 +226,21 @@ fn grunge(q: vec3<f32>) -> f32 {
     return broad * 0.6 + grit * 0.3 + speck * 0.1;
 }
 
+// Draft composites run at a fraction of the size: an output texel `c` reads
+// the full-size inputs (position, normal and tangent maps, painted channels,
+// masks) at `full(c)`. `u.gx.y` is the stride (0 or 1: full size).
+fn stride() -> i32 {
+    return i32(max(u.gx.y, 1.0));
+}
+
+fn full(c: vec2<i32>) -> vec2<i32> {
+    return c * stride();
+}
+
 // World size of one output texel at `c` (on the surface point `p`).
 fn texel_size(c: vec2<i32>, p: vec3<f32>) -> f32 {
-    let right = textureLoad(pos_map, c + vec2<i32>(1, 0), 0);
-    return select(2.0 / f32(textureDimensions(pos_map).x), distance(right.xyz, p), right.a > 0.5);
+    let right = textureLoad(pos_map, full(c) + vec2<i32>(stride(), 0), 0);
+    return select(2.0 / f32(textureDimensions(pos_map).x) * f32(stride()), distance(right.xyz, p), right.a > 0.5);
 }
 
 // Smart mask: weighted sum of mesh-map inputs, noise breakup, then levels.
@@ -304,14 +329,141 @@ struct AccumOut {
     @location(1) rough: vec4<f32>,
     @location(2) metal: vec4<f32>,
     @location(3) height: vec4<f32>,
+    @location(4) normal: vec4<f32>,
+    @location(5) emis: vec4<f32>,
 };
+
+// A normal image texel as a tangent-space vector (OpenGL: green up), with the
+// layer's strength on its slopes.
+fn decode_normal(t: vec4<f32>) -> vec3<f32> {
+    var n = t.xyz * 2.0 - 1.0;
+    if (u.ex.w > 0.5) {
+        n.y = -n.y;
+    }
+    return vec3<f32>(n.xy * u.ex.z, max(n.z, 1e-3));
+}
+
+// One planar projection of the normal image as a world-space normal: `r` and
+// `up` are the world directions of the image's right and up, `f` the face
+// direction. Rotating the image coordinates by the layer's rotation rotates
+// the slopes by the same angle.
+fn planar_normal(q: vec2<f32>, lod: f32, r: vec3<f32>, up: vec3<f32>, f: vec3<f32>) -> vec3<f32> {
+    let t = decode_normal(textureSampleLevel(l_normal, rsamp, rot2(q, u.img.y) + u.img.zw, lod));
+    let xy = rot2(t.xy, u.img.y);
+    return r * xy.x + up * xy.y + f * t.z;
+}
+
+// The fill's normal image in this texel's tangent space (the frame the
+// viewport and exports decode: MikkTSpace, bitangent "up" in the texture).
+fn fill_normal(c: vec2<i32>, uv: vec2<f32>, p: vec3<f32>, n: vec3<f32>, texel_world: f32) -> vec3<f32> {
+    let size = f32(textureDimensions(l_normal).x);
+    let tiling = max(u.img.x, 1e-3);
+    let mode = i32(u.var1.z + 0.5);
+    if (mode == 0) {
+        let q = rot2(uv - 0.5, u.img.y) * tiling + 0.5 + u.img.zw;
+        let lod = log2(max(tiling * size / f32(textureDimensions(prev_color).x), 1.0));
+        let t = decode_normal(textureSampleLevel(l_normal, rsamp, q, lod));
+        return normalize(vec3<f32>(rot2(t.xy, u.img.y), t.z));
+    }
+    var nw = n;
+    if (mode == 1) {
+        let lod = log2(max(texel_world * tiling * size, 1.0));
+        var w = pow(abs(n), vec3<f32>(max(u.gx.z, 1.0)));
+        w /= max(w.x + w.y + w.z, 1e-4);
+        let q = p * tiling;
+        let s = sign(n + vec3<f32>(1e-6));
+        // Image axes per projection match fill_image(): x (z, -y), y (x, z), z (x, -y).
+        nw = planar_normal(vec2<f32>(q.z, -q.y), lod, vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(s.x, 0.0, 0.0)) * w.x
+            + planar_normal(q.xz, lod, vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 0.0, -1.0), vec3<f32>(0.0, s.y, 0.0)) * w.y
+            + planar_normal(vec2<f32>(q.x, -q.y), lod, vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(0.0, 0.0, s.z)) * w.z;
+    } else if (mode <= 4) {
+        let ext = max(max(u.bsize.x, u.bsize.y), max(u.bsize.z, 1e-4));
+        let d = (p - (u.bmin.xyz + u.bsize.xyz * 0.5)) / ext;
+        let lod = log2(max(texel_world * tiling * size / ext, 1.0));
+        let s = sign(n + vec3<f32>(1e-6));
+        switch mode {
+            case 2: { nw = planar_normal(vec2<f32>(-d.z, -d.y) * tiling, lod, vec3<f32>(0.0, 0.0, -1.0), vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(s.x, 0.0, 0.0)); }
+            case 3: { nw = planar_normal(vec2<f32>(d.x, d.z) * tiling, lod, vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 0.0, -1.0), vec3<f32>(0.0, s.y, 0.0)); }
+            default: { nw = planar_normal(vec2<f32>(d.x, -d.y) * tiling, lod, vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(0.0, 0.0, s.z)); }
+        }
+    } else {
+        // Spherical and cylindrical: no normal detail.
+        return vec3<f32>(0.0, 0.0, 1.0);
+    }
+    // World to tangent space.
+    let ts = textureLoad(tan_map, full(c), 0);
+    let t0 = ts.xyz * 2.0 - 1.0;
+    let t = normalize(t0 - n * dot(n, t0) + vec3<f32>(1e-6, 0.0, 0.0));
+    let b = -cross(n, t) * select(-1.0, 1.0, ts.w > 0.5);
+    let v = normalize(nw);
+    return normalize(vec3<f32>(dot(v, t), dot(v, b), max(dot(v, n), 1e-3)));
+}
+
+fn unpack_normal(t: vec2<f32>) -> vec3<f32> {
+    let xy = t * 2.0 - 1.0;
+    return vec3<f32>(xy, sqrt(max(1.0 - dot(xy, xy), 0.0)));
+}
+
+// Decal box coordinates of a point: x and y 0..1 across the box (y up), z
+// -1..1 through its depth.
+fn decal_coord(p: vec3<f32>) -> vec3<f32> {
+    let d = p - u.dc[0].xyz;
+    return vec3<f32>(dot(d, u.dc[1].xyz) + 0.5, dot(d, u.dc[2].xyz) + 0.5, dot(d, u.dc[3].xyz) / u.dc[0].w);
+}
+
+// How much of a point the decal box covers: inside it across the surface
+// (soft edges), within its depth, on faces turned toward it.
+fn decal_cover(p: vec3<f32>, n: vec3<f32>) -> f32 {
+    let q = decal_coord(p);
+    let s = max(u.dc[1].w, 1e-4);
+    let across = smoothstep(0.0, s, q.x) * smoothstep(0.0, s, 1.0 - q.x) * smoothstep(0.0, s, q.y) * smoothstep(0.0, s, 1.0 - q.y);
+    let through = 1.0 - smoothstep(0.85, 1.0, abs(q.z));
+    // Facing 180 (cosine -1) wraps around every face in the box.
+    let facing = select(smoothstep(u.dc[2].w - 0.05, u.dc[2].w + 0.02, dot(n, u.dc[3].xyz)), 1.0, u.dc[2].w < -0.999);
+    return across * through * facing;
+}
+
+// A decal at a point: (image color, coverage). `flip` reads the image
+// mirrored left to right (the mirrored copy, so text stays readable).
+fn decal_eval(p: vec3<f32>, n: vec3<f32>, texel_world: f32, flip: bool) -> vec4<f32> {
+    let cov = decal_cover(p, n);
+    if (cov <= 0.0) {
+        return vec4<f32>(1.0, 1.0, 1.0, 0.0);
+    }
+    let bits = u32(u.var1.w);
+    if ((bits & 1u) == 0u) {
+        return vec4<f32>(1.0, 1.0, 1.0, cov);
+    }
+    let q = decal_coord(p);
+    let x = select(q.x, 1.0 - q.x, flip);
+    let size = f32(textureDimensions(l_color).x);
+    let lod = log2(max(texel_world * size * length(u.dc[1].xyz), 1.0));
+    let t = textureSampleLevel(l_color, rsamp, vec2<f32>(x, 1.0 - q.y), lod);
+    if ((bits & 16u) != 0u) {
+        return vec4<f32>(1.0, 1.0, 1.0, cov * t.r);
+    }
+    return vec4<f32>(t.rgb, cov * t.a);
+}
+
+// A decal at a point, and its mirror image across x = 0 when it has one.
+fn decal_both(p: vec3<f32>, n: vec3<f32>, texel_world: f32) -> vec4<f32> {
+    var d = decal_eval(p, n, texel_world, false);
+    if (u.dc[3].w > 0.5) {
+        let m = vec3<f32>(-1.0, 1.0, 1.0);
+        let e = decal_eval(p * m, n * m, texel_world, true);
+        if (e.a > d.a) {
+            d = e;
+        }
+    }
+    return d;
+}
 
 // The layer's mask before opacity: the painted mask (or, with mask filters,
 // the filtered mask) times the smart mask.
 fn layer_mask(c: vec2<i32>, p: vec3<f32>, n: vec3<f32>, uv: vec2<f32>) -> f32 {
     var mask = 1.0;
     if (u.p0.w > 0.5) {
-        mask *= textureLoad(l_mask, c, 0).r;
+        mask *= textureLoad(l_mask, full(c), 0).r;
     }
     if (u.gp1.z > 0.5) {
         mask *= generator(p, n, uv, texel_size(c, p));
@@ -324,13 +476,47 @@ fn layer_mask(c: vec2<i32>, p: vec3<f32>, n: vec3<f32>, uv: vec2<f32>) -> f32 {
 fn fs_mask_source(in: FsOut) -> @location(0) vec4<f32> {
     let c = vec2<i32>(in.pos.xy);
     let uv = in.pos.xy / vec2<f32>(textureDimensions(pos_map));
-    let p = textureLoad(pos_map, c, 0).xyz;
-    let n = normalize(textureLoad(nrm_map, c, 0).xyz * 2.0 - 1.0);
+    let p = textureLoad(pos_map, full(c), 0).xyz;
+    let n = normalize(textureLoad(nrm_map, full(c), 0).xyz * 2.0 - 1.0);
     return vec4<f32>(layer_mask(c, p, n, uv), 0.0, 0.0, 1.0);
 }
 
+// Where a layer shows (its mask, a decal's box and text), for the viewport's
+// selection highlight.
+@fragment
+fn fs_cover(in: FsOut) -> @location(0) vec4<f32> {
+    let c = vec2<i32>(in.pos.xy);
+    let uv = in.pos.xy / vec2<f32>(textureDimensions(pos_map));
+    let p = textureLoad(pos_map, full(c), 0).xyz;
+    let n = normalize(textureLoad(nrm_map, full(c), 0).xyz * 2.0 - 1.0);
+    var m = layer_mask(c, p, n, uv);
+    if (u.p0.z > 0.5 && u.p0.z < 1.5 && i32(u.var1.z + 0.5) == 7) {
+        m *= decal_both(p, n, texel_size(c, p)).a;
+    }
+    return vec4<f32>(m, 0.0, 0.0, 1.0);
+}
+
+// The four paint channels alone: documents without normal or emission layers
+// composite through these, skipping those channels' reads and writes.
+struct AccumOut4 {
+    @location(0) color: vec4<f32>,
+    @location(1) rough: vec4<f32>,
+    @location(2) metal: vec4<f32>,
+    @location(3) height: vec4<f32>,
+};
+
 @fragment
 fn fs_layer(in: FsOut) -> AccumOut {
+    return layer_pass(in, true);
+}
+
+@fragment
+fn fs_layer4(in: FsOut) -> AccumOut4 {
+    let o = layer_pass(in, false);
+    return AccumOut4(o.color, o.rough, o.metal, o.height);
+}
+
+fn layer_pass(in: FsOut, extra: bool) -> AccumOut {
     let c = vec2<i32>(in.pos.xy);
     let dims = vec2<f32>(textureDimensions(prev_color));
     let uv = in.pos.xy / dims;
@@ -339,9 +525,40 @@ fn fs_layer(in: FsOut) -> AccumOut {
     let pr = textureLoad(prev_rough, c, 0).r;
     let pm = textureLoad(prev_metal, c, 0).r;
     let ph = textureLoad(prev_height, c, 0).r;
+    var pn = vec3<f32>(0.0, 0.0, 1.0);
+    var pe = vec3<f32>(0.0);
+    if (extra) {
+        pn = unpack_normal(textureLoad(prev_normal, c, 0).rg);
+        pe = textureLoad(prev_emis, c, 0).rgb;
+    }
 
-    let p = textureLoad(pos_map, c, 0).xyz;
-    let n = normalize(textureLoad(nrm_map, c, 0).xyz * 2.0 - 1.0);
+    let p = textureLoad(pos_map, full(c), 0).xyz;
+    let n = normalize(textureLoad(nrm_map, full(c), 0).xyz * 2.0 - 1.0);
+
+    // The mask first: where it hides the layer, the stack below passes
+    // through and the layer's content (noise, images) isn't evaluated.
+    var mask = u.p0.x * layer_mask(c, p, n, uv);
+    // Decal fills show only inside their box, cut out by the image's alpha
+    // (a grayscale image's value).
+    let decal = u.p0.z > 0.5 && u.p0.z < 1.5 && i32(u.var1.z + 0.5) == 7;
+    var dimg = vec4<f32>(1.0);
+    if (decal && mask > 0.0) {
+        let d = decal_both(p, n, texel_size(c, p));
+        mask *= d.a;
+        dimg = vec4<f32>(d.rgb, 1.0);
+    }
+    if (mask <= 0.0) {
+        var keep: AccumOut;
+        keep.color = vec4<f32>(pc, 1.0);
+        keep.rough = vec4<f32>(pr);
+        keep.metal = vec4<f32>(pm);
+        keep.height = vec4<f32>(ph);
+        if (extra) {
+            keep.normal = vec4<f32>(pn.xy * 0.5 + 0.5, 0.0, 1.0);
+            keep.emis = vec4<f32>(pe, 1.0);
+        }
+        return keep;
+    }
 
     var sc = u.fill_color.rgb;
     var sr = u.fill_rmh.x;
@@ -351,26 +568,31 @@ fn fs_layer(in: FsOut) -> AccumOut {
     var ar = u.ch.y;
     var am = u.ch.z;
     var ah = u.ch.w;
+    // Normal and emission: fill layers only.
+    var sn = vec3<f32>(0.0, 0.0, 1.0);
+    var se = u.emis.rgb;
+    var an = 0.0;
+    var ae = 0.0;
 
     if (u.p0.z < 0.5) {
         // Paint layer: per-channel (value, alpha).
         if (u.ch.x > 0.5) {
-            let t = textureLoad(l_color, c, 0);
+            let t = textureLoad(l_color, full(c), 0);
             sc = t.rgb;
             ac = t.a;
         }
         if (u.ch.y > 0.5) {
-            let t = textureLoad(l_rough, c, 0).rg;
+            let t = textureLoad(l_rough, full(c), 0).rg;
             sr = t.x;
             ar = t.y;
         }
         if (u.ch.z > 0.5) {
-            let t = textureLoad(l_metal, c, 0).rg;
+            let t = textureLoad(l_metal, full(c), 0).rg;
             sm = t.x;
             am = t.y;
         }
         if (u.ch.w > 0.5) {
-            let t = textureLoad(l_height, c, 0).rg;
+            let t = textureLoad(l_height, full(c), 0).rg;
             sh = t.x;
             ah = t.y;
         }
@@ -380,7 +602,10 @@ fn fs_layer(in: FsOut) -> AccumOut {
         let bits = u32(u.var1.w);
         if (bits != 0u) {
             let texel_world = texel_size(c, p);
-            if ((bits & 1u) != 0u) {
+            if (decal) {
+                // A decal's image tints the fill color; its alpha is the mask.
+                sc = sc * dimg.rgb;
+            } else if ((bits & 1u) != 0u) {
                 let img = fill_image(l_color, uv, p, n, texel_world);
                 sc = select(img.rgb, img.rrr, (bits & 16u) != 0u);
             }
@@ -395,7 +620,23 @@ fn fs_layer(in: FsOut) -> AccumOut {
                 // height value scales it (0.5: as is; negative inverts).
                 sh = (fill_image(l_height, uv, p, n, texel_world).r - 0.5) * 2.0 * u.fill_rmh.z;
             }
+            if (extra && (bits & 32u) != 0u && u.ex.x > 0.5) {
+                sn = fill_normal(c, uv, p, n, texel_world);
+            }
+            if (extra && (bits & 64u) != 0u && u.ex.y > 0.5) {
+                // sRGB image to linear light, times the strength.
+                se = pow(fill_image(l_emis, uv, p, n, texel_world).rgb, vec3<f32>(2.2)) * u.emis.w;
+            }
         }
+        // Per-part variation tilts each part's normal a little (plates of a
+        // hull catching the light at slightly different angles).
+        if (extra && u.ex.x > 0.5 && u.var1.y != 0.0) {
+            let part = textureSampleLevel(map_b, samp, uv, 0.0).a;
+            let tilt = vec2<f32>(fract(part * 7.31), fract(part * 13.17)) - 0.5;
+            sn = normalize(vec3<f32>(sn.xy + tilt * u.var1.y * 0.25, sn.z));
+        }
+        an = u.ex.x;
+        ae = u.ex.y;
         let vs = u.var0.y;
         let seed = vec3<f32>(u.var1.x * 13.7);
         if (u.var0.x != 0.0) {
@@ -419,14 +660,18 @@ fn fs_layer(in: FsOut) -> AccumOut {
         sr = clamp(sr, 0.0, 1.0);
     }
 
-    let mask = u.p0.x * layer_mask(c, p, n, uv);
-
     let mode = i32(u.p0.y);
     var out: AccumOut;
     out.color = vec4<f32>(clamp(mix(pc, blend3(mode, pc, sc), ac * mask), vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
     out.rough = vec4<f32>(clamp(mix(pr, blend1(mode, pr, sr), ar * mask), 0.0, 1.0));
     out.metal = vec4<f32>(clamp(mix(pm, blend1(mode, pm, sm), am * mask), 0.0, 1.0));
     out.height = vec4<f32>(mix(ph, blend1(mode, ph, sh), ah * mask));
+    if (extra) {
+        // Normals combine with the ones below (whiteout), so layered detail adds up.
+        let comb = normalize(vec3<f32>(pn.xy + sn.xy, pn.z * sn.z));
+        out.normal = vec4<f32>(mix(pn.xy, comb.xy, an * mask) * 0.5 + 0.5, 0.0, 1.0);
+        out.emis = vec4<f32>(max(mix(pe, blend3(mode, pe, se), ae * mask), vec3<f32>(0.0)), 1.0);
+    }
     return out;
 }
 
@@ -435,15 +680,25 @@ fn fs_layer(in: FsOut) -> AccumOut {
 // by the folder's opacity and mask, like an isolated group.
 @fragment
 fn fs_folder_merge(in: FsOut) -> AccumOut {
+    return folder_merge(in, true);
+}
+
+@fragment
+fn fs_folder_merge4(in: FsOut) -> AccumOut4 {
+    let o = folder_merge(in, false);
+    return AccumOut4(o.color, o.rough, o.metal, o.height);
+}
+
+fn folder_merge(in: FsOut, extra: bool) -> AccumOut {
     let c = vec2<i32>(in.pos.xy);
     let uv = in.pos.xy / vec2<f32>(textureDimensions(prev_color));
     var m = u.p0.x;
     if (u.p0.w > 0.5) {
-        m *= textureLoad(l_mask, c, 0).r;
+        m *= textureLoad(l_mask, full(c), 0).r;
     }
     if (u.gp1.z > 0.5) {
-        let p = textureLoad(pos_map, c, 0).xyz;
-        let n = normalize(textureLoad(nrm_map, c, 0).xyz * 2.0 - 1.0);
+        let p = textureLoad(pos_map, full(c), 0).xyz;
+        let n = normalize(textureLoad(nrm_map, full(c), 0).xyz * 2.0 - 1.0);
         m *= generator(p, n, uv, texel_size(c, p));
     }
     var out: AccumOut;
@@ -451,5 +706,9 @@ fn fs_folder_merge(in: FsOut) -> AccumOut {
     out.rough = vec4<f32>(mix(textureLoad(l_rough, c, 0).r, textureLoad(prev_rough, c, 0).r, m));
     out.metal = vec4<f32>(mix(textureLoad(l_metal, c, 0).r, textureLoad(prev_metal, c, 0).r, m));
     out.height = vec4<f32>(mix(textureLoad(l_height, c, 0).r, textureLoad(prev_height, c, 0).r, m));
+    if (extra) {
+        out.normal = vec4<f32>(mix(textureLoad(l_normal, c, 0).rg, textureLoad(prev_normal, c, 0).rg, m), 0.0, 1.0);
+        out.emis = vec4<f32>(mix(textureLoad(l_emis, c, 0).rgb, textureLoad(prev_emis, c, 0).rgb, m), 1.0);
+    }
     return out;
 }

@@ -12,7 +12,12 @@ pub const NEAR: f32 = 0.02;
 pub const FAR: f32 = 100.0;
 const MSAA: u32 = 4;
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+/// Pipelines draw the view images through their sRGB views.
 const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
+/// The view images themselves: sRGB-encoded bytes in a plain format, because
+/// egui samples the textures it shows as already gamma-encoded (an sRGB view
+/// would decode them and the view would show darker than the image).
+const IMAGE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 
 /// What the viewports display. Discriminants match `shade()` in view.wgsl;
 /// `Map(i)` shows baked map `engine::MAPS[i]`, `Custom(id)` a custom bake map.
@@ -24,6 +29,7 @@ pub enum ViewMode {
     Metallic,
     Height,
     Normal,
+    Emission,
     Map(usize),
     Custom(u32),
     WorldNormal,
@@ -32,8 +38,15 @@ pub enum ViewMode {
 }
 
 impl ViewMode {
-    pub const CHANNELS: [ViewMode; 6] =
-        [ViewMode::Material, ViewMode::BaseColor, ViewMode::Roughness, ViewMode::Metallic, ViewMode::Height, ViewMode::Normal];
+    pub const CHANNELS: [ViewMode; 7] = [
+        ViewMode::Material,
+        ViewMode::BaseColor,
+        ViewMode::Roughness,
+        ViewMode::Metallic,
+        ViewMode::Height,
+        ViewMode::Normal,
+        ViewMode::Emission,
+    ];
 
     pub fn all() -> Vec<ViewMode> {
         let mut v = Self::CHANNELS.to_vec();
@@ -50,6 +63,7 @@ impl ViewMode {
             ViewMode::Metallic => 3,
             ViewMode::Height => 4,
             ViewMode::Normal => 5,
+            ViewMode::Emission => 23,
             ViewMode::Map(i) => 6 + i as u32,
             // Which custom map rides in the globals (see `base_globals`).
             ViewMode::Custom(_) => 22,
@@ -67,6 +81,7 @@ impl ViewMode {
             ViewMode::Metallic => "Metallic",
             ViewMode::Height => "Height",
             ViewMode::Normal => "Normal (final)",
+            ViewMode::Emission => "Emission",
             ViewMode::Map(i) => crate::engine::MAPS[i].name,
             // The app names it after the map (see `PainterApp::mode_name`).
             ViewMode::Custom(_) => "Custom map",
@@ -367,10 +382,10 @@ impl ViewTarget {
                 color: Tex::new_ms(device, "view msaa", w, h, HDR_FORMAT, wgpu::TextureUsages::RENDER_ATTACHMENT, MSAA),
                 resolve: Some(Tex::new(device, "view hdr", w, h, HDR_FORMAT, display)),
                 depth: Some(Tex::new_ms(device, "view depth", w, h, DEPTH_FORMAT, display, MSAA)),
-                display: Some(Tex::new(device, "view", w, h, COLOR_FORMAT, display)),
+                display: Some(Tex::new(device, "view", w, h, IMAGE_FORMAT, display)),
             }
         } else {
-            Targets { color: Tex::new(device, "view 2d", w, h, COLOR_FORMAT, display), resolve: None, depth: None, display: None }
+            Targets { color: Tex::new(device, "view 2d", w, h, IMAGE_FORMAT, display), resolve: None, depth: None, display: None }
         }
     }
 
@@ -477,6 +492,10 @@ impl ViewRenderer {
                 gpu::tex_entry(11, true),
                 gpu::tex_entry(12, true),
                 gpu::tex_entry(13, true),
+                // Normal (painted detail) and emission channels.
+                gpu::tex_entry(20, true),
+                gpu::tex_entry(21, true),
+                gpu::tex_entry(22, true),
                 gpu::sampler_entry(14),
                 gpu::uniform_entry(15, false),
                 wgpu::BindGroupLayoutEntry {
@@ -648,7 +667,19 @@ impl ViewRenderer {
             shadow_sampler,
             bgl,
             globals,
-            sampler: gpu::linear_sampler(device, wgpu::AddressMode::ClampToEdge),
+            // Trilinear and anisotropic: the painted channels have mip levels
+            // (`Engine::view_tex`), so detail filters instead of aliasing.
+            sampler: device.create_sampler(&wgpu::SamplerDescriptor {
+                label: Some("view surface"),
+                address_mode_u: wgpu::AddressMode::ClampToEdge,
+                address_mode_v: wgpu::AddressMode::ClampToEdge,
+                address_mode_w: wgpu::AddressMode::ClampToEdge,
+                mag_filter: wgpu::FilterMode::Linear,
+                min_filter: wgpu::FilterMode::Linear,
+                mipmap_filter: wgpu::MipmapFilterMode::Linear,
+                anisotropy_clamp: 8,
+                ..Default::default()
+            }),
             view3d: ViewTarget::new(rs, true),
             view2d: ViewTarget::new(rs, false),
         }
@@ -733,16 +764,19 @@ impl ViewRenderer {
             layout: &self.bgl,
             entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: globals.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: v(engine.final_tex(0).srgb()) },
-                wgpu::BindGroupEntry { binding: 2, resource: v(&engine.final_tex(1).view) },
-                wgpu::BindGroupEntry { binding: 3, resource: v(&engine.final_tex(2).view) },
-                wgpu::BindGroupEntry { binding: 4, resource: v(&engine.final_tex(3).view) },
+                wgpu::BindGroupEntry { binding: 1, resource: v(engine.view_tex(0).srgb()) },
+                wgpu::BindGroupEntry { binding: 2, resource: v(&engine.view_tex(1).view) },
+                wgpu::BindGroupEntry { binding: 3, resource: v(&engine.view_tex(2).view) },
+                wgpu::BindGroupEntry { binding: 4, resource: v(&engine.view_tex(3).view) },
                 wgpu::BindGroupEntry { binding: 5, resource: v(&engine.map_tex(0).view) },
                 wgpu::BindGroupEntry { binding: 6, resource: v(&engine.map_tex(1).view) },
                 wgpu::BindGroupEntry { binding: 7, resource: v(&engine.map_tex(2).view) },
                 wgpu::BindGroupEntry { binding: 8, resource: v(&engine.map_tex(3).view) },
                 wgpu::BindGroupEntry { binding: 9, resource: v(&engine.map_tex(4).view) },
                 wgpu::BindGroupEntry { binding: 19, resource: v(engine.custom_maps_view()) },
+                wgpu::BindGroupEntry { binding: 20, resource: v(&engine.view_tex(crate::engine::NORMAL_CH).view) },
+                wgpu::BindGroupEntry { binding: 21, resource: v(&engine.view_tex(crate::engine::EMISSION_CH).view) },
+                wgpu::BindGroupEntry { binding: 22, resource: v(engine.highlight_view()) },
                 wgpu::BindGroupEntry { binding: 10, resource: wgpu::BindingResource::Sampler(&self.sampler) },
                 wgpu::BindGroupEntry { binding: 11, resource: v(&engine.surface_maps().1.view) },
                 wgpu::BindGroupEntry { binding: 12, resource: v(&engine.surface_maps().0.view) },
@@ -765,7 +799,7 @@ impl ViewRenderer {
             light: [s.env_rotation, s.exposure, s.env_intensity, (RADIANCE_MIPS - 1) as f32],
             params: [s.mode.index() as f32, s.height_strength, 1.0 / res, res],
             view2d: [0.0; 4],
-            size: [size[0] as f32, size[1] as f32, s.ao_strength, 0.0],
+            size: [size[0] as f32, size[1] as f32, s.ao_strength, engine.highlight],
             extra: [
                 if s.use_baked_normal && engine.has_bake { 1.0 } else { 0.0 },
                 if engine.has_bake { 1.0 } else { 0.0 },
@@ -928,7 +962,7 @@ impl ViewRenderer {
         let t = &self.view3d;
         let (hdr, display) = (t.resolve.as_ref().expect("3D view is HDR"), t.display.as_ref().expect("3D view has a display image"));
         let raw = settings.mode != ViewMode::Material;
-        self.post.record(rs, &mut encoder, hdr, &display.view, &settings.post, settings.exposure, raw);
+        self.post.record(rs, &mut encoder, hdr, display.srgb(), &settings.post, settings.exposure, raw);
         rs.queue.submit([encoder.finish()]);
     }
 
@@ -959,7 +993,7 @@ impl ViewRenderer {
             let mut pass = gpu::pass(
                 &mut encoder,
                 "2d view",
-                &[gpu::color_attachment(&self.view2d.color.view, wgpu::LoadOp::Clear(bg_color))],
+                &[gpu::color_attachment(self.view2d.color.srgb(), wgpu::LoadOp::Clear(bg_color))],
             );
             pass.set_bind_group(0, &bg, &[]);
             pass.set_pipeline(&self.quad);

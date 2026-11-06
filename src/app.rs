@@ -34,11 +34,13 @@ mod graph_ui;
 mod shader_ui;
 mod library_ui;
 mod path_tool;
+mod decal_gizmo;
 mod bake_live;
 mod spp_open;
 mod preview_shader;
 mod smart_io;
 mod welcome;
+pub(crate) mod live_reload;
 mod mcp_tools;
 pub(crate) mod prefs;
 mod project_io;
@@ -65,6 +67,8 @@ enum Tool {
     PolyFill,
     /// Lays the brush along an editable path (stitches, seams, panel lines).
     Path,
+    /// Clicks pick what's under them: a decal selects its layer.
+    Select,
 }
 
 /// Bake cage preview (see `crate::cage`): probe results and what's drawn.
@@ -343,6 +347,18 @@ enum Action {
     Redo,
     AddPaint,
     AddFill(FillParams, String),
+    /// A decal fill layer placed where the view looks: a band (no image) or text.
+    AddDecal { text: bool },
+    /// Renders a text decal's image again (or removes it with `None`).
+    SetText { idx: usize, spec: Option<crate::decal::TextSpec> },
+    /// A run-off layer under the text decal at `idx`, following it.
+    AddRunoff { idx: usize },
+    /// Moves every selected layer to `drop`, keeping their order.
+    MoveSelection { drop: Drop },
+    /// Copies the selected layers (folders with their contents).
+    CopyLayers,
+    /// Pastes the copied layers above the selected one.
+    PasteLayers,
     AddMask { white: bool },
     AddGenerator(GenKind),
     RemoveMask,
@@ -459,8 +475,38 @@ pub struct PainterApp {
     /// A crash report the last run left, shown once.
     crash_report: Option<std::path::PathBuf>,
     frame_ms: f32,
+    /// Placing this decal layer (by id) in the 3D view: drag moves it, scroll scales.
+    decal_place: Option<u64>,
+    /// The decal gizmo: the handle being dragged, the one under the pointer,
+    /// and whether moving a decal turns it to face the surface.
+    decal_drag: Option<decal_gizmo::GizmoDrag>,
+    decal_hot: Option<decal_gizmo::Handle>,
+    decal_align: bool,
+    /// The selection highlight: which layer it shows and when it started.
+    highlight: Option<(u64, Instant)>,
+    /// Layers selected together (Ctrl / Shift click), by id; `selected` is
+    /// the one the properties show. Ignored once it no longer holds it.
+    multi: Vec<u64>,
+    /// Where a Shift click range starts.
+    sel_anchor: Option<usize>,
+    /// The layer deselected in the view (Select tool: a click on nothing, or
+    /// Esc): its gizmo is hidden until it's picked again.
+    pub(super) gizmo_off: Option<u64>,
+    /// Image files dropped on the window, waiting for a pointer position in
+    /// the 3D view (Windows sends none while a file drag is over the window),
+    /// and when they arrived.
+    file_drop: Option<(Vec<std::path::PathBuf>, Instant)>,
+    /// Copied layers, bottom to top (a folder after its contents).
+    layer_clip: Vec<crate::engine::Layer>,
+    /// Slow-frame profiling (MP_PROFILE=1): where this frame's time went.
+    prof: Vec<(String, f32)>,
+    profile: bool,
+    /// When the last frame started (profiling: the gap between frames).
+    last_frame: Option<Instant>,
     ppp: f32,
     mcp: Option<crate::mcp::McpServer>,
+    /// Follows the open text project's files on disk.
+    live: live_reload::LiveProject,
     /// MCP calls answered when the running bake completes.
     mcp_bake_waiters: Vec<mpsc::Sender<crate::mcp::ToolResult>>,
     /// The open project file, if it has been saved or opened.
@@ -556,6 +602,21 @@ fn surface_at(mesh: &Mesh, tri: u32, bary: Vec3) -> (Vec3, Vec2, f32) {
     let uv_area = (t[1] - t[0]).perp_dot(t[2] - t[0]).abs();
     let scale = if world_area > 1e-12 { (uv_area / world_area).sqrt() } else { 0.0 };
     (n, uv, scale)
+}
+
+/// A triangle's flat normal (decals project along the face, not along
+/// smoothed vertex normals that lean toward the neighbors).
+fn face_normal(mesh: &Mesh, tri: u32) -> Vec3 {
+    let p = |k: usize| Vec3::from(mesh.vertices[mesh.indices[tri as usize * 3 + k] as usize].pos);
+    (p(1) - p(0)).cross(p(2) - p(0)).normalize_or(Vec3::Y)
+}
+
+/// Where a ray meets the mesh, with the face normal turned toward the ray's
+/// origin: where a decal placed there sits and looks.
+fn decal_hit(mesh: &Mesh, bvh: &crate::bvh::Bvh, o: Vec3, d: Vec3) -> Option<(Vec3, Vec3)> {
+    let hit = bvh.raycast(o, d)?;
+    let n = face_normal(mesh, hit.tri);
+    Some((hit.pos, if n.dot(d) > 0.0 { -n } else { n }))
 }
 
 /// Turns screen stamps (with their flow) into what the stamp shader
@@ -863,7 +924,14 @@ fn input_row(ui: &mut egui::Ui, name: String, tip: &str, weight: &mut f32) -> (b
         });
         // The slider takes what's left, next to its value box.
         ui.spacing_mut().slider_width = (ui.available_width() - 60.0).max(40.0);
+        let before = *weight;
         changed = ui.add(egui::Slider::new(weight, -2.0..=2.0).max_decimals(2)).changed();
+        // A weight of 0 means "not used" and hides the row: one dragged or
+        // typed to 0 keeps a sliver, so the row stays (and under the pointer)
+        // until its remove button takes it out.
+        if changed && *weight == 0.0 {
+            *weight = if before < 0.0 { -1e-4 } else { 1e-4 };
+        }
     });
     (remove, changed)
 }
@@ -987,6 +1055,179 @@ fn material_controls(ui: &mut egui::Ui, m: &mut MatValues, show_values: bool) ->
     changed
 }
 
+/// A fill layer's channels: the brush's four, then normal and emission.
+fn fill_controls(ui: &mut egui::Ui, f: &mut crate::engine::FillParams) -> bool {
+    let mut changed = false;
+    ui.horizontal_wrapped(|ui| {
+        for (c, name) in [(0, "color"), (3, "height"), (1, "rough"), (2, "metal"), (4, "normal"), (5, "emiss")] {
+            let on = match c {
+                4 => f.normal_on,
+                5 => f.emission_on,
+                _ => f.mat.enabled[c],
+            };
+            let text = egui::RichText::new(name).color(if on { Color32::WHITE } else { theme::TEXT_DIM });
+            let b = egui::Button::new(text).fill(if on { theme::ACCENT_DIM } else { theme::WIDGET }).min_size(vec2(56.0, 20.0));
+            if ui.add(b).clicked() {
+                match c {
+                    4 => f.normal_on = !on,
+                    5 => f.emission_on = !on,
+                    _ => f.mat.enabled[c] = !on,
+                }
+                changed = true;
+            }
+        }
+    });
+    ui.add_space(4.0);
+    let m = &mut f.mat;
+    if m.enabled[0] {
+        changed |= labeled(ui, "Base color", |ui| color_edit(ui, &mut m.color));
+    }
+    if m.enabled[3] {
+        changed |= slider(ui, "Height", &mut m.height, -1.0..=1.0);
+    }
+    if m.enabled[1] {
+        changed |= slider(ui, "Roughness", &mut m.rough, 0.0..=1.0);
+    }
+    if m.enabled[2] {
+        changed |= slider(ui, "Metallic", &mut m.metal, 0.0..=1.0);
+    }
+    if f.normal_on {
+        changed |= slider(ui, "Normal strength", &mut f.normal_strength, 0.0..=4.0);
+        changed |= labeled(ui, "", |ui| {
+            ui.checkbox(&mut f.normal_dx, "DirectX normal (green down)")
+                .on_hover_text("Unreal-style normal maps; leave off for OpenGL ones (Blender, Unity, Substance default)")
+                .changed()
+        });
+    }
+    if f.emission_on {
+        changed |= labeled(ui, "Emission", |ui| color_edit(ui, &mut f.emission));
+        changed |= labeled(ui, "Emission strength", |ui| {
+            ui.add(egui::Slider::new(&mut f.emission_strength, 0.0..=50.0).logarithmic(true).max_decimals(2)).changed()
+        });
+    }
+    changed
+}
+
+/// What the Decal section asks the app to do (it can't while the layer is borrowed).
+#[derive(Default)]
+struct DecalEvents {
+    place: bool,
+    snap: bool,
+    runoff: bool,
+    text: Option<crate::decal::TextSpec>,
+    remove_text: bool,
+}
+
+fn log_slider(ui: &mut egui::Ui, label: &str, v: &mut f32, range: std::ops::RangeInclusive<f32>) -> bool {
+    // Edits clamp, not every frame: a value typed past the range stays.
+    labeled(ui, label, |ui| ui.add(egui::Slider::new(v, range).logarithmic(true).max_decimals(3).clamping(egui::SliderClamping::Edits)).changed())
+}
+
+/// The Decal section of a decal fill layer: placing, size, reach and its text.
+fn decal_controls(
+    ui: &mut egui::Ui,
+    f: &mut FillParams,
+    text: Option<&(Option<crate::decal::TextSpec>, f32)>,
+    placing: bool,
+    align: &mut bool,
+    ev: &mut DecalEvents,
+) -> bool {
+    let mut changed = false;
+    ui.label(
+        egui::RichText::new("In the 3D view: drag the dot to slide it over the surface, the arrows to move it, the ring to turn it, the squares to scale it.")
+            .small()
+            .color(theme::TEXT_DIM),
+    );
+    ui.horizontal(|ui| {
+        ui.checkbox(align, "Align to normal")
+            .on_hover_text("Moving the decal turns it to face the surface under it (hold Shift to flip this while dragging)");
+        if ui.button("Snap to surface").on_hover_text("Lay the decal flat on the surface under its center").clicked() {
+            ev.snap = true;
+        }
+    });
+    let label = if placing { "Placing… (Esc to stop)" } else { "Place on surface" };
+    if ui
+        .add(egui::Button::new(label).selected(placing))
+        .on_hover_text("Drag on the mesh: the decal moves there and turns to face the surface (Shift keeps its angle). Scroll scales it, Ctrl+scroll turns it. Esc or right-click stops.")
+        .clicked()
+    {
+        ev.place = true;
+    }
+    let spec = text.and_then(|(t, _)| t.clone());
+    match text.filter(|_| spec.is_some()) {
+        // Text keeps its proportions.
+        Some((_, aspect)) => {
+            if log_slider(ui, "Height", &mut f.decal.size[1], 0.003..=3.0) {
+                f.decal.size[0] = f.decal.size[1] * aspect;
+                changed = true;
+            }
+        }
+        None => {
+            changed |= log_slider(ui, "Width", &mut f.decal.size[0], 0.003..=10.0);
+            changed |= log_slider(ui, "Height", &mut f.decal.size[1], 0.003..=10.0);
+        }
+    }
+    changed |= slider(ui, "Rotation", &mut f.rotation, -180.0..=180.0);
+    changed |= labeled(ui, "Depth", |ui| {
+        ui.add(egui::Slider::new(&mut f.decal.depth, 0.002..=10.0).logarithmic(true).max_decimals(3).clamping(egui::SliderClamping::Edits))
+            .on_hover_text(
+                "How far the box reaches in and out along its normal, from its center (each way). \
+                 Surfaces outside that slab don't take the decal; inside it, Facing decides. \
+                 It matters where the same facing appears at another height, e.g. a lower step under the top, \
+                 or with Facing 180, where only depth stops it reaching the far side.",
+            )
+            .changed()
+    });
+    changed |= labeled(ui, "Facing", |ui| {
+        ui.add(egui::Slider::new(&mut f.decal.facing, 0.0..=180.0).suffix("°").max_decimals(0))
+            .on_hover_text("Faces turned further than this from the decal don't take it; 180 wraps it around everything in the box")
+            .changed()
+    });
+    changed |= slider(ui, "Edge softness", &mut f.decal.soft, 0.0..=0.5);
+    changed |= labeled(ui, "Mirror", |ui| {
+        ui.checkbox(&mut f.decal.mirror, "Both sides")
+            .on_hover_text("Also on the other side of the mesh, mirrored across x = 0 (text stays readable)")
+            .changed()
+    });
+    section(ui, "Text");
+    match spec {
+        Some(t) => {
+            let mut t2 = t.clone();
+            let mut edit = labeled(ui, "Text", |ui| ui.add(egui::TextEdit::multiline(&mut t2.text).desired_rows(1)).changed());
+            edit |= labeled(ui, "Font", |ui| {
+                let mut c = false;
+                egui::ComboBox::from_id_salt("decal font").selected_text(t2.font.clone()).show_ui(ui, |ui| {
+                    for name in crate::decal::FONT_CHOICES {
+                        if crate::decal::font_path(name).is_some() {
+                            c |= ui.selectable_value(&mut t2.font, name.to_string(), name).changed();
+                        }
+                    }
+                });
+                c
+            });
+            edit |= labeled(ui, "Weight", |ui| ui.add(egui::Slider::new(&mut t2.weight, 100.0..=900.0).step_by(50.0)).changed());
+            edit |= slider(ui, "Letter spacing", &mut t2.spacing, -0.1..=0.6);
+            if edit && t2 != t {
+                ev.text = Some(t2);
+            }
+            ui.horizontal(|ui| {
+                if ui.button("Add run-off").on_hover_text("Paint running down from the letters, on a layer below that follows this one").clicked() {
+                    ev.runoff = true;
+                }
+                if ui.small_button("Remove text").clicked() {
+                    ev.remove_text = true;
+                }
+            });
+        }
+        None => {
+            if ui.button("Add text").on_hover_text("Cut the decal out by text (white, tinted by the base color)").clicked() {
+                ev.text = Some(crate::decal::TextSpec::default());
+            }
+        }
+    }
+    changed
+}
+
 /// Adds a smart material as a folder holding its layers, at `at` inside
 /// `parent`, as one undo step; returns the folder's index.
 pub(crate) fn add_smart_material(
@@ -1051,6 +1292,28 @@ enum ShelfItem {
 #[derive(Clone, Copy)]
 struct LayerDrag(usize);
 
+/// Command line: `material_painter [--mcp] [project.mpp | project.json | mesh.fbx/.obj]`.
+#[derive(Default)]
+struct StartupArgs {
+    /// Accept AI agent (MCP) connections this run, whatever the preference.
+    mcp: bool,
+    open: Option<std::path::PathBuf>,
+}
+
+impl StartupArgs {
+    fn parse(args: impl Iterator<Item = String>) -> StartupArgs {
+        let mut out = StartupArgs::default();
+        for a in args {
+            match a.as_str() {
+                "--mcp" => out.mcp = true,
+                _ if a.starts_with("--") => {}
+                _ => out.open = Some(std::path::PathBuf::from(a)),
+            }
+        }
+        out
+    }
+}
+
 impl PainterApp {
     /// Switches workspace (offscreen UI tests).
     #[cfg(test)]
@@ -1089,6 +1352,22 @@ impl PainterApp {
     #[cfg(test)]
     pub(crate) fn test_close_welcome(&mut self) {
         self.show_welcome = false;
+    }
+
+    /// Opens a project file (performance tests on real documents).
+    #[cfg(test)]
+    pub(crate) fn test_open_project(&mut self, path: &std::path::Path, ctx: &egui::Context) -> Result<(), String> {
+        self.open_project(path, ctx)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_engine(&mut self) -> &mut Engine {
+        &mut self.engine
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_render_state(&self) -> egui_wgpu::RenderState {
+        self.rs.clone()
     }
 
     /// Opens the asset library and shows the Downloaded shelf (offscreen UI
@@ -1321,8 +1600,6 @@ impl PainterApp {
             })
             .collect();
 
-        let shelf_previews = shelf_previews::ShelfPreviews::start(&rs, ctx, &env_baker);
-
         let mut app = PainterApp {
             rs,
             mesh: Arc::new(mesh),
@@ -1339,7 +1616,7 @@ impl PainterApp {
             brush: Brush::default(),
             cam: OrbitCam::default(),
             cam2d: Cam2d::default(),
-            layout: Layout::Split,
+            layout: Layout::View3d,
             view: ViewSettings::default(),
             env,
             env_baker,
@@ -1354,7 +1631,7 @@ impl PainterApp {
             baker,
             show_bake: false,
             shelf: Shelf { cat: ShelfCat::SmartMaterials, search: String::new(), kind: None, icon_size: 72.0, smart, materials, generators, brushes, textures },
-            shelf_previews: Some(shelf_previews),
+            shelf_previews: None,
             export: ExportDialog::new("MaterialBall".into()),
             prefs_applied: prefs.clone(),
             prefs,
@@ -1378,8 +1655,22 @@ impl PainterApp {
             preview: Default::default(),
             crash_report: crate::crash::take_report(),
             frame_ms: 0.0,
+            decal_place: None,
+            decal_drag: None,
+            decal_hot: None,
+            decal_align: true,
+            highlight: None,
+            multi: Vec::new(),
+            sel_anchor: None,
+            layer_clip: Vec::new(),
+            file_drop: None,
+            gizmo_off: None,
+            prof: Vec::new(),
+            last_frame: None,
+            profile: std::env::var_os("MP_PROFILE").is_some(),
             ppp: cc.egui_ctx.pixels_per_point(),
             mcp: None,
+            live: live_reload::LiveProject::new(&cc.egui_ctx),
             mcp_bake_waiters: Vec::new(),
             mcp_env_waiters: Vec::new(),
             project_path: None,
@@ -1409,13 +1700,27 @@ impl PainterApp {
             pressure: 1.0,
             line_anchor: None,
         };
+        // Shelf thumbnails from an earlier run, then render whatever's missing.
+        let missing = shelf_previews::load_cached(&mut app.shelf);
+        if !missing.is_empty() {
+            app.shelf_previews = Some(shelf_previews::ShelfPreviews::start(&app.rs, ctx, &app.env_baker, missing));
+        }
         app.apply_startup_preferences(ctx);
-        match crate::mcp::McpServer::start(&cc.egui_ctx, app.prefs.mcp_port, app.prefs.mcp_on_start) {
+        let startup = StartupArgs::parse(std::env::args().skip(1));
+        match crate::mcp::McpServer::start(&cc.egui_ctx, app.prefs.mcp_port, app.prefs.mcp_on_start || startup.mcp) {
             Ok(server) => app.mcp = Some(server),
             Err(e) => app.status = e,
         }
-        if app.prefs.bake_on_load {
-            app.start_bake(ctx);
+        match startup.open {
+            Some(path) if project_io::is_text_project(&path) || path.extension().is_some_and(|x| x == project_io::EXTENSION) => {
+                app.pending.push(Action::OpenProject(Some(path)));
+            }
+            Some(path) => match Mesh::load_file(&path) {
+                Ok(mesh) => app.load_mesh(mesh, ctx),
+                Err(e) => app.status = e,
+            },
+            None if app.prefs.bake_on_load => app.start_bake(ctx),
+            None => {}
         }
         Ok(app)
     }
@@ -1647,21 +1952,85 @@ impl PainterApp {
                     self.selected = self.engine.add_fill_layer(at, parent, name, fill, &mut self.undo);
                     self.target = StrokeTarget::Content;
                 }
+                Action::AddDecal { text } => {
+                    // Where the view looks, on the surface facing the camera.
+                    let (o, d) = (self.cam.eye(), (self.cam.target - self.cam.eye()).normalize_or(Vec3::NEG_Z));
+                    let (pos, n) = decal_hit(&self.mesh, &self.bvh, o, d).unwrap_or((self.cam.target, -d));
+                    let mut fill = FillParams { projection: Projection::Decal, ..FillParams::default() };
+                    fill.mat.enabled = [true, true, true, false];
+                    fill.mat.metal = 0.0;
+                    fill.mat.rough = 0.5;
+                    fill.decal.center = pos.to_array();
+                    fill.decal.normal = n.to_array();
+                    fill.decal.depth = 0.05;
+                    if text {
+                        fill.mat.color = [0.85, 0.85, 0.82];
+                        fill.decal.size = [0.3, 0.06];
+                    } else {
+                        fill.mat.color = [0.62, 0.63, 0.62];
+                        fill.decal.size = [0.2, 0.08];
+                    }
+                    let name = if text { "Text" } else { "Decal" };
+                    self.selected = self.engine.add_fill_layer(at, parent, name.into(), fill, &mut self.undo);
+                    self.target = StrokeTarget::Content;
+                    if text {
+                        self.pending.push(Action::SetText { idx: self.selected, spec: Some(crate::decal::TextSpec::default()) });
+                    }
+                    self.decal_place = Some(self.engine.layers[self.selected].id);
+                    self.status = "Drag on the mesh to place the decal; scroll scales it, Ctrl+scroll turns it; Esc stops.".into();
+                }
+                Action::AddRunoff { idx } => {
+                    if let Some(src) = self.engine.layers.get(idx) {
+                        let (id, parent, name) = (src.id, src.parent, src.name.clone());
+                        if let Content::Fill(sf) = &src.content {
+                            let mut fill = *sf;
+                            fill.mat.color = sf.mat.color.map(|c| c * 0.8);
+                            fill.runoff = Some(crate::decal::Runoff { source: id, length: 0.8, seed: (id % 97) as f32 });
+                            let at = self.engine.add_fill_layer(idx, parent, format!("Run-off: {name}"), fill, &mut self.undo);
+                            self.engine.layers[at].opacity = 0.8;
+                            self.selected = at;
+                            self.target = StrokeTarget::Content;
+                        }
+                    }
+                }
+                Action::SetText { idx, spec } => match spec {
+                    None => self.engine.set_fill_image(idx, 0, None, &mut self.undo),
+                    Some(spec) => match self.engine.text_fill_image(&spec) {
+                        Ok((img, aspect)) => {
+                            self.engine.set_fill_image(idx, 0, Some(img), &mut self.undo);
+                            if let Some(Content::Fill(f)) = self.engine.layers.get_mut(idx).map(|l| &mut l.content) {
+                                // The height stays; the width follows the text.
+                                f.decal.size[0] = f.decal.size[1] * aspect;
+                                f.projection = Projection::Decal;
+                            }
+                            self.engine.mark_layer_dirty(idx);
+                        }
+                        Err(e) => self.status = e,
+                    },
+                },
                 Action::AddFolder => {
                     let n = self.engine.layers.iter().filter(|l| l.is_folder()).count() + 1;
                     self.selected = self.engine.add_folder(at, parent, format!("Folder {n}"), &mut self.undo);
                     self.target = StrokeTarget::Content;
                 }
                 Action::GroupIntoFolder => {
-                    if let Some(layer) = self.engine.layers.get(self.selected) {
-                        let (parent, label) = (layer.parent, format!("Group {}", layer.name));
-                        self.undo.begin_group(label);
+                    let sel = self.selection();
+                    if let Some(&top) = sel.last() {
+                        let ids: Vec<u64> = sel.iter().map(|&i| self.engine.layers[i].id).collect();
+                        let parent = self.engine.layers[top].parent;
+                        self.undo.begin_group(format!("Group {} layers", ids.len()));
                         let n = self.engine.layers.iter().filter(|l| l.is_folder()).count() + 1;
-                        let folder = self.engine.add_folder(self.selected + 1, parent, format!("Folder {n}"), &mut self.undo);
+                        let folder = self.engine.add_folder(top + 1, parent, format!("Folder {n}"), &mut self.undo);
                         let folder_id = self.engine.layers[folder].id;
-                        self.engine.move_to(self.selected, Drop::Into(folder_id), &mut self.undo);
+                        // Bottom first: each goes on top inside the folder.
+                        for id in ids {
+                            if let Some(i) = self.engine.index_of(id) {
+                                self.engine.move_to(i, Drop::Into(folder_id), &mut self.undo);
+                            }
+                        }
                         self.undo.end_group();
                         self.selected = self.engine.index_of(folder_id).unwrap_or(folder);
+                        self.multi.clear();
                         self.target = StrokeTarget::Content;
                     }
                 }
@@ -1692,14 +2061,84 @@ impl PainterApp {
                 }
                 Action::SaveSmart => self.save_smart_material(ctx),
                 Action::Duplicate => {
-                    if let Some(i) = self.engine.duplicate_layer(self.selected, &mut self.undo) {
+                    let sel = self.selection();
+                    self.undo.begin_group(format!("Duplicate {} layers", sel.len()));
+                    // Top first: a copy goes right above its layer, moving only those above.
+                    let mut copies = Vec::new();
+                    for &i in sel.iter().rev() {
+                        if let Some(c) = self.engine.duplicate_layer(i, &mut self.undo) {
+                            copies.push(self.engine.layers[c].id);
+                        }
+                    }
+                    self.undo.end_group();
+                    if let Some(i) = copies.first().and_then(|&id| self.engine.index_of(id)) {
                         self.selected = i;
                     }
+                    self.multi = copies;
                 }
                 Action::Delete => {
-                    self.engine.delete_layer(self.selected, &mut self.undo);
-                    self.selected = self.selected.min(self.engine.layers.len().saturating_sub(1));
+                    let sel = self.selection();
+                    self.undo.begin_group(format!("Delete {} layers", sel.len()));
+                    // Top first: removing a layer moves only those above it.
+                    for &i in sel.iter().rev() {
+                        self.engine.delete_layer(i, &mut self.undo);
+                    }
+                    self.undo.end_group();
+                    let lowest = sel.first().copied().unwrap_or(self.selected);
+                    self.selected = lowest.min(self.engine.layers.len().saturating_sub(1));
+                    self.multi.clear();
                     self.target = StrokeTarget::Content;
+                }
+                Action::CopyLayers => {
+                    let sel = self.selection();
+                    let clip: Vec<_> = sel.iter().flat_map(|&i| self.engine.block(i)).map(|j| self.engine.copy_of(&self.engine.layers[j])).collect();
+                    if !clip.is_empty() {
+                        self.status = format!("Copied {} layer{}", sel.len(), if sel.len() == 1 { "" } else { "s" });
+                        self.layer_clip = clip;
+                    }
+                }
+                Action::PasteLayers => {
+                    if !self.layer_clip.is_empty() {
+                        let layers: Vec<_> = self.layer_clip.iter().map(|l| self.engine.copy_of(l)).collect();
+                        let (at, parent) = match self.engine.layers.get(self.selected) {
+                            Some(l) => (self.selected + 1, l.parent),
+                            None => (self.engine.layers.len(), None),
+                        };
+                        let ids = self.engine.insert_layers(at, parent, layers, "Paste layers".into(), &mut self.undo);
+                        let top: Vec<u64> = ids.iter().copied().filter(|&id| self.engine.index_of(id).is_some_and(|i| self.engine.layers[i].parent == parent)).collect();
+                        if let Some(i) = top.last().and_then(|&id| self.engine.index_of(id)) {
+                            self.selected = i;
+                        }
+                        self.status = format!("Pasted {} layer{}", top.len(), if top.len() == 1 { "" } else { "s" });
+                        self.multi = top;
+                        self.target = StrokeTarget::Content;
+                        self.engine.mark_dirty();
+                    }
+                }
+                Action::MoveSelection { drop } => {
+                    let ids: Vec<u64> = self.selection().iter().map(|&i| self.engine.layers[i].id).collect();
+                    let anchor = match drop {
+                        Drop::Above(a) | Drop::Below(a) | Drop::Into(a) => a,
+                    };
+                    if !ids.contains(&anchor) {
+                        self.undo.begin_group(format!("Move {} layers", ids.len()));
+                        // The order that keeps them as they were: above an anchor,
+                        // the top one first; below it or into a folder, the bottom one.
+                        let order: Vec<u64> = match drop {
+                            Drop::Above(_) => ids.iter().rev().copied().collect(),
+                            _ => ids.clone(),
+                        };
+                        for id in order {
+                            if let Some(i) = self.engine.index_of(id) {
+                                self.engine.move_to(i, drop, &mut self.undo);
+                            }
+                        }
+                        self.undo.end_group();
+                        if let Some(&primary) = ids.last() {
+                            self.selected = self.engine.index_of(primary).unwrap_or(self.selected);
+                        }
+                        self.multi = ids;
+                    }
                 }
                 Action::Clear => self.engine.clear_layer(self.selected, &mut self.undo),
                 // Shelf content added by clicking or dropping on a view goes
@@ -2014,6 +2453,34 @@ impl PainterApp {
         if ctx.egui_wants_keyboard_input() {
             return;
         }
+        // Layers: copy, cut, paste, duplicate and delete (the graph editor
+        // has its own while the pointer is over it).
+        if !self.graphs.editor.hovered {
+            let (copy, cut, paste, dup, del) = ctx.input(|i| {
+                let cmd = |k| i.modifiers.command && i.key_pressed(k);
+                (
+                    cmd(Key::C) || i.events.iter().any(|e| matches!(e, egui::Event::Copy)),
+                    cmd(Key::X) || i.events.iter().any(|e| matches!(e, egui::Event::Cut)),
+                    cmd(Key::V) || i.events.iter().any(|e| matches!(e, egui::Event::Paste(_))),
+                    cmd(Key::D),
+                    i.key_pressed(Key::Delete) && !i.modifiers.any(),
+                )
+            });
+            if copy || cut {
+                self.pending.push(Action::CopyLayers);
+                // Something on the system clipboard, so Ctrl+V comes back as a paste.
+                ctx.copy_text("Material Painter layers".into());
+            }
+            if cut || del {
+                self.pending.push(Action::Delete);
+            }
+            if paste {
+                self.pending.push(Action::PasteLayers);
+            }
+            if dup {
+                self.pending.push(Action::Duplicate);
+            }
+        }
         ctx.input(|i| {
             if i.modifiers.any() {
                 return;
@@ -2032,6 +2499,12 @@ impl PainterApp {
             }
             if i.key_pressed(Key::I) {
                 self.tool = Tool::Picker;
+            }
+            if i.key_pressed(Key::V) {
+                self.tool = Tool::Select;
+            }
+            if i.key_pressed(Key::Escape) && self.tool == Tool::Select && self.decal_place.is_none() {
+                self.deselect();
             }
             if i.key_pressed(Key::Num3) || i.key_pressed(Key::P) {
                 self.tool = Tool::PolyFill;
@@ -2246,12 +2719,6 @@ impl PainterApp {
                     self.workspace = ws;
                 }
             }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let resp = theme::donate_button(ui, "Support", vec2(0.0, 22.0));
-                if resp.on_hover_text("Material Painter is free; donations on Ko-fi keep it going").clicked() {
-                    ui.ctx().open_url(egui::OpenUrl::new_tab(welcome::DONATE_URL));
-                }
-            });
         });
     }
 
@@ -2268,6 +2735,8 @@ impl PainterApp {
         item(ui, true, "Add paint layer", || Action::AddPaint);
         item(ui, true, "Add fill layer", || Action::AddFill(FillParams::default(), "Fill layer".into()));
         item(ui, true, "Add graph fill layer", || Action::AddGraphLayer);
+        item(ui, true, "Add decal (band, stripe)", || Action::AddDecal { text: false });
+        item(ui, true, "Add text decal", || Action::AddDecal { text: true });
         item(ui, true, "Add folder", || Action::AddFolder);
         item(ui, has, "Group into folder", || Action::GroupIntoFolder);
         ui.separator();
@@ -2376,6 +2845,7 @@ impl PainterApp {
                         (Tool::PolyFill, _) => "Polygon fill",
                         (Tool::Path, StrokeTarget::Mask) => "Path (mask)",
                         (Tool::Path, _) => "Path",
+                        (Tool::Select, _) => "Select (click a decal to select its layer)",
                     };
                     let icon = match self.tool {
                         Tool::Paint => icons::PAINT_BRUSH,
@@ -2383,6 +2853,7 @@ impl PainterApp {
                         Tool::Picker => icons::EYEDROPPER,
                         Tool::PolyFill => icons::POLYGON,
                         Tool::Path => icons::PATH,
+                        Tool::Select => icons::CROSSHAIR,
                     };
                     ui.label(egui::RichText::new(theme::with_icon(icon, name)).strong().color(Color32::WHITE));
                     ui.separator();
@@ -2408,7 +2879,7 @@ impl PainterApp {
                         ui.add_space(6.0);
                         ui.label(egui::RichText::new("Opacity").color(theme::TEXT_DIM));
                         let mut p = self.brush.opacity * 100.0;
-                        if ui.add(egui::Slider::new(&mut p, 1.0..=100.0).max_decimals(0).suffix("%")).changed() {
+                        if ui.add(egui::Slider::new(&mut p, 1.0..=100.0).max_decimals(0).suffix("%").clamping(egui::SliderClamping::Edits)).changed() {
                             self.brush.opacity = p / 100.0;
                         }
                         ui.label(egui::RichText::new("Click or drag across faces, Shift+drag a box. Uses the brush material.").small().color(theme::TEXT_DIM));
@@ -2421,7 +2892,7 @@ impl PainterApp {
                             let mut p = *v * 100.0;
                             let lo = *r.start() * 100.0;
                             let hi = *r.end() * 100.0;
-                            let resp = ui.add(egui::Slider::new(&mut p, lo..=hi).max_decimals(0).suffix("%"));
+                            let resp = ui.add(egui::Slider::new(&mut p, lo..=hi).max_decimals(0).suffix("%").clamping(egui::SliderClamping::Edits));
                             if resp.changed() {
                                 *v = p / 100.0;
                             }
@@ -2467,6 +2938,7 @@ impl PainterApp {
             (Tool::PolyFill, icons::POLYGON, "Polygon fill: triangles, quads, mesh parts or UV islands (3 / P)"),
             (Tool::Path, icons::PATH, "Path: place points, then paint along them; stitches, seams, panel lines (4 / L)"),
             (Tool::Picker, icons::EYEDROPPER, "Pick material from the surface (I)"),
+            (Tool::Select, icons::CROSSHAIR, "Select: click a decal or text in the 3D view to select its layer (V)"),
         ] {
             if theme::icon_button(ui, icon, self.tool == tool, 34.0).on_hover_text(tip).clicked() {
                 self.tool = tool;
@@ -2594,14 +3066,16 @@ impl PainterApp {
     fn layer_row(&mut self, ui: &mut egui::Ui, idx: usize) {
         let h = 46.0;
         let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), h), Sense::click_and_drag());
-        let indent = self.engine.depth(idx) as f32 * 16.0;
+        let depth = self.engine.depth(idx);
+        let indent = depth as f32 * 20.0;
         let layer = &self.engine.layers[idx];
         let (id, visible, name) = (layer.id, layer.visible, layer.name.clone());
         let folder_open = match layer.content {
             Content::Folder(f) => Some(f.open),
             _ => None,
         };
-        let selected = idx == self.selected;
+        let in_multi = self.multi.len() > 1 && self.multi.contains(&id) && self.multi_active();
+        let selected = idx == self.selected || in_multi;
         let base_id = ui.scope_id().with(("layer", id));
 
         let painter = ui.painter_at(rect);
@@ -2620,20 +3094,43 @@ impl PainterApp {
             painter.rect_filled(Rect::from_min_size(rect.min + vec2(0.0, 6.0), vec2(3.0, h - 12.0)), 1.5, theme::ACCENT);
         }
 
-        // Visibility toggle.
+        // Mute (visibility) and solo, in a column of their own.
+        let soloed = self.engine.solo == Some(id);
+        let muted_by_solo = self.engine.solo.is_some() && !soloed;
         let eye_rect = Rect::from_center_size(pos2(rect.min.x + 16.0, rect.center().y), vec2(22.0, 22.0));
-        let eye = ui.interact(eye_rect, base_id.with("eye"), Sense::click());
+        let eye = ui.interact(eye_rect, base_id.with("eye"), Sense::click()).on_hover_text("Show / hide (Ctrl+click: solo)");
         let (eye_icon, eye_col) = if visible { (icons::EYE, theme::TEXT) } else { (icons::EYE_SLASH, theme::TEXT_DIM.gamma_multiply(0.6)) };
-        let eye_col = if eye.hovered() { Color32::WHITE } else { eye_col };
+        let eye_col = if eye.hovered() {
+            Color32::WHITE
+        } else if muted_by_solo {
+            eye_col.gamma_multiply(0.4)
+        } else {
+            eye_col
+        };
         painter.text(eye_rect.center(), egui::Align2::CENTER_CENTER, eye_icon, egui::FontId::proportional(15.0), eye_col);
+        let solo_rect = Rect::from_center_size(pos2(rect.min.x + 38.0, rect.center().y), vec2(18.0, 18.0));
+        let solo = ui.interact(solo_rect, base_id.with("solo"), Sense::click()).on_hover_text("Solo: show only this layer (click again to end)");
+        if soloed {
+            painter.rect_filled(solo_rect, 3.0, Color32::from_rgb(0xe8, 0xb9, 0x4a));
+        } else if solo.hovered() {
+            painter.rect_stroke(solo_rect, 3.0, Stroke::new(1.0, theme::TEXT), egui::StrokeKind::Inside);
+        }
+        let solo_col = if soloed { Color32::BLACK } else if solo.hovered() { Color32::WHITE } else { theme::TEXT_DIM };
+        painter.text(solo_rect.center(), egui::Align2::CENTER_CENTER, "S", egui::FontId::proportional(12.0), solo_col);
+        // Tree lines: one per enclosing folder, an elbow into this row.
+        let tree_x = |d: usize| rect.min.x + 52.0 + d as f32 * 20.0 + 8.0;
+        for d in 0..depth {
+            let x = tree_x(d);
+            let line = Stroke::new(1.0, theme::TEXT_DIM.gamma_multiply(0.45));
+            painter.line_segment([pos2(x, rect.top()), pos2(x, rect.bottom())], line);
+            if d + 1 == depth {
+                painter.line_segment([pos2(x, rect.center().y), pos2(x + 10.0, rect.center().y)], line);
+            }
+        }
 
         // Content thumbnail, indented by folder depth.
-        let thumb = Rect::from_min_size(pos2(eye_rect.max.x + 6.0 + indent, rect.min.y + 5.0), vec2(36.0, 36.0));
+        let thumb = Rect::from_min_size(pos2(rect.min.x + 52.0 + indent, rect.min.y + 5.0), vec2(36.0, 36.0));
         let thumb_resp = ui.interact(thumb, base_id.with("thumb"), Sense::click());
-        if indent > 0.0 {
-            let x = eye_rect.max.x + indent - 4.0;
-            painter.line_segment([pos2(x, rect.top()), pos2(x, rect.bottom())], Stroke::new(1.0, theme::BORDER));
-        }
         match &layer.content {
             Content::Paint(_) => {
                 paint_checker(&painter, thumb);
@@ -2656,6 +3153,27 @@ impl PainterApp {
                 let col = if visible { Color32::from_rgb(0xe8, 0xb9, 0x4a) } else { theme::TEXT_DIM };
                 let icon = if f.open { icons::FOLDER_OPEN } else { icons::FOLDER };
                 painter.text(thumb.center(), egui::Align2::CENTER_CENTER, icon, egui::FontId::proportional(24.0), col);
+            }
+        }
+        // What kind of layer this is, as a badge on the thumbnail.
+        let badge = match &layer.content {
+            Content::Paint(_) => Some((icons::PAINT_BRUSH, "Paint layer")),
+            Content::Fill(f) if f.projection == Projection::Decal && layer.images[0].as_ref().is_some_and(|im| im.text.is_some()) => {
+                Some(("T", "Text decal"))
+            }
+            Content::Fill(f) if f.projection == Projection::Decal => Some((icons::SQUARE, "Decal")),
+            Content::Fill(f) if f.emission_on => Some((icons::LIGHTNING, "Emissive fill")),
+            Content::Fill(_) if layer.images.iter().any(Option::is_some) => Some((icons::IMAGES, "Image fill")),
+            Content::Fill(f) if f.graph.is_some() => Some((icons::SPARKLE, "Graph fill")),
+            Content::Fill(_) => Some((icons::PAINT_BUCKET, "Fill")),
+            Content::Folder(_) => None,
+        };
+        if let Some((icon, what)) = badge {
+            let b = Rect::from_min_size(thumb.right_bottom() - vec2(15.0, 15.0), vec2(15.0, 15.0));
+            painter.rect_filled(b, 3.0, Color32::from_black_alpha(200));
+            painter.text(b.center(), egui::Align2::CENTER_CENTER, icon, egui::FontId::proportional(11.0), Color32::WHITE);
+            if thumb_resp.hovered() {
+                thumb_resp.clone().on_hover_text(what);
             }
         }
         if selected && self.target == StrokeTarget::Content {
@@ -2710,8 +3228,14 @@ impl PainterApp {
         let resp = if name_cut { resp.on_hover_text(&name) } else { resp };
 
         // Interaction.
-        if eye.clicked() {
-            self.engine.layers[idx].visible = !visible;
+        if eye.clicked() && ui.input(|i| i.modifiers.command) || solo.clicked() {
+            self.engine.set_solo(if soloed { None } else { Some(id) });
+        } else if eye.clicked() {
+            // On a selected row, the eye shows or hides the whole selection.
+            let targets = if in_multi { self.selection() } else { vec![idx] };
+            for i in targets {
+                self.engine.layers[i].visible = !visible;
+            }
             self.engine.mark_dirty();
         } else if mask_resp.as_ref().is_some_and(|r| r.clicked()) {
             self.selected = idx;
@@ -2730,7 +3254,36 @@ impl PainterApp {
             if self.selected != idx || matches!(self.target, StrokeTarget::BakeFix(_)) {
                 self.target = StrokeTarget::Content;
             }
-            self.selected = idx;
+            let mods = ui.input(|i| i.modifiers);
+            self.gizmo_off = None;
+            if mods.command {
+                // Ctrl: add or remove this layer.
+                if !self.multi_active() {
+                    self.multi = self.engine.layers.get(self.selected).map(|l| vec![l.id]).unwrap_or_default();
+                }
+                if let Some(k) = self.multi.iter().position(|&m| m == id) {
+                    self.multi.remove(k);
+                    if self.selected == idx {
+                        if let Some(i) = self.multi.last().and_then(|&m| self.engine.index_of(m)) {
+                            self.selected = i;
+                        }
+                    }
+                } else {
+                    self.multi.push(id);
+                    self.selected = idx;
+                }
+                self.sel_anchor = Some(idx);
+            } else if mods.shift {
+                // Shift: everything between the last clicked layer and this one.
+                let from = self.sel_anchor.unwrap_or(self.selected).min(self.engine.layers.len().saturating_sub(1));
+                let (lo, hi) = (from.min(idx), from.max(idx));
+                self.multi = (lo..=hi).map(|i| self.engine.layers[i].id).collect();
+                self.selected = idx;
+            } else {
+                self.multi = vec![id];
+                self.sel_anchor = Some(idx);
+                self.selected = idx;
+            }
         }
 
         // Drag to reorder: the top or bottom part of a row drops above or below
@@ -2762,7 +3315,13 @@ impl PainterApp {
         }
         if let (Some(from), Some(p)) = (resp.dnd_release_payload::<LayerDrag>(), ui.ctx().pointer_interact_pos()) {
             if from.0 != idx {
-                self.pending.push(Action::MoveTo { from: from.0, drop: drop_at(p.y) });
+                // Dragging a selected layer moves the whole selection.
+                let dragged = self.engine.layers.get(from.0).map(|l| l.id);
+                if self.multi_active() && self.multi.len() > 1 && dragged.is_some_and(|d| self.multi.contains(&d)) {
+                    self.pending.push(Action::MoveSelection { drop: drop_at(p.y) });
+                } else {
+                    self.pending.push(Action::MoveTo { from: from.0, drop: drop_at(p.y) });
+                }
             }
         }
         // Shelf items land where they're dropped; a generator masks the row's layer.
@@ -3382,6 +3941,7 @@ impl PainterApp {
                     }
                 });
                 slider(ui, "Hard edge angle (°)", &mut s.hard_edge_angle, 5.0..=120.0);
+                slider(ui, "Split parts at folds (°)", &mut s.part_crease_angle, 0.0..=90.0);
                 ui.label(egui::RichText::new("Distances are in mesh units; the mesh is normalized to a 2-unit box.").small().color(theme::TEXT_DIM));
             });
 
@@ -3467,7 +4027,11 @@ impl PainterApp {
         dirty |= slider(ui, "Level", &mut g.level, -1.0..=2.0);
         dirty |= slider(ui, "Contrast", &mut g.contrast, 0.001..=0.6);
         dirty |= slider(ui, "Noise breakup", &mut g.noise, 0.0..=2.0);
-        dirty |= slider(ui, "Noise scale", &mut g.scale, 0.2..=20.0);
+        dirty |= labeled(ui, "Scale", |ui| {
+            ui.add(egui::Slider::new(&mut g.scale, 0.2..=400.0).logarithmic(true).max_decimals(1))
+                .on_hover_text("Size of the noise, scratches, cells and grain: higher is finer")
+                .changed()
+        });
         dirty |= slider(ui, "Seed", &mut g.seed, 0.0..=100.0);
         dirty |= labeled(ui, "Invert", |ui| ui.checkbox(&mut g.invert, "").changed());
         let uses_width = g.weights[gin::EDGE] != 0.0 || g.weights[gin::CREASE] != 0.0;
@@ -3515,8 +4079,11 @@ impl PainterApp {
                         }
                     });
                 });
+                // A percentage of the stored value: egui's default clamping would
+                // round it to whole percent every frame (18.0000007 -> 18), see a
+                // change each time and recomposite the stack on every frame.
                 let mut op = layer.opacity * 100.0;
-                if labeled(ui, "Opacity", |ui| ui.add(egui::Slider::new(&mut op, 0.0..=100.0).max_decimals(0).suffix("%")).changed()) {
+                if labeled(ui, "Opacity", |ui| ui.add(egui::Slider::new(&mut op, 0.0..=100.0).max_decimals(0).suffix("%").clamping(egui::SliderClamping::Edits)).changed()) {
                     layer.opacity = op / 100.0;
                     dirty = true;
                 }
@@ -3528,7 +4095,7 @@ impl PainterApp {
             } else {
                 let is_fill = self.engine.layers[idx].is_fill();
                 if is_fill {
-                    let names: [Option<String>; 4] =
+                    let names: [Option<String>; crate::engine::IMAGE_SLOTS] =
                         std::array::from_fn(|i| self.engine.layers[idx].images[i].as_ref().map(|im| im.name.clone()));
                     let graph_name = match &self.engine.layers[idx].content {
                         Content::Fill(f) => f.graph.map(|g| self.graphs.doc(g).map_or("(missing)".to_string(), |d| d.graph.name.clone())),
@@ -3550,13 +4117,45 @@ impl PainterApp {
                             self.exposed_controls(ui, gid);
                         }
                     }
+                    let text_info = self.engine.layers[idx]
+                        .images[0]
+                        .as_ref()
+                        .map(|im| (im.text.as_deref().cloned(), im.tex.width as f32 / im.tex.height.max(1) as f32));
+                    let layer_id = self.engine.layers[idx].id;
+                    let placing = self.decal_place == Some(layer_id);
+                    let runoff_source = match &self.engine.layers[idx].content {
+                        Content::Fill(f) => f.runoff.and_then(|r| self.engine.index_of(r.source)).map(|i| self.engine.layers[i].name.clone()),
+                        _ => None,
+                    };
+                    let mut ev = DecalEvents::default();
                     if let Content::Fill(f) = &mut self.engine.layers[idx].content {
                         section(ui, "Fill material");
-                        dirty |= material_controls(ui, &mut f.mat, true);
+                        dirty |= fill_controls(ui, f);
+                        if let Some(r) = &mut f.runoff {
+                            section(ui, "Run-off");
+                            ui.label(
+                                egui::RichText::new(format!("Runs down from \"{}\" and follows it.", runoff_source.as_deref().unwrap_or("(missing layer)")))
+                                    .small()
+                                    .color(theme::TEXT_DIM),
+                            );
+                            dirty |= slider(ui, "Length", &mut r.length, 0.1..=4.0);
+                            dirty |= slider(ui, "Seed", &mut r.seed, 0.0..=100.0);
+                        } else if f.projection == Projection::Decal {
+                            section(ui, "Decal");
+                            dirty |= decal_controls(ui, f, text_info.as_ref(), placing, &mut self.decal_align, &mut ev);
+                        } else if ui
+                            .button("Use as decal")
+                            .on_hover_text("Show this layer only inside a box placed on the surface: bands, stripes, text, insignia")
+                            .clicked()
+                        {
+                            f.projection = Projection::Decal;
+                            ev.place = true;
+                            dirty = true;
+                        }
                         if graph_name.is_none() {
                         section(ui, "Images");
                         let shelf_textures = &self.shelf.textures;
-                        for (ch, label) in ["Color", "Roughness", "Metallic", "Height"].into_iter().enumerate() {
+                        for (ch, label) in ["Color", "Roughness", "Metallic", "Height", "Normal", "Emission"].into_iter().enumerate() {
                             labeled(ui, label, |ui| {
                                 match &names[ch] {
                                     Some(name) => {
@@ -3624,6 +4223,21 @@ impl PainterApp {
                         dirty |= slider(ui, "Seed", &mut f.seed, 0.0..=100.0);
                         dirty |= slider(ui, "Per-part var.", &mut f.part_var, 0.0..=1.0);
                     }
+                    if ev.place {
+                        self.decal_place = if placing { None } else { Some(layer_id) };
+                    }
+                    if ev.snap {
+                        self.align_decal_to_surface(idx);
+                    }
+                    if ev.runoff {
+                        self.pending.push(Action::AddRunoff { idx });
+                    }
+                    if let Some(spec) = ev.text {
+                        self.pending.push(Action::SetText { idx, spec: Some(spec) });
+                    }
+                    if ev.remove_text {
+                        self.pending.push(Action::SetText { idx, spec: None });
+                    }
                     ui.add_space(6.0);
                     ui.label(egui::RichText::new("Fill layers cost no texture memory. Add a mask to paint where they show.").small().color(theme::TEXT_DIM));
                 } else {
@@ -3631,7 +4245,12 @@ impl PainterApp {
                 }
             }
             if dirty {
-                self.engine.mark_dirty();
+                // Only the selected layer changed: composite from it up (as a
+                // draft while a slider or color is being dragged).
+                if ui.input(|i| i.pointer.any_down()) {
+                    self.engine.draft = true;
+                }
+                self.engine.mark_layer_dirty(self.selected);
             }
         });
     }
@@ -4594,6 +5213,176 @@ impl PainterApp {
         self.poly.topo.get_or_insert_with(|| Arc::new(Topology::build(&self.mesh))).clone()
     }
 
+    /// Blinks where the selected layer (or a folder's layers) shows in the 3D
+    /// view right after it's selected.
+    fn update_highlight(&mut self, ctx: &egui::Context) {
+        let id = self.engine.layers.get(self.selected).map(|l| l.id);
+        if id != self.highlight.map(|(h, _)| h) {
+            self.highlight = id.map(|i| (i, Instant::now()));
+            if id.is_some() {
+                self.engine.render_highlight(self.selected);
+            }
+        }
+        let t = self.highlight.map_or(9.0, |(_, at)| at.elapsed().as_secs_f32());
+        // A blink: full for a moment, gone a moment later.
+        let k = (1.0 - (t - 0.12).max(0.0) / 0.18).clamp(0.0, 1.0);
+        if (k - self.engine.highlight).abs() > 1e-3 {
+            self.engine.highlight = k;
+            ctx.request_repaint();
+        }
+    }
+
+    /// Image files dragged from outside onto the window become decals in the
+    /// 3D view: while they hover, a hint; once dropped, each lands on the
+    /// surface under the pointer (or the middle of the view when the pointer
+    /// doesn't show up in time).
+    fn file_drop_in_view(&mut self, ctx: &egui::Context, rect: Rect, painter: &egui::Painter) {
+        let is_image = |p: &std::path::Path| {
+            p.extension().is_some_and(|e| ["png", "jpg", "jpeg", "tga", "bmp", "webp", "tif", "tiff"].contains(&e.to_string_lossy().to_lowercase().as_str()))
+        };
+        let (hovering, dropped) = ctx.input(|i| {
+            (
+                i.raw.hovered_files.iter().any(|f| f.path.as_deref().is_some_and(is_image)),
+                i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).filter(|p| is_image(p)).collect::<Vec<_>>(),
+            )
+        });
+        if hovering {
+            painter.rect_stroke(rect.shrink(2.0), 0.0, Stroke::new(2.0, theme::ACCENT), egui::StrokeKind::Inside);
+            painter.text(rect.center_bottom() - vec2(0.0, 24.0), egui::Align2::CENTER_CENTER, "Drop the image to add it as a decal", egui::FontId::proportional(13.0), Color32::WHITE);
+        }
+        if !dropped.is_empty() {
+            self.file_drop = Some((dropped, Instant::now()));
+        }
+        let Some((files, since)) = &self.file_drop else { return };
+        let pointer = ctx.input(|i| i.pointer.latest_pos()).filter(|p| rect.contains(*p));
+        let waited = since.elapsed().as_secs_f32();
+        if pointer.is_none() && waited < 0.5 {
+            ctx.request_repaint();
+            return;
+        }
+        let files = files.clone();
+        self.file_drop = None;
+        let at = pointer.map(|p| Vec2::new((p.x - rect.min.x) * self.ppp, (p.y - rect.min.y) * self.ppp));
+        for path in files {
+            self.add_image_decal(&path, at);
+        }
+    }
+
+    /// A decal layer showing an image file, placed on the surface under a 3D
+    /// view pixel (or where the view looks), sized to the image's proportions.
+    fn add_image_decal(&mut self, path: &std::path::Path, at: Option<Vec2>) {
+        let size = Vec2::new(self.views.view3d.size[0] as f32, self.views.view3d.size[1] as f32);
+        let (o, d) = match at {
+            Some(a) => self.cam.ray(a, size),
+            None => (self.cam.eye(), (self.cam.target - self.cam.eye()).normalize_or(Vec3::NEG_Z)),
+        };
+        let Some((pos, n)) = decal_hit(&self.mesh, &self.bvh, o, d) else {
+            self.status = "Drop the image on the mesh to place it".into();
+            return;
+        };
+        let img = match self.engine.shared_fill_image(path) {
+            Ok(img) => img,
+            Err(e) => {
+                self.status = e;
+                return;
+            }
+        };
+        let aspect = img.tex.height as f32 / img.tex.width.max(1) as f32;
+        let mut fill = FillParams { projection: Projection::Decal, ..FillParams::default() };
+        fill.mat.enabled = [true, true, true, false];
+        // White: the image's own colors show (the fill color tints them).
+        fill.mat.color = [1.0, 1.0, 1.0];
+        fill.mat.metal = 0.0;
+        fill.mat.rough = 0.5;
+        // A fifth of the distance to the camera across: a good size at any zoom.
+        let width = ((self.cam.eye() - pos).length() * 0.2).clamp(0.01, 3.0);
+        fill.decal.center = pos.to_array();
+        fill.decal.normal = n.to_array();
+        fill.decal.size = [width, width * aspect];
+        fill.decal.depth = (width * 0.25).max(0.02);
+        let name = path.file_stem().map_or("Decal".into(), |s| s.to_string_lossy().into_owned());
+        let (at_idx, parent) = self.insert_place();
+        self.undo.begin_group(format!("Add decal {name}"));
+        let idx = self.engine.add_fill_layer(at_idx, parent, name.clone(), fill, &mut self.undo);
+        self.engine.set_fill_image(idx, 0, Some(img), &mut self.undo);
+        self.undo.end_group();
+        self.selected = idx;
+        self.multi.clear();
+        self.gizmo_off = None;
+        self.target = StrokeTarget::Content;
+        self.status = format!("Added decal {name}: drag its handles to move, turn or scale it");
+    }
+
+    /// Deselects in the view: the multi-selection ends and the selected
+    /// decal's gizmo hides (the properties still show the layer).
+    fn deselect(&mut self) {
+        self.multi.clear();
+        self.gizmo_off = self.engine.layers.get(self.selected).map(|l| l.id);
+        self.decal_drag = None;
+        self.status = "Deselected".into();
+    }
+
+    /// The multi-selection still holds the selected layer (anything else that
+    /// changed `selected` ends it).
+    fn multi_active(&self) -> bool {
+        self.engine.layers.get(self.selected).is_some_and(|l| self.multi.contains(&l.id))
+    }
+
+    /// The selected layers, bottom to top (just the selected one without a
+    /// multi-selection). Layers inside a selected folder are left out: the
+    /// folder carries them.
+    fn selection(&self) -> Vec<usize> {
+        if !self.multi_active() || self.multi.len() < 2 {
+            return if self.selected < self.engine.layers.len() { vec![self.selected] } else { Vec::new() };
+        }
+        let mut v: Vec<usize> = self.multi.iter().filter_map(|&id| self.engine.index_of(id)).collect();
+        v.sort_unstable();
+        let set: std::collections::HashSet<usize> = v.iter().copied().collect();
+        v.retain(|&i| !self.engine.ancestors(i).any(|a| set.contains(&a)));
+        v
+    }
+
+    /// Selects the topmost visible decal layer covering the surface under a
+    /// 3D view pixel.
+    fn select_at(&mut self, at: Vec2) {
+        let size = Vec2::new(self.views.view3d.size[0] as f32, self.views.view3d.size[1] as f32);
+        let (o, d) = self.cam.ray(at, size);
+        let Some((p, n)) = decal_hit(&self.mesh, &self.bvh, o, d) else { return };
+        let hit = (0..self.engine.layers.len()).rev().find(|&i| {
+            let l = &self.engine.layers[i];
+            let visible = l.visible && self.engine.ancestors(i).all(|a| self.engine.layers[a].visible);
+            match &l.content {
+                Content::Fill(f) if visible && f.projection == Projection::Decal && f.runoff.is_none() => f.decal.covers(f.rotation, p, n),
+                _ => false,
+            }
+        });
+        match hit {
+            Some(i) => {
+                // Open the folders around it so its row shows.
+                for a in self.engine.ancestors(i).collect::<Vec<_>>() {
+                    if let Content::Folder(f) = &mut self.engine.layers[a].content {
+                        f.open = true;
+                    }
+                }
+                self.selected = i;
+                self.multi.clear();
+                self.gizmo_off = None;
+                self.target = StrokeTarget::Content;
+                self.status = format!("Selected {}", self.engine.layers[i].name);
+            }
+            None => self.deselect(),
+        }
+    }
+
+    /// The decal layer being placed, while it still is one.
+    fn placing_decal(&self) -> Option<usize> {
+        let i = self.engine.index_of(self.decal_place?)?;
+        match &self.engine.layers[i].content {
+            Content::Fill(f) if f.projection == Projection::Decal => Some(i),
+            _ => None,
+        }
+    }
+
     /// The triangle under a view pixel.
     fn pick_triangle(&mut self, kind: ViewKind, at: Vec2) -> Option<u32> {
         match kind {
@@ -4946,7 +5735,7 @@ impl PainterApp {
                     self.brush.size = (self.brush.size + delta.x).clamp(2.0, 800.0);
                     self.brush.hardness = (self.brush.hardness - delta.y * 0.005).clamp(0.0, 0.99);
                 }
-                if resp.hovered() && scroll != 0.0 {
+                if resp.hovered() && scroll != 0.0 && self.placing_decal().is_none() {
                     self.cam.dist = (self.cam.dist * (-scroll * self.zoom_rate()).exp()).clamp(0.3, 40.0);
                 }
                 if resp.double_clicked() && mods.alt {
@@ -4975,6 +5764,59 @@ impl PainterApp {
                         self.cam2d.pan -= anchor * (f - 1.0);
                     }
                 }
+            }
+        }
+
+        // The decal gizmo's handles take the clicks that land on them.
+        if kind == ViewKind::V3d && !mods.alt && self.stroke.is_none() {
+            let on_view = pressed && resp.hovered();
+            if self.decal_gizmo_input(rect, hover, on_view, down, mods.shift) {
+                return;
+            }
+        }
+
+        // Placing a decal: drag moves it, scroll scales it, Ctrl+scroll turns it.
+        if kind == ViewKind::V3d && !mods.alt {
+            if let Some(i) = self.placing_decal() {
+                let stop = ui.input(|i| i.key_pressed(egui::Key::Escape) || i.pointer.secondary_clicked());
+                if stop {
+                    self.decal_place = None;
+                    return;
+                }
+                let mut changed = false;
+                let dragging = resp.dragged_by(B::Primary) || (pressed && resp.hovered());
+                if dragging {
+                    if let Some(p) = hover.filter(|p| rect.contains(*p)) {
+                        let size = Vec2::new(self.views.view3d.size[0] as f32, self.views.view3d.size[1] as f32);
+                        let (o, d) = self.cam.ray(local(p), size);
+                        if let Some((pos, n)) = decal_hit(&self.mesh, &self.bvh, o, d)
+                            && let Content::Fill(f) = &mut self.engine.layers[i].content
+                        {
+                            f.decal.center = pos.to_array();
+                            if self.decal_align != mods.shift {
+                                f.decal.normal = n.to_array();
+                            }
+                            changed = true;
+                        }
+                    }
+                }
+                let zoom = ui.input(|i| i.zoom_delta());
+                if resp.hovered() && let Content::Fill(f) = &mut self.engine.layers[i].content {
+                    if scroll != 0.0 && !mods.ctrl {
+                        let k = (scroll * 0.002).exp();
+                        f.decal.size = f.decal.size.map(|v| (v * k).clamp(1e-3, 4.0));
+                        changed = true;
+                    }
+                    if mods.ctrl && zoom != 1.0 {
+                        f.rotation = (f.rotation + zoom.ln() * 90.0 + 180.0).rem_euclid(360.0) - 180.0;
+                        changed = true;
+                    }
+                }
+                if changed {
+                    self.engine.draft |= dragging;
+                    self.engine.mark_layer_dirty(i);
+                }
+                return;
             }
         }
 
@@ -5049,6 +5891,16 @@ impl PainterApp {
             return;
         }
 
+        // Selecting: the decal under the click (topmost first).
+        if self.tool == Tool::Select {
+            if pressed && resp.hovered() && !mods.alt && kind == ViewKind::V3d {
+                if let Some(p) = hover.filter(|p| rect.contains(*p)) {
+                    self.select_at(local(p));
+                }
+            }
+            return;
+        }
+
         // Painting.
         if let Some(p) = hover {
             let in_view = rect.contains(p);
@@ -5088,10 +5940,18 @@ impl PainterApp {
         self.update_poly_highlight();
 
         // GPU: composite, then render this view at its pixel size.
+        let t0 = Instant::now();
         if self.engine.dirty {
             self.engine.composite();
+            if self.profile {
+                self.prof.push(("composite".into(), t0.elapsed().as_secs_f32() * 1000.0));
+            }
         }
+        let t0 = Instant::now();
         self.composite_parked();
+        if self.profile {
+            self.prof.push(("composite_parked".into(), t0.elapsed().as_secs_f32() * 1000.0));
+        }
         let size = [(rect.width() * self.ppp).round() as u32, (rect.height() * self.ppp).round() as u32];
         let mut rt_view = None;
         match kind {
@@ -5127,6 +5987,9 @@ impl PainterApp {
         painter.image(id, rect, uv, Color32::WHITE);
         self.draw_path(&painter, kind, rect);
         self.draw_gizmo(&painter, kind, rect);
+        if kind == ViewKind::V3d {
+            self.draw_decal(&painter, rect);
+        }
         if let Some(b) = self.poly.box_drag.filter(|b| b.view == kind) {
             let color = if b.erase { Color32::from_rgb(255, 90, 80) } else { Color32::from_rgb(80, 160, 255) };
             let r = Rect::from_two_pos(b.start, b.end);
@@ -5141,6 +6004,9 @@ impl PainterApp {
             _ => self.mode_name(self.view.mode),
         };
         painter.text(rect.min + vec2(10.0, 8.0), egui::Align2::LEFT_TOP, label, egui::FontId::proportional(11.5), Color32::from_white_alpha(150));
+        if kind == ViewKind::V3d {
+            self.file_drop_in_view(ui.ctx(), rect, &painter);
+        }
         if let Some(item) = resp.dnd_hover_payload::<ShelfItem>() {
             let what = match *item {
                 ShelfItem::Generator(_) => "Drop to mask the selected layer",
@@ -5300,11 +6166,11 @@ impl eframe::App for PainterApp {
         let start = Instant::now();
         let ctx = ui.ctx().clone();
         self.ppp = ctx.pixels_per_point();
-        let _ = self.rs.device.poll(wgpu::PollType::Poll);
-        self.undo.update();
-        self.poll_bake(&ctx);
+        { let t_ = Instant::now(); let _ = self.rs.device.poll(wgpu::PollType::Poll); if self.profile { self.prof.push(("rs.device.poll".into(), t_.elapsed().as_secs_f32() * 1000.0)); } }
+        { let t_ = Instant::now(); self.undo.update(); if self.profile { self.prof.push(("undo.update".into(), t_.elapsed().as_secs_f32() * 1000.0)); } }
+        { let t_ = Instant::now(); self.poll_bake(&ctx); if self.profile { self.prof.push(("poll_bake".into(), t_.elapsed().as_secs_f32() * 1000.0)); } }
         self.poll_spp_open(&ctx);
-        self.update_preview(&ctx);
+        { let t_ = Instant::now(); self.update_preview(&ctx); if self.profile { self.prof.push(("update_preview".into(), t_.elapsed().as_secs_f32() * 1000.0)); } }
         self.poll_env();
         self.poll_hdri_thumbs(&ctx);
         self.poll_library(&ctx);
@@ -5319,7 +6185,7 @@ impl eframe::App for PainterApp {
         }
         self.recovery_dialog(&ctx);
         self.confirm_dialog(&ctx);
-        self.autosave_if_due();
+        { let t_ = Instant::now(); self.autosave_if_due(); if self.profile { self.prof.push(("autosave_if_due".into(), t_.elapsed().as_secs_f32() * 1000.0)); } }
         let title = format!(
             "{}{} — Material Painter",
             self.project_path.as_ref().and_then(|p| p.file_stem()).map_or("Untitled".to_string(), |n| n.to_string_lossy().into_owned()),
@@ -5336,10 +6202,15 @@ impl eframe::App for PainterApp {
         }
         self.path_keys(&ctx);
         self.shortcuts(&ctx);
-        self.process_actions(&ctx);
-        self.process_mcp(&ctx);
+        { let t_ = Instant::now(); self.process_actions(&ctx); if self.profile { self.prof.push(("process_actions".into(), t_.elapsed().as_secs_f32() * 1000.0)); } }
+        { let t_ = Instant::now(); self.process_mcp(&ctx); if self.profile { self.prof.push(("process_mcp".into(), t_.elapsed().as_secs_f32() * 1000.0)); } }
+        { let t_ = Instant::now(); self.process_live_reload(&ctx); if self.profile { self.prof.push(("process_live_reload".into(), t_.elapsed().as_secs_f32() * 1000.0)); } }
 
+        let t_ = Instant::now();
         egui::Panel::top("menu").frame(theme::bar().inner_margin(egui::Margin::symmetric(10, 5))).show(ui, |ui| self.menu_bar(ui));
+        if self.profile {
+            self.prof.push(("menu bar".into(), t_.elapsed().as_secs_f32() * 1000.0));
+        }
         let paint = self.workspace == Workspace::Paint;
         if paint {
             egui::Panel::top("toolbar")
@@ -5356,12 +6227,21 @@ impl eframe::App for PainterApp {
         }
 
         // Panel actions (add layer, etc.) apply before this frame's GPU work.
-        self.process_actions(&ctx);
+        { let t_ = Instant::now(); self.process_actions(&ctx); if self.profile { self.prof.push(("process_actions".into(), t_.elapsed().as_secs_f32() * 1000.0)); } }
+        // Edits made while a button is held (slider and color drags, gizmo
+        // handles) show as quick drafts; the full composite follows on release.
+        let held = ctx.input(|i| i.pointer.any_down());
+        if self.engine.draft && !held {
+            self.engine.draft = false;
+            self.engine.mark_dirty();
+        } else if held && self.engine.dirty && self.stroke.is_none() {
+            self.engine.draft = true;
+        }
         self.sync_brush_tip();
         self.sync_brush_grain();
-        self.update_graphs();
-        self.update_preview_shader();
-        self.update_cage_preview(&ctx);
+        { let t_ = Instant::now(); self.update_graphs(); if self.profile { self.prof.push(("update_graphs".into(), t_.elapsed().as_secs_f32() * 1000.0)); } }
+        { let t_ = Instant::now(); self.update_preview_shader(); if self.profile { self.prof.push(("update_preview_shader".into(), t_.elapsed().as_secs_f32() * 1000.0)); } }
+        { let t_ = Instant::now(); self.update_cage_preview(&ctx); if self.profile { self.prof.push(("update_cage_preview".into(), t_.elapsed().as_secs_f32() * 1000.0)); } }
         match self.workspace {
             Workspace::Paint => {
                 egui::CentralPanel::default().frame(egui::Frame::new().fill(theme::BG).inner_margin(egui::Margin::same(4))).show(ui, |ui| {
@@ -5378,8 +6258,8 @@ impl eframe::App for PainterApp {
         if self.workspace != Workspace::Designer {
             self.graphs.editor.hovered = false;
         }
-        self.views_end_frame(&ctx);
-        self.docks.save_if_changed(&ctx);
+        { let t_ = Instant::now(); self.views_end_frame(&ctx); if self.profile { self.prof.push(("views_end_frame".into(), t_.elapsed().as_secs_f32() * 1000.0)); } }
+        { let t_ = Instant::now(); self.docks.save_if_changed(&ctx); if self.profile { self.prof.push(("docks.save_if_changed".into(), t_.elapsed().as_secs_f32() * 1000.0)); } }
 
         self.export_window(&ctx);
         self.preferences_window(&ctx);
@@ -5392,15 +6272,40 @@ impl eframe::App for PainterApp {
         self.welcome_window(&ctx);
         self.library_window(&ctx);
         // Settings changed in the bake window show on the next frame.
-        self.update_cage_preview(&ctx);
+        { let t_ = Instant::now(); self.update_cage_preview(&ctx); if self.profile { self.prof.push(("update_cage_preview".into(), t_.elapsed().as_secs_f32() * 1000.0)); } }
 
         // Property edits become one undo step once the interaction ends: no
         // button held (slider drags) and no text field focused (typing).
         let idle = !ctx.input(|i| i.pointer.any_down()) && ctx.memory(|m| m.focused().is_none());
         if idle && self.stroke.is_none() {
-            self.engine.commit_props(&mut self.undo);
+            { let t_ = Instant::now(); self.engine.commit_props(&mut self.undo); if self.profile { self.prof.push(("engine.commit_props".into(), t_.elapsed().as_secs_f32() * 1000.0)); } }
         }
+        { let t_ = Instant::now(); self.update_highlight(&ctx); if self.profile { self.prof.push(("update_highlight".into(), t_.elapsed().as_secs_f32() * 1000.0)); } }
         let ms = start.elapsed().as_secs_f32() * 1000.0;
         self.frame_ms = self.frame_ms * 0.9 + ms * 0.1;
+        if self.profile {
+            // The GPU work this frame queued, and how long since the last frame began.
+            let t_gpu = Instant::now();
+            let _ = self.rs.device.poll(wgpu::PollType::wait_indefinitely());
+            let gpu = t_gpu.elapsed().as_secs_f32() * 1000.0;
+            let gap = self.last_frame.map_or(0.0, |t| t.elapsed().as_secs_f32() * 1000.0);
+            self.last_frame = Some(start);
+            if ms > 40.0 || gpu > 25.0 || gap > 120.0 {
+                let name = self.engine.layers.get(self.selected).map_or("-", |l| l.name.as_str());
+                let parts: Vec<String> = self.prof.iter().filter(|(_, v)| *v > 0.5).map(|(k, v)| format!("{k} {v:.1}")).collect();
+                let causes: Vec<String> = ctx.repaint_causes().iter().map(|c| c.to_string()).collect();
+                let line = format!(
+                    "{ms:.1} ms cpu, {gpu:.1} ms gpu, {gap:.0} ms since last frame  selected '{name}'  [{}]  repaint: {}\n",
+                    parts.join(", "),
+                    causes.join(" | ")
+                );
+                let path = std::env::temp_dir().join("mp_profile.log");
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                    use std::io::Write;
+                    let _ = f.write_all(line.as_bytes());
+                }
+            }
+            self.prof.clear();
+        }
     }
 }

@@ -9,7 +9,7 @@ struct Globals {
     light: vec4<f32>,    // env rotation (radians), exposure, env intensity, radiance max lod
     params: vec4<f32>,   // view mode, height strength, texel size, texture resolution
     view2d: vec4<f32>,   // zoom (px per uv), pan x, pan y, unused
-    size: vec4<f32>,     // viewport width, height, baked AO strength, unused
+    size: vec4<f32>,     // viewport width, height, baked AO strength, selection highlight strength
     extra: vec4<f32>,    // use baked normal, has bake, custom map shown (view mode 22), wireframe opacity
     bmin: vec4<f32>,
     bsize: vec4<f32>,
@@ -31,6 +31,9 @@ struct Globals {
 @group(0) @binding(8) var map_d: texture_2d<f32>;  // baked normal xy, height, missed
 @group(0) @binding(9) var map_e: texture_2d<f32>;  // ID
 @group(0) @binding(19) var custom_maps: texture_2d_array<f32>;  // custom map i: channel i % 4 of layer i / 4
+@group(0) @binding(20) var t_nrm: texture_2d<f32>;   // painted normal detail: tangent xy at 0.5 + 0.5 n
+@group(0) @binding(21) var t_emis: texture_2d<f32>;  // emission, linear HDR
+@group(0) @binding(22) var t_hl: texture_2d<f32>;    // the selected layer's coverage (strength in size.w)
 @group(0) @binding(10) var samp: sampler;
 @group(0) @binding(11) var t_wnrm: texture_2d<f32>;
 @group(0) @binding(12) var t_wpos: texture_2d<f32>;
@@ -71,12 +74,17 @@ fn aces(x: vec3<f32>) -> vec3<f32> {
 }
 
 // Karis' analytic approximation of the split-sum environment BRDF.
-fn env_brdf(f0: vec3<f32>, rough: f32, nv: f32) -> vec3<f32> {
+// Scale and bias to F0 of the split-sum environment BRDF (Karis's fit).
+fn env_ab(rough: f32, nv: f32) -> vec2<f32> {
     let c0 = vec4<f32>(-1.0, -0.0275, -0.572, 0.022);
     let c1 = vec4<f32>(1.0, 0.0425, 1.04, -0.04);
     let r = rough * c0 + c1;
     let a004 = min(r.x * r.x, exp2(-9.28 * nv)) * r.x + r.y;
-    let ab = vec2<f32>(-1.04, 1.04) * a004 + r.zw;
+    return vec2<f32>(-1.04, 1.04) * a004 + r.zw;
+}
+
+fn env_brdf(f0: vec3<f32>, rough: f32, nv: f32) -> vec3<f32> {
+    let ab = env_ab(rough, nv);
     return f0 * ab.x + ab.y;
 }
 
@@ -95,14 +103,31 @@ struct Surface {
     f: vec4<f32>,
     wnrm: vec3<f32>,
     wpos: vec3<f32>,
+    // Emitted light (linear), added on top of the shading.
+    emis: vec3<f32>,
 };
 
+// Deepest mip level of the painted channels (`VIEW_MIPS` - 1 in engine.rs).
+const VIEW_MAX_LOD: f32 = 4.0;
+// Footprint scale for the painted channels: below 1 is a negative mip bias
+// (0.6 = -0.74 levels), keeping panel lines crisp at a distance without the
+// shimmer of sampling level 0.
+const VIEW_LOD_SCALE: f32 = 0.6;
+
+// Called from uniform control flow only (it takes screen-space derivatives).
 fn sample_surface(uv: vec2<f32>) -> Surface {
     var s: Surface;
-    s.albedo = textureSampleLevel(t_color, samp, uv, 0.0).rgb;
-    s.rough = textureSampleLevel(t_rough, samp, uv, 0.0).r;
-    s.metal = textureSampleLevel(t_metal, samp, uv, 0.0).r;
-    s.height = textureSampleLevel(t_height, samp, uv, 0.0).r;
+    // The pixel's footprint in UV: the painted channels are mipmapped and
+    // sampled anisotropically over it, so fine detail doesn't shimmer.
+    let ddx = dpdx(uv) * VIEW_LOD_SCALE;
+    let ddy = dpdy(uv) * VIEW_LOD_SCALE;
+    s.albedo = textureSampleGrad(t_color, samp, uv, ddx, ddy).rgb;
+    s.rough = textureSampleGrad(t_rough, samp, uv, ddx, ddy).r;
+    s.metal = textureSampleGrad(t_metal, samp, uv, ddx, ddy).r;
+    s.height = textureSampleGrad(t_height, samp, uv, ddx, ddy).r;
+    s.emis = textureSampleGrad(t_emis, samp, uv, ddx, ddy).rgb;
+    let pxy = textureSampleGrad(t_nrm, samp, uv, ddx, ddy).rg * 2.0 - 1.0;
+    let painted = vec3<f32>(pxy, sqrt(max(1.0 - dot(pxy, pxy), 0.0)));
     s.a = textureSampleLevel(map_a, samp, uv, 0.0);
     s.b = textureSampleLevel(map_b, samp, uv, 0.0);
     s.c = textureSampleLevel(map_c, samp, uv, 0.0);
@@ -112,13 +137,19 @@ fn sample_surface(uv: vec2<f32>) -> Surface {
     s.f = vec4<f32>(textureSampleLevel(custom_maps, samp, uv, ci / 4, 0.0)[ci % 4]);
     s.wnrm = textureSampleLevel(t_wnrm, samp, uv, 0.0).xyz * 2.0 - 1.0;
     s.wpos = textureSampleLevel(t_wpos, samp, uv, 0.0).xyz;
-    let tx = g.params.z;
-    let hl = textureSampleLevel(t_height, samp, uv - vec2<f32>(tx, 0.0), 0.0).r;
-    let hr = textureSampleLevel(t_height, samp, uv + vec2<f32>(tx, 0.0), 0.0).r;
-    let hd = textureSampleLevel(t_height, samp, uv - vec2<f32>(0.0, tx), 0.0).r;
-    let hb = textureSampleLevel(t_height, samp, uv + vec2<f32>(0.0, tx), 0.0).r;
+    // Height slope over the pixel's footprint (at least a texel), from the
+    // matching mip level: one-texel differences under a pixel that covers
+    // many texels turn thin grooves into flickering bright and dark lines.
+    let texels = max(length(ddx), length(ddy)) * g.params.w;
+    let lod = clamp(log2(max(texels, 1.0)), 0.0, VIEW_MAX_LOD);
+    let step = exp2(lod);
+    let tx = g.params.z * step;
+    let hl = textureSampleLevel(t_height, samp, uv - vec2<f32>(tx, 0.0), lod).r;
+    let hr = textureSampleLevel(t_height, samp, uv + vec2<f32>(tx, 0.0), lod).r;
+    let hd = textureSampleLevel(t_height, samp, uv - vec2<f32>(0.0, tx), lod).r;
+    let hb = textureSampleLevel(t_height, samp, uv + vec2<f32>(0.0, tx), lod).r;
     // Height slope per texel, scaled so the look is resolution-independent.
-    let k = g.params.y * g.params.w / 256.0;
+    let k = g.params.y * g.params.w / 256.0 / step;
     let hu = (hr - hl) * 0.5 * k;
     let ht = (hb - hd) * 0.5 * k;
     var base = vec3<f32>(0.0, 0.0, 1.0);
@@ -127,8 +158,8 @@ fn sample_surface(uv: vec2<f32>) -> Surface {
         let by = s.d.y;
         base = vec3<f32>(bx, by, sqrt(max(1.0 - bx * bx - by * by, 0.0)));
     }
-    // Whiteout blend of baked normal and height detail.
-    s.ts = normalize(vec3<f32>(base.xy + vec2<f32>(-hu, ht), base.z));
+    // Whiteout blend of baked normal, painted normal detail and height detail.
+    s.ts = normalize(vec3<f32>(base.xy + painted.xy + vec2<f32>(-hu, ht), base.z * painted.z));
     return s;
 }
 
@@ -223,6 +254,7 @@ fn shade(s: Surface, n: vec3<f32>, v: vec3<f32>, shadow: f32) -> vec3<f32> {
             return mix(base, vec3<f32>(1.0, 0.02, 0.02), s.d.w);
         }
         case 22: { return lin(s.f.r); }
+        case 23: { return s.emis; }
         default: {}
     }
     return shade_pbr(s, n, v, shadow);
@@ -241,14 +273,22 @@ fn shade_pbr(s: Surface, n: vec3<f32>, v: vec3<f32>, shadow: f32) -> vec3<f32> {
     // (it's sky occlusion), so at full strength it darkens whole crevices,
     // not just contact lines; the view applies it at the user's strength.
     let ao = mix(1.0, s.a.r, clamp(g.size.z, 0.0, 1.0));
-    let spec = env_brdf(f0, rough, nv);
+    let ab = env_ab(rough, nv);
+    let spec = f0 * ab.x + ab.y;
+    // Multiple scattering (Fdez-Aguera 2019): single-scatter GGX loses the
+    // light that bounces more than once inside rough metal; Cycles, Unreal
+    // and Substance keep it. Without this, rough steel shades ~8% too dark.
+    // The cap keeps the analytic fit (which underestimates A + B when very
+    // rough) from overshooting: checked against Cycles on a sphere chart
+    // (tools/parity/chart.py).
+    let ms = min(1.0 + f0 * (1.0 / max(ab.x + ab.y, 1e-3) - 1.0), 1.0 + 0.5 * f0);
     var col = diffuse_c * (1.0 - spec) * irradiance(n) / PI * ao;
     let r = reflect(-v, n);
     let spec_ao = clamp(pow(nv + ao, exp2(-16.0 * a - 1.0)) - 1.0 + ao, 0.0, 1.0);
-    col += env(r, rough) * spec * spec_ao;
+    col += env(r, rough) * spec * ms * spec_ao;
     // Baked AO darkens the key light only a little: it's mostly sky occlusion.
     col += key_light(s, n, v, shadow) * mix(1.0, ao, 0.35);
-    return col;
+    return col + s.emis;
 }
 
 // ---------------------------------------------------------------- backdrop
@@ -338,7 +378,14 @@ fn mesh_shade_inputs(in: MeshOut, front: bool) -> Shade {
 @fragment
 fn fs_mesh(in: MeshOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {
     let c = mesh_shade_inputs(in, front);
-    return vec4<f32>(shade(c.s, c.n, c.v, c.shadow), 1.0);
+    var col = shade(c.s, c.n, c.v, c.shadow);
+    if (g.size.w > 0.0) {
+        // Where the selected layer shows: tinted, with the rest dimmed.
+        let m = textureSampleLevel(t_hl, samp, in.uv, 0.0).r;
+        let tint = vec3<f32>(1.0, 0.55, 0.1);
+        col = mix(col, mix(col * 0.35, tint * (0.25 + dot(col, vec3<f32>(0.3, 0.6, 0.1))), m), g.size.w);
+    }
+    return vec4<f32>(col, 1.0);
 }
 
 // ---------------------------------------------------------------- 2D view

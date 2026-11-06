@@ -19,7 +19,18 @@ use wgpu::TextureFormat as F;
 
 pub const CH_NAMES: [&str; 4] = ["Base Color", "Roughness", "Metallic", "Height"];
 const PAINT_FORMATS: [F; 4] = [F::Rgba8Unorm, F::Rg8Unorm, F::Rg8Unorm, F::Rg16Float];
-const ACCUM_FORMATS: [F; 4] = [F::Rgba8Unorm, F::R8Unorm, F::R8Unorm, F::R16Float];
+/// Final channels: the four paint channels, then normal and emission, which
+/// fill (and decal) layers write. Paint layers leave the last two alone.
+pub const FINAL_CHANNELS: usize = 6;
+/// Tangent-space normal detail: x and y at 0.5 + 0.5 * n (z is implied).
+pub const NORMAL_CH: usize = 4;
+/// Emitted light, linear HDR rgb.
+pub const EMISSION_CH: usize = 5;
+const ACCUM_FORMATS: [F; FINAL_CHANNELS] =
+    [F::Rgba8Unorm, F::R8Unorm, F::R8Unorm, F::R16Float, F::Rg8Unorm, F::Rgba16Float];
+/// MikkTSpace tangent per texel (xyz at 0.5 + 0.5 * t, bitangent sign in alpha),
+/// to turn projected normal images into the mesh's tangent space.
+const TAN_FORMAT: F = F::Rgba8Unorm;
 const POS_FORMAT: F = F::Rgba16Float;
 const NRM_FORMAT: F = F::Rgba8Unorm;
 const MASK_FORMAT: F = F::R8Unorm;
@@ -439,6 +450,23 @@ pub struct FillParams {
     pub tri_sharpness: f32,
     /// The material graph whose outputs fill the image slots (an app graph id).
     pub graph: Option<u64>,
+    /// Writes the normal channel: the normal image's detail (flat without one),
+    /// combined with the normals below like Substance's "Normal Map Detail".
+    pub normal_on: bool,
+    /// Scales the normal image's slopes (1: as authored).
+    pub normal_strength: f32,
+    /// The normal image is DirectX-style (green pointing down).
+    pub normal_dx: bool,
+    /// Writes the emission channel: the emission image (sRGB), or `emission`
+    /// (sRGB) without one, times `emission_strength`.
+    pub emission_on: bool,
+    pub emission: [f32; 3],
+    pub emission_strength: f32,
+    /// Where the layer shows with the Decal projection.
+    pub decal: crate::decal::Decal,
+    /// Paint running down from a text decal: this layer follows that layer's
+    /// decal and text (see `Engine::sync_runoffs`).
+    pub runoff: Option<crate::decal::Runoff>,
 }
 
 /// The order is the shader's projection index (`composite.wgsl`).
@@ -457,10 +485,13 @@ pub enum Projection {
     Spherical,
     /// Wrapped around the vertical axis like a can label.
     Cylindrical,
+    /// Inside a box placed on the surface (`FillParams::decal`): bands,
+    /// stripes, text and insignia that stay where they're put.
+    Decal,
 }
 
 impl Projection {
-    pub const ALL: [Projection; 7] = [
+    pub const ALL: [Projection; 8] = [
         Projection::Uv,
         Projection::Triplanar,
         Projection::PlanarX,
@@ -468,6 +499,7 @@ impl Projection {
         Projection::PlanarZ,
         Projection::Spherical,
         Projection::Cylindrical,
+        Projection::Decal,
     ];
     pub fn name(self) -> &'static str {
         match self {
@@ -478,6 +510,7 @@ impl Projection {
             Projection::PlanarZ => "Planar Z",
             Projection::Spherical => "Spherical",
             Projection::Cylindrical => "Cylindrical",
+            Projection::Decal => "Decal",
         }
     }
     /// Name in projects and MCP calls.
@@ -490,6 +523,7 @@ impl Projection {
             Projection::PlanarZ => "planar_z",
             Projection::Spherical => "spherical",
             Projection::Cylindrical => "cylindrical",
+            Projection::Decal => "decal",
         }
     }
     pub fn from_key(key: &str) -> Option<Projection> {
@@ -504,6 +538,7 @@ impl Projection {
             }
             Projection::Spherical => "Wrap around the mesh's center like a globe",
             Projection::Cylindrical => "Wrap around the vertical axis like a can label",
+            Projection::Decal => "Only inside a box placed on the surface: bands, stripes, text, insignia. The image's alpha cuts it out.",
         }
     }
 }
@@ -524,9 +559,20 @@ impl Default for FillParams {
             offset: [0.0; 2],
             tri_sharpness: 4.0,
             graph: None,
+            normal_on: false,
+            normal_strength: 1.0,
+            normal_dx: false,
+            emission_on: false,
+            emission: [1.0, 1.0, 1.0],
+            emission_strength: 1.0,
+            decal: crate::decal::Decal::default(),
+            runoff: None,
         }
     }
 }
+
+/// Fill image slots: the paint channels', then the normal and emission images.
+pub const IMAGE_SLOTS: usize = FINAL_CHANNELS;
 
 /// A bitmap feeding one channel of a fill layer. Shared, so duplicating a
 /// layer or keeping it in the history costs no copy; `encoded` is the
@@ -536,6 +582,9 @@ pub struct FillImage {
     pub tex: Arc<Tex>,
     pub name: String,
     pub encoded: Arc<Vec<u8>>,
+    /// The text this image was rendered from (text decals): editing it
+    /// renders the image again.
+    pub text: Option<Arc<crate::decal::TextSpec>>,
 }
 
 /// Largest image edge kept on the GPU; bigger files are scaled down.
@@ -777,8 +826,9 @@ pub struct Layer {
     pub mask: Option<Mask>,
     /// The folder this layer is in. A folder's layers sit directly below it.
     pub parent: Option<u64>,
-    /// Fill layers: images replacing color, roughness, metallic, height.
-    pub images: [Option<FillImage>; 4],
+    /// Fill layers: images replacing color, roughness, metallic, height,
+    /// then the normal image and the emission image.
+    pub images: [Option<FillImage>; IMAGE_SLOTS],
     /// egui handle of the color channel, used as the layer thumbnail.
     pub thumb: Option<egui::TextureId>,
 }
@@ -822,6 +872,12 @@ struct LayerUniform {
     gid: [f32; 4],
     gx: [f32; 4],
     img: [f32; 4],
+    /// Emission: linear rgb times strength, strength.
+    emis: [f32; 4],
+    /// Normal on, emission on, normal strength, normal image is DirectX.
+    ex: [f32; 4],
+    /// The decal box (see `Decal::uniform`).
+    dc: [[f32; 4]; 4],
 }
 
 #[repr(C)]
@@ -886,8 +942,15 @@ struct Pipelines {
     apply_mask: wgpu::RenderPipeline,
     composite: wgpu::RenderPipeline,
     folder_merge: wgpu::RenderPipeline,
+    /// The same, for documents without normal or emission layers: the four
+    /// paint channels only (about half the memory traffic per pass).
+    composite4: wgpu::RenderPipeline,
+    folder_merge4: wgpu::RenderPipeline,
     composite_bgl: wgpu::BindGroupLayout,
     mask_source: wgpu::RenderPipeline,
+    /// A layer's coverage (see `fs_cover`) for the selection highlight, kept
+    /// where it's highest (a folder's layers, merged).
+    cover_max: wgpu::RenderPipeline,
     mask_filter: wgpu::RenderPipeline,
     mask_filter_bgl: wgpu::BindGroupLayout,
     resample: HashMap<F, wgpu::RenderPipeline>,
@@ -901,7 +964,7 @@ pub struct Engine {
     repeat_sampler: wgpu::Sampler,
     /// The stack below each open faded/masked folder while its layers are
     /// composited, one set per nesting level; only allocated while needed.
-    folder_below: Vec<[Tex; 4]>,
+    folder_below: Vec<[Tex; FINAL_CHANNELS]>,
     rs: egui_wgpu::RenderState,
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -913,8 +976,12 @@ pub struct Engine {
     tris: std::ops::Range<u32>,
     pos: Tex,
     nrm: Tex,
-    accum: [[Tex; 4]; 2],
+    tan: Tex,
+    accum: [[Tex; FINAL_CHANNELS]; 2],
     final_idx: usize,
+    /// Mipmapped copies of the final channels for the viewport (see
+    /// [`Engine::view_tex`]); rebuilt after every composite.
+    view_mips: Option<[Tex; FINAL_CHANNELS]>,
     stroke: Tex,
     snap: [Option<Tex>; 4],
     snap_mask: Option<Tex>,
@@ -966,13 +1033,34 @@ pub struct Engine {
     pub dirty: bool,
     /// Something besides the painted layer changed since the last composite.
     full_dirty: bool,
+    /// The selected layer's coverage in UV space (the viewport tints it while
+    /// `highlight` is above 0), and the layer it shows.
+    highlight_tex: Option<Tex>,
+    pub highlight: f32,
+    /// The layer shown alone (see `solo_keeps`); not saved.
+    pub solo: Option<u64>,
+    /// Composite at a fraction of the size (while a setting is being dragged):
+    /// the whole stack in a few milliseconds instead of a full-size pass.
+    pub draft: bool,
+    draft_accum: Option<[[Tex; FINAL_CHANNELS]; 2]>,
+    draft_below: Vec<[Tex; FINAL_CHANNELS]>,
+    /// Which draft set holds the last draft result (none: show the full one).
+    draft_final: Option<usize>,
+    /// The layer whose settings are being edited: like a stroke's layer, the
+    /// next composite can start at its pass from the stack kept below it.
+    edit_layer: Option<u64>,
+    /// Some fill layer writes normal or emission: composite all six channels.
+    extra_channels: bool,
+    /// What the normal and emission channels read without such layers.
+    flat_normal: Tex,
+    no_emission: Tex,
     /// The layer the current stroke paints (content or mask).
     stroke_layer: Option<u64>,
     /// The stack below the painted layer, kept so stroke frames only
     /// recomposite from that layer up.
     prefix: Option<Prefix>,
     /// Holds the stack below the painted layer when more passes follow it.
-    prefix_cache: Option<[Tex; 4]>,
+    prefix_cache: Option<[Tex; FINAL_CHANNELS]>,
     /// Filtered masks: per layer, the two textures its filter steps
     /// alternate between (the result is in one of them).
     mask_out: HashMap<u64, [Tex; 3]>,
@@ -986,7 +1074,11 @@ pub struct Engine {
     pub generation: u64,
 }
 
-fn accum_set(device: &wgpu::Device, res: u32, label: &str) -> [Tex; 4] {
+/// Mip levels of the viewport's copies of the final channels (4096 down to
+/// 256). Deeper levels would blend across UV islands. `view.wgsl` matches it.
+const VIEW_MIPS: u32 = 5;
+
+fn accum_set(device: &wgpu::Device, res: u32, label: &str) -> [Tex; FINAL_CHANNELS] {
     ACCUM_FORMATS.map(|f| Tex::new(device, label, res, res, f, LAYER_USAGE))
 }
 
@@ -1037,8 +1129,10 @@ impl Engine {
             rs: rs.clone(),
             pos: Tex::new(&device, "position map", res, res, POS_FORMAT, LAYER_USAGE),
             nrm: Tex::new(&device, "normal map", res, res, NRM_FORMAT, LAYER_USAGE),
+            tan: Tex::new(&device, "tangent map", res, res, TAN_FORMAT, LAYER_USAGE),
             accum: [accum_set(&device, res, "accum A"), accum_set(&device, res, "accum B")],
             final_idx: 0,
+            view_mips: None,
             stroke: Tex::new(&device, "stroke mask", res, res, STROKE_FORMAT, LAYER_USAGE),
             snap: [None, None, None, None],
             snap_mask: None,
@@ -1085,6 +1179,25 @@ impl Engine {
             active: None,
             dirty: true,
             full_dirty: true,
+            highlight_tex: None,
+            highlight: 0.0,
+            solo: None,
+            draft: false,
+            draft_accum: None,
+            draft_below: Vec::new(),
+            draft_final: None,
+            edit_layer: None,
+            extra_channels: false,
+            flat_normal: {
+                let t = Tex::new(&device, "flat normal", 1, 1, F::Rg8Unorm, LAYER_USAGE);
+                queue.write_texture(t.copy_info(), &[128, 128], wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(256), rows_per_image: None }, t.extent());
+                t
+            },
+            no_emission: {
+                let t = Tex::new(&device, "no emission", 1, 1, F::Rgba16Float, LAYER_USAGE);
+                queue.write_texture(t.copy_info(), &[0; 8], wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(256), rows_per_image: None }, t.extent());
+                t
+            },
             stroke_layer: None,
             prefix: None,
             prefix_cache: None,
@@ -1133,14 +1246,14 @@ impl Engine {
                 module: &uv_module,
                 entry_point: Some("fs_uv"),
                 compilation_options: Default::default(),
-                targets: &[gpu::target(POS_FORMAT), gpu::target(NRM_FORMAT)],
+                targets: &[gpu::target(POS_FORMAT), gpu::target(NRM_FORMAT), gpu::target(TAN_FORMAT)],
             }),
             multiview_mask: None,
             cache: None,
         });
         let dilate_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("dilate"),
-            entries: &[gpu::tex_entry(0, false), gpu::tex_entry(1, false)],
+            entries: &[gpu::tex_entry(0, false), gpu::tex_entry(1, false), gpu::tex_entry(2, false)],
         });
         let dilate = gpu::fullscreen_pipeline(
             device,
@@ -1148,7 +1261,7 @@ impl Engine {
             &uv_module,
             "fs_dilate",
             &gpu::layout(device, &dilate_bgl),
-            &[gpu::target(POS_FORMAT), gpu::target(NRM_FORMAT)],
+            &[gpu::target(POS_FORMAT), gpu::target(NRM_FORMAT), gpu::target(TAN_FORMAT)],
         );
 
         // Brush stamping into the stroke mask.
@@ -1286,6 +1399,11 @@ impl Engine {
         }
         entries.push(gpu::sampler_entry(17));
         entries.push(gpu::sampler_entry(18));
+        // Normal and emission: the stack below (19, 20), the layer's images or
+        // the folder-below stack (21, 22), and the tangent map (23).
+        for (b, filterable) in [(19, false), (20, false), (21, true), (22, true), (23, false)] {
+            entries.push(gpu::tex_entry(b, filterable));
+        }
         let composite_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("composite"),
             entries: &entries,
@@ -1306,6 +1424,10 @@ impl Engine {
             &gpu::layout(device, &composite_bgl),
             &ACCUM_FORMATS.map(gpu::target),
         );
+        let four = &ACCUM_FORMATS.map(gpu::target)[..4];
+        let composite4 = gpu::fullscreen_pipeline(device, "composite (4)", &composite_module, "fs_layer4", &gpu::layout(device, &composite_bgl), four);
+        let folder_merge4 =
+            gpu::fullscreen_pipeline(device, "folder merge (4)", &composite_module, "fs_folder_merge4", &gpu::layout(device, &composite_bgl), four);
         let mask_source = gpu::fullscreen_pipeline(
             device,
             "mask source",
@@ -1313,6 +1435,19 @@ impl Engine {
             "fs_mask_source",
             &gpu::layout(device, &composite_bgl),
             &[gpu::target(MASK_FILTER_FORMAT)],
+        );
+        let max_blend = wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Max };
+        let cover_max = gpu::fullscreen_pipeline(
+            device,
+            "layer cover (max)",
+            &composite_module,
+            "fs_cover",
+            &gpu::layout(device, &composite_bgl),
+            &[Some(wgpu::ColorTargetState {
+                format: MASK_FILTER_FORMAT,
+                blend: Some(wgpu::BlendState { color: max_blend, alpha: max_blend }),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
         );
         let mask_filter_module = gpu::shader(device, "mask filter", include_str!("shaders/mask_filter.wgsl"));
         let mask_filter_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -1335,7 +1470,8 @@ impl Engine {
             entries: &[gpu::tex_entry(0, true), gpu::sampler_entry(1)],
         });
         let resample_layout = gpu::layout(device, &resample_bgl);
-        let resample = [F::Rgba8Unorm, F::Rg8Unorm, F::Rg16Float, F::R8Unorm, F::R16Float, F::Rgba16Float]
+        let resample =
+            [F::Rgba8Unorm, F::Rgba8UnormSrgb, F::Rg8Unorm, F::Rg16Float, F::R8Unorm, F::R16Float, F::Rgba16Float]
             .into_iter()
             .map(|f| {
                 let pl = gpu::fullscreen_pipeline(
@@ -1394,8 +1530,11 @@ impl Engine {
             apply_mask,
             composite,
             folder_merge,
+            composite4,
+            folder_merge4,
             composite_bgl,
             mask_source,
+            cover_max,
             mask_filter,
             mask_filter_bgl,
             resample,
@@ -1416,39 +1555,52 @@ impl Engine {
         let device = &self.device;
         let tmp_pos = Tex::new(device, "dilate pos", self.res, self.res, POS_FORMAT, LAYER_USAGE);
         let tmp_nrm = Tex::new(device, "dilate nrm", self.res, self.res, NRM_FORMAT, LAYER_USAGE);
+        let tmp_tan = Tex::new(device, "dilate tan", self.res, self.res, TAN_FORMAT, LAYER_USAGE);
         let mut encoder = device.create_command_encoder(&Default::default());
         {
             let clear = wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT);
             let mut pass = gpu::pass(
                 &mut encoder,
                 "uv bake",
-                &[gpu::color_attachment(&self.pos.view, clear), gpu::color_attachment(&self.nrm.view, clear)],
+                &[
+                    gpu::color_attachment(&self.pos.view, clear),
+                    gpu::color_attachment(&self.nrm.view, clear),
+                    gpu::color_attachment(&self.tan.view, clear),
+                ],
             );
             pass.set_pipeline(&self.p.uvbake);
             pass.set_vertex_buffer(0, mesh.vertices.slice(..));
             pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
             pass.draw_indexed(tris, 0, 0..1);
         }
-        let bg = |src_pos: &Tex, src_nrm: &Tex| {
+        let bg = |src_pos: &Tex, src_nrm: &Tex, src_tan: &Tex| {
             device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: None,
                 layout: &self.p.dilate_bgl,
                 entries: &[
                     wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&src_pos.view) },
                     wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&src_nrm.view) },
+                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&src_tan.view) },
                 ],
             })
         };
-        let forward = bg(&self.pos, &self.nrm);
-        let backward = bg(&tmp_pos, &tmp_nrm);
+        let forward = bg(&self.pos, &self.nrm, &self.tan);
+        let backward = bg(&tmp_pos, &tmp_nrm, &tmp_tan);
         for i in 0..DILATE_PASSES {
-            let (group, dst_pos, dst_nrm) =
-                if i % 2 == 0 { (&forward, &tmp_pos, &tmp_nrm) } else { (&backward, &self.pos, &self.nrm) };
+            let (group, dst_pos, dst_nrm, dst_tan) = if i % 2 == 0 {
+                (&forward, &tmp_pos, &tmp_nrm, &tmp_tan)
+            } else {
+                (&backward, &self.pos, &self.nrm, &self.tan)
+            };
             let load = wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT);
             let mut pass = gpu::pass(
                 &mut encoder,
                 "dilate",
-                &[gpu::color_attachment(&dst_pos.view, load), gpu::color_attachment(&dst_nrm.view, load)],
+                &[
+                    gpu::color_attachment(&dst_pos.view, load),
+                    gpu::color_attachment(&dst_nrm.view, load),
+                    gpu::color_attachment(&dst_tan.view, load),
+                ],
             );
             pass.set_pipeline(&self.p.dilate);
             pass.set_bind_group(0, group, &[]);
@@ -1639,9 +1791,10 @@ impl Engine {
     /// (derived data: no history entry).
     pub fn set_graph_images(&mut self, idx: usize, outputs: [Option<Arc<Tex>>; 4], name: &str) {
         let Some(layer) = self.layers.get_mut(idx) else { return };
-        layer.images = outputs.map(|o| {
-            o.map(|tex| FillImage { tex, name: name.to_string(), encoded: Arc::new(Vec::new()) })
-        });
+        // Graphs output the four paint channels; normal and emission images stay unset.
+        let [a, b, c, d] = outputs;
+        let [a, b, c, d] = [a, b, c, d].map(|o| o.map(|tex| FillImage { tex, name: name.to_string(), encoded: Arc::new(Vec::new()), text: None }));
+        layer.images = [a, b, c, d, None, None];
         self.mark_dirty();
     }
 
@@ -1794,6 +1947,25 @@ impl Engine {
         self.mark_dirty();
     }
 
+    /// Replaces the whole stack with `layers` as one undo step, keeping their
+    /// ids (a project file edited on disk refers to layers by id).
+    pub fn replace_layers(&mut self, layers: Vec<Layer>, label: String, undo: &mut UndoStack) {
+        self.commit_props(undo);
+        undo.begin_group(label.clone());
+        while let Some(top) = self.layers.len().checked_sub(1) {
+            self.delete_layer(top, undo);
+        }
+        for (at, mut layer) in layers.into_iter().enumerate() {
+            Self::attach_thumb(&self.rs, &mut layer);
+            self.next_id = self.next_id.max(layer.id);
+            self.insert_layer(at, layer, undo, label.clone());
+        }
+        undo.end_group();
+        self.folder_below.clear();
+        self.maps_dirty = true;
+        self.mark_dirty();
+    }
+
     /// The final material at a UV position: sRGB color, roughness, metallic.
     pub fn sample_final(&self, uv: glam::Vec2) -> ([f32; 3], f32, f32) {
         let res = self.res as f32;
@@ -1842,7 +2014,7 @@ impl Engine {
         let name = format!("{dir}{}", path.file_name().map_or("image".into(), |n| n.to_string_lossy()));
         if let Some((tex, encoded)) = self.image_cache.get(path) {
             if let Some(tex) = tex.upgrade() {
-                return Ok(FillImage { tex, name, encoded: encoded.clone() });
+                return Ok(FillImage { tex, name, encoded: encoded.clone(), text: None });
             }
         }
         let encoded = Arc::new(std::fs::read(path).map_err(|e| format!("can't read {}: {e}", path.display()))?);
@@ -1858,7 +2030,21 @@ impl Engine {
         let img = image::load_from_memory(&encoded).map_err(|e| format!("can't read {name}: {e}"))?;
         let gray = matches!(img.color(), image::ColorType::L8 | image::ColorType::L16);
         let tex = if gray { self.upload_mips(img.into_luma8(), F::R8Unorm) } else { self.upload_mips(img.into_rgba8(), F::Rgba8Unorm) };
-        Ok(FillImage { tex: Arc::new(tex), name, encoded })
+        Ok(FillImage { tex: Arc::new(tex), name, encoded, text: None })
+    }
+
+    /// Text rendered into a fill image (white, coverage in alpha) that
+    /// remembers its text. Returns the image and its width over height.
+    pub fn text_fill_image(&self, spec: &crate::decal::TextSpec) -> Result<(FillImage, f32), String> {
+        let img = crate::decal::render_text(spec, 160.0)?;
+        let aspect = img.width() as f32 / img.height().max(1) as f32;
+        let mut encoded = Vec::new();
+        image::DynamicImage::ImageRgba8(img.clone())
+            .write_to(&mut std::io::Cursor::new(&mut encoded), image::ImageFormat::Png)
+            .map_err(|e| e.to_string())?;
+        let tex = self.upload_mips(img, F::Rgba8Unorm);
+        let name = format!("text: {}", spec.text.replace('\n', " "));
+        Ok((FillImage { tex: Arc::new(tex), name, encoded: Arc::new(encoded), text: Some(Arc::new(spec.clone())) }, aspect))
     }
 
     fn upload_mips<P: image::Pixel<Subpixel = u8> + 'static>(&self, mut img: image::ImageBuffer<P, Vec<u8>>, format: F) -> Tex {
@@ -1902,7 +2088,7 @@ impl Engine {
     /// channel when an image is set; one undo step.
     pub fn set_fill_image(&mut self, idx: usize, ch: usize, image: Option<FillImage>, undo: &mut UndoStack) {
         let Some(layer) = self.layers.get(idx) else { return };
-        if !layer.is_fill() || ch >= 4 {
+        if !layer.is_fill() || ch >= IMAGE_SLOTS {
             return;
         }
         let label = format!("Image on {}", layer.name);
@@ -1910,7 +2096,11 @@ impl Engine {
         undo.begin_group(label.clone());
         let layer = &mut self.layers[idx];
         if let (Content::Fill(f), true) = (&mut layer.content, image.is_some()) {
-            f.mat.enabled[ch] = true;
+            match ch {
+                NORMAL_CH => f.normal_on = true,
+                EMISSION_CH => f.emission_on = true,
+                _ => f.mat.enabled[ch] = true,
+            }
             // A height image is scaled by the height value: start it as is.
             if ch == 3 && f.mat.height == 0.0 && layer.images[3].is_none() {
                 f.mat.height = 0.5;
@@ -2080,7 +2270,7 @@ impl Engine {
             chans[ch] = Some(if size == self.res { src } else { self.resample(&mut encoder, &src, self.res) });
         }
         self.queue.submit([encoder.finish()]);
-        let thumb = chans[0].as_ref().map(|c| self.rs.renderer.write().register_native_texture(&self.device, c.srgb(), wgpu::FilterMode::Linear));
+        let thumb = chans[0].as_ref().map(|c| self.rs.renderer.write().register_native_texture(&self.device, &c.view, wgpu::FilterMode::Linear));
         let layer = Layer {
             id: self.new_id(),
             name,
@@ -2194,7 +2384,16 @@ impl Engine {
 
     /// A copy of one layer with new textures and id, not yet in the stack.
     fn copy_layer(&mut self, idx: usize) -> Layer {
-        let src = &self.layers[idx];
+        let mut layer = self.copy_of(&self.layers[idx]);
+        layer.id = self.new_id();
+        Self::attach_thumb(&self.rs, &mut layer);
+        layer
+    }
+
+    /// A copy of a layer with its own textures, off the stack (same id and
+    /// parent, no thumbnail): what the layer clipboard holds, and pastes
+    /// through `insert_layers`.
+    pub fn copy_of(&self, src: &Layer) -> Layer {
         let mut encoder = self.device.create_command_encoder(&Default::default());
         let copy = |encoder: &mut wgpu::CommandEncoder, t: &Tex| {
             let n = Tex::new(&self.device, "layer", t.width, t.height, t.format, LAYER_USAGE);
@@ -2216,10 +2415,7 @@ impl Engine {
         let (name, visible, opacity, blend, parent) = (src.name.clone(), src.visible, src.opacity, src.blend, src.parent);
         let images = src.images.clone();
         self.queue.submit([encoder.finish()]);
-        let id = self.new_id();
-        let mut layer = Layer { id, name, visible, opacity, blend, content, mask, parent, images, thumb: None };
-        Self::attach_thumb(&self.rs, &mut layer);
-        layer
+        Layer { id: src.id, name, visible, opacity, blend, content, mask, parent, images, thumb: None }
     }
 
     /// Moves a layer so it ends up where layer `to` is now (index-based, for
@@ -2348,7 +2544,7 @@ impl Engine {
             if let Some(color) = &ch[0] {
                 layer.thumb = Some(rs.renderer.write().register_native_texture(
                     &rs.device,
-                    color.srgb(),
+                    &color.view,
                     wgpu::FilterMode::Linear,
                 ));
             }
@@ -2527,7 +2723,7 @@ impl Engine {
         if ch == 0 {
             layer.thumb = Some(self.rs.renderer.write().register_native_texture(
                 &self.device,
-                tex.srgb(),
+                &tex.view,
                 wgpu::FilterMode::Linear,
             ));
         }
@@ -2950,6 +3146,19 @@ impl Engine {
         self.full_dirty = true;
     }
 
+    /// Only the layer at `idx` changed (its settings or mask): the next
+    /// composite can start at that layer from the stack kept below it,
+    /// instead of recompositing everything under it.
+    pub fn mark_layer_dirty(&mut self, idx: usize) {
+        let Some(id) = self.layers.get(idx).map(|l| l.id) else { return self.mark_dirty() };
+        if self.edit_layer != Some(id) || self.stroke_layer.is_some() {
+            self.full_dirty = true;
+        }
+        self.edit_layer = Some(id);
+        self.region_unknown = true;
+        self.dirty = true;
+    }
+
     /// Finishes the stroke and returns its undo record.
     pub fn end_stroke(&mut self) -> Option<UndoEntry> {
         // The stroke's layer keeps its last thumbnail; the next update redoes it.
@@ -3021,8 +3230,20 @@ impl Engine {
                 if layer.images[0].as_ref().is_some_and(|im| im.tex.format == F::R8Unorm) {
                     bits |= 16;
                 }
+                if layer.images[NORMAL_CH].is_some() {
+                    bits |= 32;
+                }
+                if layer.images[EMISSION_CH].is_some() {
+                    bits |= 64;
+                }
+                let lin = |c: f32| if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) };
+                let e = f.emission.map(lin).map(|c| c * f.emission_strength);
+                u.emis = [e[0], e[1], e[2], f.emission_strength];
+                let on = |b: bool| if b { 1.0 } else { 0.0 };
+                u.ex = [on(f.normal_on), on(f.emission_on), f.normal_strength, on(f.normal_dx)];
                 u.var1 = [f.seed, f.part_var, f.projection as u32 as f32, bits as f32];
                 u.img = [f.tiling, f.rotation, f.offset[0], f.offset[1]];
+                u.dc = f.decal.uniform(f.rotation);
                 u.gx[2] = f.tri_sharpness;
                 (1.0, flags(m.enabled))
             }
@@ -3048,13 +3269,28 @@ impl Engine {
         let (lo, hi) = self.bounds;
         u.bmin = [lo.x, lo.y, lo.z, 0.0];
         u.bsize = [hi.x - lo.x, hi.y - lo.y, hi.z - lo.z, 0.0];
-        u.gx = [self.edge_max, 0.0, 0.0, 0.0];
+        u.gx[0] = self.edge_max;
         u
     }
 
     /// Shown: the layer and every folder around it are visible.
     fn shown(&self, idx: usize) -> bool {
-        self.layers[idx].visible && self.ancestors(idx).all(|a| self.layers[a].visible)
+        self.layers[idx].visible && self.ancestors(idx).all(|a| self.layers[a].visible) && self.solo_keeps(idx)
+    }
+
+    /// With a layer soloed, only it, what's inside it (a folder) and the
+    /// folders around it composite.
+    fn solo_keeps(&self, idx: usize) -> bool {
+        let Some(s) = self.solo.and_then(|id| self.index_of(id)) else { return true };
+        idx == s || self.ancestors(idx).any(|a| a == s) || self.ancestors(s).any(|a| a == idx)
+    }
+
+    /// Solos the layer with this id (or ends the solo with `None`).
+    pub fn set_solo(&mut self, id: Option<u64>) {
+        if self.solo != id {
+            self.solo = id;
+            self.mark_dirty();
+        }
     }
 
     /// A folder that fades or masks its contents, so it composites them apart.
@@ -3069,6 +3305,7 @@ impl Engine {
         if self.maps_dirty {
             self.resolve_maps();
         }
+        self.sync_runoffs();
         let n = self.layers.len();
         let mut passes = Vec::new();
         let (mut depth, mut max_depth) = (0, 0);
@@ -3085,7 +3322,7 @@ impl Engine {
             let l = &self.layers[i];
             let has_content = match &l.content {
                 Content::Paint(ch) => ch.iter().any(|c| c.is_some()),
-                Content::Fill(f) => f.mat.enabled.iter().any(|&e| e),
+                Content::Fill(f) => f.mat.enabled.iter().any(|&e| e) || f.normal_on || f.emission_on,
                 Content::Folder(_) => false,
             };
             if has_content && l.opacity > 0.0 && self.shown(i) {
@@ -3146,6 +3383,9 @@ impl Engine {
         for (k, pass) in passes.iter().enumerate() {
             let (Pass::Layer(li) | Pass::End(li)) = *pass else { continue };
             let mut u = self.layer_uniform(&self.layers[li]);
+            if self.draft {
+                u.gx[1] = self.draft_stride() as f32;
+            }
             if let Some(&slot) = source_slot.get(&li) {
                 let off = slot * UNIFORM_STRIDE as usize;
                 data[off..off + size_of::<LayerUniform>()].copy_from_slice(bytemuck::bytes_of(&u));
@@ -3222,14 +3462,25 @@ impl Engine {
         }
         self.queue.write_buffer(&self.mask_filter_ubuf, 0, &sdata);
 
-        // While painting, everything below the painted layer is unchanged:
-        // start at its pass from the kept prefix instead of the bottom.
-        let resume = self
-            .prefix
-            .take()
-            .filter(|p| !self.full_dirty && self.stroke_layer == Some(p.layer_id) && p.passes == passes);
-        // A full composite while painting records the prefix for the next frames.
-        let record = self.stroke_layer.filter(|_| resume.is_none()).and_then(|id| {
+        // Normal and emission cost memory traffic in every pass: only
+        // composite them when some layer writes them.
+        let extra = self.layers.iter().any(|l| matches!(&l.content, Content::Fill(f) if f.normal_on || f.emission_on));
+        if extra != self.extra_channels {
+            self.extra_channels = extra;
+            self.full_dirty = true;
+        }
+        let nch = if extra { FINAL_CHANNELS } else { 4 };
+        if self.draft && self.stroke_layer.is_none() {
+            self.composite_draft(&passes, extra, nch, &source_slot);
+            return;
+        }
+        // While painting (or editing one layer's settings), everything below
+        // that layer is unchanged: start at its pass from the kept prefix
+        // instead of the bottom.
+        let focus = self.stroke_layer.or(self.edit_layer);
+        let resume = self.prefix.take().filter(|p| !self.full_dirty && focus == Some(p.layer_id) && p.passes == passes);
+        // A full composite while painting or editing records the prefix for the next frames.
+        let record = focus.filter(|_| resume.is_none()).and_then(|id| {
             passes.iter().position(|p| matches!(*p, Pass::Layer(li) | Pass::End(li) if self.layers[li].id == id))
         });
         if record.is_some_and(|k| k + 1 < passes.len()) && self.prefix_cache.as_ref().is_none_or(|c| c[0].width != self.res) {
@@ -3240,16 +3491,9 @@ impl Engine {
         if resume.is_none() {
             let c = |v: f64| wgpu::LoadOp::Clear(wgpu::Color { r: v, g: v, b: v, a: 1.0 });
             let a = &self.accum[0];
-            let _pass = gpu::pass(
-                &mut encoder,
-                "composite clear",
-                &[
-                    gpu::color_attachment(&a[0].view, c(0.75)),
-                    gpu::color_attachment(&a[1].view, c(0.5)),
-                    gpu::color_attachment(&a[2].view, c(0.0)),
-                    gpu::color_attachment(&a[3].view, c(0.0)),
-                ],
-            );
+            let clears = [c(0.75), c(0.5), c(0.0), c(0.0), c(0.5), wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT)];
+            let targets: Vec<_> = a.iter().zip(clears).take(nch).map(|(t, load)| gpu::color_attachment(&t.view, load)).collect();
+            let _pass = gpu::pass(&mut encoder, "composite clear", &targets);
         }
         // Resumed frames only redo the patch the stroke touched. Each pass
         // there reads the texel it writes, so inside the patch the chain is
@@ -3294,14 +3538,14 @@ impl Engine {
             if record == Some(k) {
                 let input = if k + 1 < passes.len() {
                     let cache = self.prefix_cache.as_ref().expect("allocated above");
-                    for (from, to) in self.accum[src].iter().zip(cache) {
+                    for (from, to) in self.accum[src].iter().zip(cache).take(nch) {
                         encoder.copy_texture_to_texture(from.copy_info(), to.copy_info(), from.extent());
                     }
                     None
                 } else {
                     Some(src)
                 };
-                let layer_id = self.stroke_layer.expect("recording for a stroke");
+                let layer_id = focus.expect("recording for a stroke or an edit");
                 self.prefix = Some(Prefix { layer_id, passes: passes.clone(), at: k, depth, input });
             }
             let li = match *pass {
@@ -3312,7 +3556,7 @@ impl Engine {
                         wgpu::TexelCopyTextureInfo { origin: wgpu::Origin3d { x, y, z: 0 }, ..t.copy_info() }
                     }
                     let size = wgpu::Extent3d { width: x1 - x0, height: y1 - y0, depth_or_array_layers: 1 };
-                    for (from, to) in self.accum[src].iter().zip(&self.folder_below[depth]) {
+                    for (from, to) in self.accum[src].iter().zip(&self.folder_below[depth]).take(nch) {
                         encoder.copy_texture_to_texture(at(from, x0, y0), at(to, x0, y0), size);
                     }
                     depth += 1;
@@ -3331,11 +3575,11 @@ impl Engine {
                 wgpu::BindingResource::TextureView(t.map_or(dummy, |t| &t.view))
             }
             let view = |t| or_dummy(t, dummy);
-            let chans: [Option<&Tex>; 4] = match &layer.content {
-                Content::Paint(ch) => [0, 1, 2, 3].map(|i| ch[i].as_ref()),
+            let chans: [Option<&Tex>; FINAL_CHANNELS] = match &layer.content {
+                Content::Paint(ch) => std::array::from_fn(|i| ch.get(i).and_then(|t| t.as_ref())),
                 // A folder merge reads the stack below it in the layer slots.
-                Content::Folder(_) => [0, 1, 2, 3].map(|i| Some(&self.folder_below[depth][i])),
-                Content::Fill(_) => [0, 1, 2, 3].map(|i| layer.images[i].as_ref().map(|im| im.tex.as_ref())),
+                Content::Folder(_) => std::array::from_fn(|i| Some(&self.folder_below[depth][i])),
+                Content::Fill(_) => std::array::from_fn(|i| layer.images[i].as_ref().map(|im| im.tex.as_ref())),
             };
             let mask = layer.mask.as_ref().and_then(|m| m.paint.as_ref());
             let prev = if from_cache { self.prefix_cache.as_ref().expect("prefix cache") } else { &self.accum[src] };
@@ -3370,6 +3614,11 @@ impl Engine {
                     wgpu::BindGroupEntry { binding: 16, resource: view(Some(self.map_tex(4))) },
                     wgpu::BindGroupEntry { binding: 17, resource: wgpu::BindingResource::Sampler(&self.sampler) },
                     wgpu::BindGroupEntry { binding: 18, resource: wgpu::BindingResource::Sampler(&self.repeat_sampler) },
+                    wgpu::BindGroupEntry { binding: 19, resource: view(Some(&prev[NORMAL_CH])) },
+                    wgpu::BindGroupEntry { binding: 20, resource: view(Some(&prev[EMISSION_CH])) },
+                    wgpu::BindGroupEntry { binding: 21, resource: view(chans[NORMAL_CH]) },
+                    wgpu::BindGroupEntry { binding: 22, resource: view(chans[EMISSION_CH]) },
+                    wgpu::BindGroupEntry { binding: 23, resource: view(Some(&self.tan)) },
                 ],
             });
             // Mask filters: render the mask, run its filters, then read the result.
@@ -3393,20 +3642,17 @@ impl Engine {
             let out = &self.accum[dst];
             // A patch keeps what is around it.
             let load = if scissor.is_some() { wgpu::LoadOp::Load } else { wgpu::LoadOp::Clear(wgpu::Color::BLACK) };
-            let mut pass = gpu::pass(
-                &mut encoder,
-                "composite layer",
-                &[
-                    gpu::color_attachment(&out[0].view, load),
-                    gpu::color_attachment(&out[1].view, load),
-                    gpu::color_attachment(&out[2].view, load),
-                    gpu::color_attachment(&out[3].view, load),
-                ],
-            );
+            let targets: Vec<_> = out.iter().take(nch).map(|t| gpu::color_attachment(&t.view, load)).collect();
+            let mut pass = gpu::pass(&mut encoder, "composite layer", &targets);
             if let Some([x0, y0, x1, y1]) = scissor {
                 pass.set_scissor_rect(x0, y0, x1 - x0, y1 - y0);
             }
-            pass.set_pipeline(if layer.is_folder() { &self.p.folder_merge } else { &self.p.composite });
+            pass.set_pipeline(match (layer.is_folder(), extra) {
+                (true, true) => &self.p.folder_merge,
+                (false, true) => &self.p.composite,
+                (true, false) => &self.p.folder_merge4,
+                (false, false) => &self.p.composite4,
+            });
             pass.set_bind_group(0, &bg, &[(k as u64 * UNIFORM_STRIDE) as u32]);
             pass.draw(0..3, 0..1);
             drop(pass);
@@ -3418,18 +3664,258 @@ impl Engine {
             self.prefix = Some(p);
         }
         self.final_idx = src;
+        self.draft_final = None;
         self.generation += 1;
         self.dirty = false;
         self.full_dirty = false;
         self.mask_final.retain(|id, _| self.mask_out.contains_key(id));
         self.mask_final.extend(finals);
+        self.build_view_mips();
         self.update_thumbs();
+    }
+
+    /// Run-off layers follow their text: the same box, reaching `length` text
+    /// heights further down, and streaks rendered from the same letters.
+    /// A run-off that changed composites the stack from the bottom (it may
+    /// sit below the layer being edited).
+    fn sync_runoffs(&mut self) {
+        let mut updates = Vec::new();
+        for (i, l) in self.layers.iter().enumerate() {
+            let Content::Fill(f) = &l.content else { continue };
+            let Some(r) = f.runoff else { continue };
+            let Some(si) = self.index_of(r.source) else { continue };
+            let src = &self.layers[si];
+            let Content::Fill(sf) = &src.content else { continue };
+            let Some(spec) = src.images[0].as_ref().and_then(|im| im.text.clone()) else { continue };
+            let (_, up, _) = sf.decal.axes(sf.rotation);
+            let h = sf.decal.size[1];
+            let mut d = sf.decal;
+            d.size[1] = h * (1.0 + r.length.max(0.0));
+            d.center = (Vec3::from(sf.decal.center) - up * (h * r.length.max(0.0) * 0.5)).to_array();
+            let key = format!("runoff: {} | {} {} {} | {} {}", spec.text, spec.font, spec.weight, spec.spacing, r.length, r.seed);
+            let image_ok = l.images[0].as_ref().is_some_and(|im| im.name == key);
+            let placed = f.decal == d && f.rotation == sf.rotation && f.projection == Projection::Decal;
+            if !image_ok || !placed {
+                updates.push((i, d, sf.rotation, (!image_ok).then(|| (spec.clone(), r, key))));
+            }
+        }
+        for (i, d, rot, image) in updates {
+            if let Some((spec, r, key)) = image {
+                match crate::decal::render_runoff(&spec, 160.0, r.length, r.seed) {
+                    Ok(img) => {
+                        let mut encoded = Vec::new();
+                        let _ = image::DynamicImage::ImageRgba8(img.clone())
+                            .write_to(&mut std::io::Cursor::new(&mut encoded), image::ImageFormat::Png);
+                        let tex = self.upload_mips(img, F::Rgba8Unorm);
+                        self.layers[i].images[0] = Some(FillImage { tex: Arc::new(tex), name: key, encoded: Arc::new(encoded), text: None });
+                    }
+                    Err(e) => eprintln!("run-off: {e}"),
+                }
+            }
+            if let Content::Fill(f) = &mut self.layers[i].content {
+                f.decal = d;
+                f.rotation = rot;
+                f.projection = Projection::Decal;
+            }
+            self.full_dirty = true;
+        }
+    }
+
+    /// How many full-size texels a draft texel stands for.
+    fn draft_stride(&self) -> u32 {
+        if self.res >= 2048 { 4 } else { 2 }
+    }
+
+    /// The whole stack at `1 / draft_stride` of the size, every pass reading
+    /// its full-size inputs at a stride. No prefix, no patches, no mask
+    /// filter passes (filtered masks use their last full result): just fast,
+    /// for showing a setting while it's being dragged. The next full
+    /// composite replaces it.
+    fn composite_draft(&mut self, passes: &[Pass], extra: bool, nch: usize, source_slot: &HashMap<usize, usize>) {
+        let dres = (self.res / self.draft_stride()).max(16);
+        if self.draft_accum.as_ref().is_none_or(|a| a[0][0].width != dres) {
+            self.draft_accum = Some([accum_set(&self.device, dres, "draft A"), accum_set(&self.device, dres, "draft B")]);
+        }
+        let mut need = 0usize;
+        let mut d = 0usize;
+        for p in passes {
+            match p {
+                Pass::Begin => {
+                    d += 1;
+                    need = need.max(d);
+                }
+                Pass::End(_) => d = d.saturating_sub(1),
+                Pass::Layer(_) => {}
+            }
+        }
+        self.draft_below.retain(|set| set[0].width == dres);
+        while self.draft_below.len() < need {
+            self.draft_below.push(ACCUM_FORMATS.map(|f| Tex::new(&self.device, "draft folder below", dres, dres, f, LAYER_USAGE)));
+        }
+        let accum = self.draft_accum.as_ref().expect("made above");
+        let mut encoder = self.device.create_command_encoder(&Default::default());
+        {
+            let c = |v: f64| wgpu::LoadOp::Clear(wgpu::Color { r: v, g: v, b: v, a: 1.0 });
+            let clears = [c(0.75), c(0.5), c(0.0), c(0.0), c(0.5), wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT)];
+            let targets: Vec<_> = accum[0].iter().zip(clears).take(nch).map(|(t, load)| gpu::color_attachment(&t.view, load)).collect();
+            let _pass = gpu::pass(&mut encoder, "draft clear", &targets);
+        }
+        let (mut src, mut depth) = (0usize, 0usize);
+        for (k, pass) in passes.iter().enumerate() {
+            let li = match *pass {
+                Pass::Begin => {
+                    for (from, to) in accum[src].iter().zip(&self.draft_below[depth]).take(nch) {
+                        encoder.copy_texture_to_texture(from.copy_info(), to.copy_info(), from.extent());
+                    }
+                    depth += 1;
+                    continue;
+                }
+                Pass::Layer(li) => li,
+                Pass::End(li) => {
+                    depth -= 1;
+                    li
+                }
+            };
+            let dst = 1 - src;
+            let layer = &self.layers[li];
+            let dummy = &self.dummy.view;
+            fn or_dummy<'a>(t: Option<&'a Tex>, dummy: &'a wgpu::TextureView) -> wgpu::BindingResource<'a> {
+                wgpu::BindingResource::TextureView(t.map_or(dummy, |t| &t.view))
+            }
+            let view = |t| or_dummy(t, dummy);
+            let chans: [Option<&Tex>; FINAL_CHANNELS] = match &layer.content {
+                Content::Paint(ch) => std::array::from_fn(|i| ch.get(i).and_then(|t| t.as_ref())),
+                Content::Folder(_) => std::array::from_fn(|i| Some(&self.draft_below[depth][i])),
+                Content::Fill(_) => std::array::from_fn(|i| layer.images[i].as_ref().map(|im| im.tex.as_ref())),
+            };
+            // A filtered mask: its last full result (its uniform reads the mask
+            // texture instead of the smart mask).
+            let filtered = match (*pass, source_slot.contains_key(&li)) {
+                (Pass::Layer(_), true) => self.mask_final.get(&layer.id).and_then(|&i| self.mask_out.get(&layer.id).map(|t| &t[i])),
+                _ => None,
+            };
+            let mask = filtered.or(layer.mask.as_ref().and_then(|m| m.paint.as_ref()));
+            let prev = &accum[src];
+            let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("draft composite"),
+                layout: &self.p.composite_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                            buffer: &self.layer_ubuf,
+                            offset: 0,
+                            size: NonZeroU64::new(size_of::<LayerUniform>() as u64),
+                        }),
+                    },
+                    wgpu::BindGroupEntry { binding: 1, resource: view(Some(&prev[0])) },
+                    wgpu::BindGroupEntry { binding: 2, resource: view(Some(&prev[1])) },
+                    wgpu::BindGroupEntry { binding: 3, resource: view(Some(&prev[2])) },
+                    wgpu::BindGroupEntry { binding: 4, resource: view(Some(&prev[3])) },
+                    wgpu::BindGroupEntry { binding: 5, resource: view(chans[0]) },
+                    wgpu::BindGroupEntry { binding: 6, resource: view(chans[1]) },
+                    wgpu::BindGroupEntry { binding: 7, resource: view(chans[2]) },
+                    wgpu::BindGroupEntry { binding: 8, resource: view(chans[3]) },
+                    wgpu::BindGroupEntry { binding: 9, resource: or_dummy(mask, dummy) },
+                    wgpu::BindGroupEntry { binding: 10, resource: view(Some(&self.pos)) },
+                    wgpu::BindGroupEntry { binding: 11, resource: view(Some(&self.nrm)) },
+                    wgpu::BindGroupEntry { binding: 12, resource: view(Some(self.map_tex(0))) },
+                    wgpu::BindGroupEntry { binding: 13, resource: view(Some(self.map_tex(1))) },
+                    wgpu::BindGroupEntry { binding: 14, resource: view(Some(self.map_tex(2))) },
+                    wgpu::BindGroupEntry { binding: 15, resource: wgpu::BindingResource::TextureView(&self.custom_array.1) },
+                    wgpu::BindGroupEntry { binding: 16, resource: view(Some(self.map_tex(4))) },
+                    wgpu::BindGroupEntry { binding: 17, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                    wgpu::BindGroupEntry { binding: 18, resource: wgpu::BindingResource::Sampler(&self.repeat_sampler) },
+                    wgpu::BindGroupEntry { binding: 19, resource: view(Some(&prev[NORMAL_CH])) },
+                    wgpu::BindGroupEntry { binding: 20, resource: view(Some(&prev[EMISSION_CH])) },
+                    wgpu::BindGroupEntry { binding: 21, resource: view(chans[NORMAL_CH]) },
+                    wgpu::BindGroupEntry { binding: 22, resource: view(chans[EMISSION_CH]) },
+                    wgpu::BindGroupEntry { binding: 23, resource: view(Some(&self.tan)) },
+                ],
+            });
+            let out = &accum[dst];
+            let clear = wgpu::LoadOp::Clear(wgpu::Color::BLACK);
+            let targets: Vec<_> = out.iter().take(nch).map(|t| gpu::color_attachment(&t.view, clear)).collect();
+            let mut rp = gpu::pass(&mut encoder, "draft layer", &targets);
+            rp.set_pipeline(match (layer.is_folder(), extra) {
+                (true, true) => &self.p.folder_merge,
+                (false, true) => &self.p.composite,
+                (true, false) => &self.p.folder_merge4,
+                (false, false) => &self.p.composite4,
+            });
+            rp.set_bind_group(0, &bg, &[(k as u64 * UNIFORM_STRIDE) as u32]);
+            rp.draw(0..3, 0..1);
+            drop(rp);
+            src = dst;
+        }
+        self.queue.submit([encoder.finish()]);
+        self.draft_final = Some(src);
+        self.dirty = false;
+        // The full composite after the drag starts from scratch.
+        self.full_dirty = true;
+        self.prefix = None;
+    }
+
+    /// The draft result for a channel, while one is shown.
+    fn draft_tex(&self, ch: usize) -> Option<&Tex> {
+        let i = self.draft_final?;
+        if ch >= 4 && !self.extra_channels {
+            return None;
+        }
+        self.draft_accum.as_ref().map(|a| &a[i][ch])
+    }
+
+    /// The final channels as the viewport samples them: with mip levels, so
+    /// fine painted detail filters smoothly at a distance instead of shimmering.
+    /// Falls back to [`Engine::final_tex`] until the first composite.
+    pub fn view_tex(&self, ch: usize) -> &Tex {
+        if let Some(t) = self.draft_tex(ch) {
+            return t;
+        }
+        if ch >= 4 && !self.extra_channels {
+            return self.final_tex(ch);
+        }
+        match &self.view_mips {
+            Some(m) if m[ch].width == self.res => &m[ch],
+            _ => self.final_tex(ch),
+        }
+    }
+
+    /// Copies the final channels into the viewport's mipmapped textures and
+    /// box-filters each level from the one above (color in linear light,
+    /// through the sRGB views).
+    fn build_view_mips(&mut self) {
+        let res = self.res;
+        let mips = VIEW_MIPS.min(32 - res.leading_zeros());
+        if self.view_mips.as_ref().is_none_or(|m| m[0].width != res) {
+            self.view_mips =
+                Some(ACCUM_FORMATS.map(|f| Tex::new_mipped(&self.device, "view mips", res, res, f, LAYER_USAGE, mips)));
+        }
+        let Some(view) = &self.view_mips else { return };
+        let mut encoder = self.device.create_command_encoder(&Default::default());
+        let nch = if self.extra_channels { FINAL_CHANNELS } else { 4 };
+        for (ch, dst) in view.iter().enumerate().take(nch) {
+            let src = &self.accum[self.final_idx][ch];
+            encoder.copy_texture_to_texture(src.copy_info(), dst.copy_info(), src.extent());
+            let srgb = dst.srgb_view.is_some();
+            let format = if srgb { F::Rgba8UnormSrgb } else { dst.format };
+            for level in 1..dst.texture.mip_level_count() {
+                let from = dst.mip_view(level - 1, srgb);
+                let to = dst.mip_view(level, srgb);
+                self.resample_view(&mut encoder, &from, &to, format);
+            }
+        }
+        self.queue.submit([encoder.finish()]);
     }
 
     /// Final composited channels: base color (sRGB-encoded), roughness, metallic, height.
     /// (A [`Pass`] list drives [`Engine::composite`].)
     pub fn final_tex(&self, ch: usize) -> &Tex {
-        &self.accum[self.final_idx][ch]
+        match ch {
+            NORMAL_CH if !self.extra_channels => &self.flat_normal,
+            EMISSION_CH if !self.extra_channels => &self.no_emission,
+            _ => &self.accum[self.final_idx][ch],
+        }
     }
 
     // ------------------------------------------------------------------ resolution
@@ -3454,11 +3940,17 @@ impl Engine {
     /// Draws `src` over all of `dst`, a view of a texture of format `format`
     /// (any of the layer, final and mesh-map formats); for copies at another size.
     pub fn resample_to_view(&self, encoder: &mut wgpu::CommandEncoder, src: &Tex, dst: &wgpu::TextureView, format: F) {
+        self.resample_view(encoder, &src.view, dst, format);
+    }
+
+    /// Draws the texture view `src` over all of `dst` (bilinear; a 2:1 size
+    /// ratio makes it a box filter, as for mip levels).
+    fn resample_view(&self, encoder: &mut wgpu::CommandEncoder, src: &wgpu::TextureView, dst: &wgpu::TextureView, format: F) {
         let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout: &self.p.resample_bgl,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&src.view) },
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(src) },
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
             ],
         });
@@ -3537,6 +4029,7 @@ impl Engine {
         self.uv_version += 1;
         self.pos = Tex::new(&self.device, "position map", res, res, POS_FORMAT, LAYER_USAGE);
         self.nrm = Tex::new(&self.device, "normal map", res, res, NRM_FORMAT, LAYER_USAGE);
+        self.tan = Tex::new(&self.device, "tangent map", res, res, TAN_FORMAT, LAYER_USAGE);
         self.accum = [accum_set(&self.device, res, "accum A"), accum_set(&self.device, res, "accum B")];
         self.stroke = Tex::new(&self.device, "stroke mask", res, res, STROKE_FORMAT, LAYER_USAGE);
         self.snap = [None, None, None, None];
@@ -3550,6 +4043,7 @@ impl Engine {
     pub fn vram_bytes(&self) -> u64 {
         let fixed = self.pos.bytes()
             + self.nrm.bytes()
+            + self.tan.bytes()
             + self.stroke.bytes()
             + self.maps.iter().map(|t| t.bytes()).sum::<u64>()
             + self.resolved.iter().flatten().map(|t| t.bytes()).sum::<u64>()

@@ -40,8 +40,8 @@ struct ThumbGpu {
     shrink_mask: wgpu::RenderPipeline,
     show: wgpu::RenderPipeline,
     /// Thumbnail-sized composite targets: a cleared stack below, and the result.
-    below: [Tex; 4],
-    out: [Tex; 4],
+    below: [Tex; FINAL_CHANNELS],
+    out: [Tex; FINAL_CHANNELS],
     /// A painted mask, shrunk; a mask's value.
     mask_paint: Tex,
     mask_value: Tex,
@@ -219,59 +219,34 @@ impl Engine {
         let slot = if mask { &mut entry.mask } else { &mut entry.content };
         if slot.is_none() {
             let tex = Tex::new(&self.device, "layer thumbnail", THUMB, THUMB, F::Rgba8Unorm, LAYER_USAGE);
-            let id = self.rs.renderer.write().register_native_texture(&self.device, tex.srgb(), wgpu::FilterMode::Linear);
+            let id = self.rs.renderer.write().register_native_texture(&self.device, &tex.view, wgpu::FilterMode::Linear);
             *slot = Some(Shown { tex, id });
         }
         &slot.as_ref().expect("just made").tex
     }
 
-    fn render_thumbs(&mut self, encoder: &mut wgpu::CommandEncoder, li: usize, key: u64) {
-        let layer_id = self.layers[li].id;
-        let is_fill = matches!(self.layers[li].content, Content::Fill(_));
-        let has_mask = self.layers[li].mask.is_some();
-        // Make the display textures first (they borrow the engine mutably).
-        if is_fill {
-            self.shown_tex(layer_id, false);
-        }
-        if has_mask {
-            self.shown_tex(layer_id, true);
-        }
+    /// The composite bind group for rendering the layer at `li` at thumbnail
+    /// size: the shrunk position and normal maps, its images, and its painted
+    /// mask (shrunk into `mask_paint` beforehand).
+    fn thumb_bind_group(&self, li: usize, ubuf: &wgpu::Buffer) -> wgpu::BindGroup {
         let layer = &self.layers[li];
         let g = self.thumbs.gpu.as_ref().expect("thumbnail pipelines");
-        let (_, small_pos, small_nrm) = self.thumbs.small.as_ref().expect("shrunk above");
-        let entry = &self.thumbs.entries[&layer_id];
-
-        // One uniform slot for the content, one for the mask.
-        let mut content_u = self.layer_uniform(layer);
-        content_u.p0 = [1.0, 0.0, content_u.p0[2], 0.0];
-        content_u.gp1[2] = 0.0;
-        let mask_u = self.layer_uniform(layer);
-        let mut data = vec![0u8; UNIFORM_STRIDE as usize * 2];
-        data[..size_of::<LayerUniform>()].copy_from_slice(bytemuck::bytes_of(&content_u));
-        let off = UNIFORM_STRIDE as usize;
-        data[off..off + size_of::<LayerUniform>()].copy_from_slice(bytemuck::bytes_of(&mask_u));
-        let ubuf = wgpu::util::DeviceExt::create_buffer_init(
-            &self.device,
-            &wgpu::util::BufferInitDescriptor { label: Some("thumbnail layer"), contents: &data, usage: wgpu::BufferUsages::UNIFORM },
-        );
+        let (_, small_pos, small_nrm) = self.thumbs.small.as_ref().expect("shrunk surface");
         fn or_dummy<'a>(t: Option<&'a Tex>, dummy: &'a wgpu::TextureView) -> wgpu::BindingResource<'a> {
             wgpu::BindingResource::TextureView(t.map_or(dummy, |t| &t.view))
         }
         let dummy = &self.dummy.view;
         let view = |t| or_dummy(t, dummy);
-        let images: [Option<&Tex>; 4] = [0, 1, 2, 3].map(|i| layer.images[i].as_ref().map(|im| im.tex.as_ref()));
+        let images: [Option<&Tex>; IMAGE_SLOTS] = std::array::from_fn(|i| layer.images[i].as_ref().map(|im| im.tex.as_ref()));
         let painted = layer.mask.as_ref().and_then(|m| m.paint.as_ref());
-        if painted.is_some() {
-            self.thumb_pass(encoder, &g.shrink_mask, painted.unwrap(), &g.mask_paint, [0.0, SHRINK_TAPS, RENDER as f32, 0.0]);
-        }
-        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("thumbnail composite"),
             layout: &self.p.composite_bgl,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
                     resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                        buffer: &ubuf,
+                        buffer: ubuf,
                         offset: 0,
                         size: NonZeroU64::new(size_of::<LayerUniform>() as u64),
                     }),
@@ -294,8 +269,99 @@ impl Engine {
                 wgpu::BindGroupEntry { binding: 16, resource: view(Some(self.map_tex(4))) },
                 wgpu::BindGroupEntry { binding: 17, resource: wgpu::BindingResource::Sampler(&self.sampler) },
                 wgpu::BindGroupEntry { binding: 18, resource: wgpu::BindingResource::Sampler(&self.repeat_sampler) },
+                wgpu::BindGroupEntry { binding: 19, resource: view(Some(&g.below[NORMAL_CH])) },
+                wgpu::BindGroupEntry { binding: 20, resource: view(Some(&g.below[EMISSION_CH])) },
+                wgpu::BindGroupEntry { binding: 21, resource: view(images[NORMAL_CH]) },
+                wgpu::BindGroupEntry { binding: 22, resource: view(images[EMISSION_CH]) },
+                // Thumbnails never show the normal channel: no tangent map needed.
+                wgpu::BindGroupEntry { binding: 23, resource: view(None) },
             ],
-        });
+        })
+    }
+
+    /// Renders where the layer at `li` shows, for the viewport's selection
+    /// highlight (see `highlight_view`).
+    pub fn render_highlight(&mut self, li: usize) {
+        if li >= self.layers.len() {
+            return;
+        }
+        if self.thumbs.gpu.is_none() {
+            self.thumbs.gpu = Some(ThumbGpu::new(&self.device));
+        }
+        let mut encoder = self.device.create_command_encoder(&Default::default());
+        self.shrink_surface(&mut encoder);
+        if self.highlight_tex.is_none() {
+            self.highlight_tex = Some(Tex::new(&self.device, "selection highlight", RENDER, RENDER, MASK_FILTER_FORMAT, LAYER_USAGE));
+        }
+        // A folder shows where its layers do (merged); a layer, where it does.
+        let parts: Vec<usize> = if self.layers[li].is_folder() {
+            (self.block(li).start..li).filter(|&k| !self.layers[k].is_folder() && self.layers[k].visible).collect()
+        } else {
+            vec![li]
+        };
+        {
+            let out = self.highlight_tex.as_ref().expect("made above");
+            let _clear = gpu::pass(&mut encoder, "highlight clear", &[gpu::color_attachment(&out.view, wgpu::LoadOp::Clear(wgpu::Color::BLACK))]);
+        }
+        for k in parts {
+            let u = self.layer_uniform(&self.layers[k]);
+            let ubuf = wgpu::util::DeviceExt::create_buffer_init(
+                &self.device,
+                &wgpu::util::BufferInitDescriptor { label: Some("highlight layer"), contents: bytemuck::bytes_of(&u), usage: wgpu::BufferUsages::UNIFORM },
+            );
+            let g = self.thumbs.gpu.as_ref().expect("made above");
+            if let Some(painted) = self.layers[k].mask.as_ref().and_then(|m| m.paint.as_ref()) {
+                self.thumb_pass(&mut encoder, &g.shrink_mask, painted, &g.mask_paint, [0.0, SHRINK_TAPS, RENDER as f32, 0.0]);
+            }
+            let bg = self.thumb_bind_group(k, &ubuf);
+            let out = self.highlight_tex.as_ref().expect("made above");
+            let mut pass = gpu::pass(&mut encoder, "highlight", &[gpu::color_attachment(&out.view, wgpu::LoadOp::Load)]);
+            pass.set_pipeline(&self.p.cover_max);
+            pass.set_bind_group(0, &bg, &[0]);
+            pass.draw(0..3, 0..1);
+        }
+        self.queue.submit([encoder.finish()]);
+    }
+
+    /// The selection highlight texture (black until one was rendered).
+    pub fn highlight_view(&self) -> &wgpu::TextureView {
+        self.highlight_tex.as_ref().map_or(&self.dummy.view, |t| &t.view)
+    }
+
+    fn render_thumbs(&mut self, encoder: &mut wgpu::CommandEncoder, li: usize, key: u64) {
+        let layer_id = self.layers[li].id;
+        let is_fill = matches!(self.layers[li].content, Content::Fill(_));
+        let has_mask = self.layers[li].mask.is_some();
+        // Make the display textures first (they borrow the engine mutably).
+        if is_fill {
+            self.shown_tex(layer_id, false);
+        }
+        if has_mask {
+            self.shown_tex(layer_id, true);
+        }
+        let layer = &self.layers[li];
+        let g = self.thumbs.gpu.as_ref().expect("thumbnail pipelines");
+        let _ = self.thumbs.small.as_ref().expect("shrunk above");
+        let entry = &self.thumbs.entries[&layer_id];
+
+        // One uniform slot for the content, one for the mask.
+        let mut content_u = self.layer_uniform(layer);
+        content_u.p0 = [1.0, 0.0, content_u.p0[2], 0.0];
+        content_u.gp1[2] = 0.0;
+        let mask_u = self.layer_uniform(layer);
+        let mut data = vec![0u8; UNIFORM_STRIDE as usize * 2];
+        data[..size_of::<LayerUniform>()].copy_from_slice(bytemuck::bytes_of(&content_u));
+        let off = UNIFORM_STRIDE as usize;
+        data[off..off + size_of::<LayerUniform>()].copy_from_slice(bytemuck::bytes_of(&mask_u));
+        let ubuf = wgpu::util::DeviceExt::create_buffer_init(
+            &self.device,
+            &wgpu::util::BufferInitDescriptor { label: Some("thumbnail layer"), contents: &data, usage: wgpu::BufferUsages::UNIFORM },
+        );
+        let painted = layer.mask.as_ref().and_then(|m| m.paint.as_ref());
+        if let Some(p) = painted {
+            self.thumb_pass(encoder, &g.shrink_mask, p, &g.mask_paint, [0.0, SHRINK_TAPS, RENDER as f32, 0.0]);
+        }
+        let bg = self.thumb_bind_group(li, &ubuf);
 
         // Content: the fill alone over a neutral stack, showing its first
         // channel that's on (color, else roughness, metallic or height).
@@ -310,6 +376,8 @@ impl Engine {
                         gpu::color_attachment(&g.below[1].view, c(0.5)),
                         gpu::color_attachment(&g.below[2].view, c(0.0)),
                         gpu::color_attachment(&g.below[3].view, c(0.0)),
+                        gpu::color_attachment(&g.below[NORMAL_CH].view, c(0.5)),
+                        gpu::color_attachment(&g.below[EMISSION_CH].view, c(0.0)),
                     ],
                 );
             }

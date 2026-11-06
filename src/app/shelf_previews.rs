@@ -21,10 +21,69 @@ const RES: u32 = 512;
 const THUMB: u32 = 192;
 
 #[derive(Clone, Copy)]
-enum Item {
+pub(super) enum Item {
     Smart(usize),
     Material(usize),
     Generator(usize),
+}
+
+impl Item {
+    fn all() -> Vec<Item> {
+        let mut items: Vec<Item> = (0..presets::SMART_MATERIALS.len()).map(Item::Smart).collect();
+        items.extend((0..presets::MATERIALS.len()).map(Item::Material));
+        items.extend((0..GenKind::ALL.len()).map(Item::Generator));
+        items
+    }
+
+    /// Where the rendered thumbnail is kept between runs. The folder carries
+    /// the app version, so a new version (new presets) renders them again.
+    fn cache_path(self) -> Option<std::path::PathBuf> {
+        let (kind, i, name) = match self {
+            Item::Smart(i) => ("smart", i, presets::SMART_MATERIALS[i].name),
+            Item::Material(i) => ("material", i, presets::MATERIALS[i].name),
+            Item::Generator(i) => ("generator", i, GenKind::ALL[i].name()),
+        };
+        let name: String = name.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
+        let dir = super::project_io::data_dir()?.join("shelf_previews").join(env!("CARGO_PKG_VERSION"));
+        Some(dir.join(format!("{kind}-{i}-{name}.png")))
+    }
+
+    fn handle(self, shelf: &mut Shelf) -> &mut egui::TextureHandle {
+        match self {
+            Item::Smart(i) => &mut shelf.smart[i],
+            Item::Material(i) => &mut shelf.materials[i],
+            Item::Generator(i) => &mut shelf.generators[i],
+        }
+    }
+}
+
+/// Puts the thumbnails rendered on an earlier run in place. Returns the
+/// items still missing.
+pub(super) fn load_cached(shelf: &mut Shelf) -> Vec<Item> {
+    Item::all()
+        .into_iter()
+        .filter(|item| {
+            let img = item.cache_path().and_then(|p| image::open(p).ok()).map(|i| i.into_rgba8());
+            match img {
+                Some(img) => {
+                    let size = [img.width() as usize, img.height() as usize];
+                    let color = egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw());
+                    item.handle(shelf).set(color, egui::TextureOptions::LINEAR);
+                    false
+                }
+                None => true,
+            }
+        })
+        .collect()
+}
+
+fn save_cached(item: Item, img: &egui::ColorImage) {
+    let Some(path) = item.cache_path() else { return };
+    let _ = std::fs::create_dir_all(path.parent().expect("a file in a folder"));
+    let bytes: Vec<u8> = img.pixels.iter().flat_map(|c| c.to_srgba_unmultiplied()).collect();
+    if let Some(buf) = image::RgbaImage::from_raw(img.size[0] as u32, img.size[1] as u32, bytes) {
+        let _ = buf.save(path);
+    }
 }
 
 enum Stage {
@@ -43,10 +102,13 @@ pub(super) struct ShelfPreviews {
     /// Fixed studio lighting, so thumbnails don't change with the viewport HDRI.
     env: Environment,
     stage: Stage,
+    /// The thumbnails no earlier run left behind.
+    missing: Vec<Item>,
 }
 
 impl ShelfPreviews {
-    pub fn start(rs: &egui_wgpu::RenderState, ctx: &egui::Context, env_baker: &EnvBaker) -> ShelfPreviews {
+    /// Starts rendering the thumbnails in `missing` (see `load_cached`).
+    pub fn start(rs: &egui_wgpu::RenderState, ctx: &egui::Context, env_baker: &EnvBaker, missing: Vec<Item>) -> ShelfPreviews {
         let mesh = Primitive::MaterialBall.build();
         let gpu_mesh = GpuMesh::new(&rs.device, &mesh);
         let bounds = (mesh.bounds_min, mesh.bounds_max);
@@ -65,6 +127,7 @@ impl ShelfPreviews {
             views: ViewRenderer::new(rs),
             env: env_baker.upload(rs, &environment::decode(&EnvSource::Builtin(0)).expect("the procedural studio always decodes")),
             stage: Stage::Preparing(rx),
+            missing,
         }
     }
 
@@ -93,9 +156,7 @@ impl ShelfPreviews {
                     let mut engine = Engine::new(rs, &self.mesh, self.bounds, RES);
                     engine.set_maps(maps, report);
                     self.engine = Some(engine);
-                    let mut items: Vec<Item> = (0..presets::SMART_MATERIALS.len()).map(Item::Smart).collect();
-                    items.extend((0..presets::MATERIALS.len()).map(Item::Material));
-                    items.extend((0..GenKind::ALL.len()).map(Item::Generator));
+                    let mut items = std::mem::take(&mut self.missing);
                     items.reverse();
                     self.stage = Stage::Rendering(items);
                     ctx.request_repaint();
@@ -106,12 +167,8 @@ impl ShelfPreviews {
                 let Some(item) = items.pop() else { return false };
                 let engine = self.engine.as_mut().expect("engine exists while rendering");
                 let image = render(rs, engine, &self.env, &mut self.views, &self.mesh, item);
-                let handle = match item {
-                    Item::Smart(i) => &mut shelf.smart[i],
-                    Item::Material(i) => &mut shelf.materials[i],
-                    Item::Generator(i) => &mut shelf.generators[i],
-                };
-                handle.set(image, egui::TextureOptions::LINEAR);
+                save_cached(item, &image);
+                item.handle(shelf).set(image, egui::TextureOptions::LINEAR);
                 ctx.request_repaint();
                 !items.is_empty()
             }

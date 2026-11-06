@@ -7,6 +7,12 @@
 //! manifest (UTF-8 JSON), u64 blob count, then per blob a u64 length and the
 //! compressed bytes. Saving writes a temporary file and renames it over the
 //! target, so a failed save never damages an existing project.
+//!
+//! Text projects (`name.json`) hold the same manifest, pretty-printed, so
+//! people and agents can read, diff and edit them. Blob references become
+//! paths into the `name.data/` folder next to it: 8-bit textures as PNG,
+//! everything else LZ4-compressed. Unchanged files aren't rewritten, so a
+//! save only touches what changed (see `live_reload` for edits on disk).
 
 use super::PainterApp;
 use crate::bake::{IdSource, Quality};
@@ -99,27 +105,290 @@ const FORMATS: [wgpu::TextureFormat; 6] = [
     wgpu::TextureFormat::Rgba16Float,
 ];
 
+/// Text projects: the data folder next to `name.json`.
+pub(super) fn data_dir_of(manifest: &Path) -> PathBuf {
+    manifest.with_extension("data")
+}
+
+pub(super) fn is_text_project(path: &Path) -> bool {
+    path.extension().is_some_and(|x| x.eq_ignore_ascii_case("json"))
+}
+
+/// A data-folder path from a manifest, refused if it could leave the folder
+/// (the manifest may have been edited by hand or by an agent).
+pub(super) fn data_path(dir: &Path, rel: &str) -> Result<PathBuf, String> {
+    let p = Path::new(rel);
+    if rel.is_empty() || !p.components().all(|c| matches!(c, std::path::Component::Normal(_))) {
+        return Err(format!("'{rel}' isn't a path inside the project's data folder"));
+    }
+    Ok(dir.join(p))
+}
+
 struct Writer {
     blobs: Vec<Vec<u8>>,
+    /// Text projects: data-folder files by relative path, instead of blobs.
+    files: Option<Vec<(String, Vec<u8>)>>,
 }
 
 impl Writer {
-    fn blob(&mut self, raw: &[u8]) -> Value {
-        self.blobs.push(lz4_flex::compress_prepend_size(raw));
-        json!(self.blobs.len() - 1)
+    /// `name` (no extension) is the file's path in a text project.
+    fn blob(&mut self, raw: &[u8], name: &str) -> Value {
+        let packed = lz4_flex::compress_prepend_size(raw);
+        match &mut self.files {
+            Some(files) => {
+                let rel = format!("{name}.lz4");
+                files.push((rel.clone(), packed));
+                json!(rel)
+            }
+            None => {
+                self.blobs.push(packed);
+                json!(self.blobs.len() - 1)
+            }
+        }
+    }
+
+    /// Already-encoded bytes (an image file): stored as they are in a text
+    /// project, as a compressed blob otherwise.
+    fn encoded(&mut self, bytes: &[u8], name: &str) -> Value {
+        match &mut self.files {
+            Some(files) => {
+                let ext = image::guess_format(bytes).ok().and_then(|f| f.extensions_str().first().copied()).unwrap_or("bin");
+                let rel = format!("{name}.{ext}");
+                files.push((rel.clone(), bytes.to_vec()));
+                json!(rel)
+            }
+            None => self.blob(bytes, name),
+        }
     }
 }
 
 struct Reader {
     blobs: Vec<Vec<u8>>,
+    /// Text projects: where blob paths point.
+    dir: Option<PathBuf>,
 }
 
 impl Reader {
+    /// A blob's bytes; for text projects a `.lz4` file is decompressed and
+    /// any other file (images) is returned as stored.
     fn blob(&self, v: &Value) -> Result<Vec<u8>, String> {
+        if let (Some(rel), Some(dir)) = (v.as_str(), &self.dir) {
+            let path = data_path(dir, rel)?;
+            let bytes = std::fs::read(&path).map_err(|e| format!("can't read {}: {e}", path.display()))?;
+            return if rel.ends_with(".lz4") {
+                lz4_flex::decompress_size_prepended(&bytes).map_err(|e| format!("{rel} is damaged: {e}"))
+            } else {
+                Ok(bytes)
+            };
+        }
         let i = v.as_u64().ok_or("missing blob reference")? as usize;
         let packed = self.blobs.get(i).ok_or(format!("blob {i} is missing"))?;
         lz4_flex::decompress_size_prepended(packed).map_err(|e| format!("blob {i} is damaged: {e}"))
     }
+}
+
+/// Writes through a temporary file, so readers (the live reload, an editor)
+/// never see a half-written file.
+fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    std::fs::write(&tmp, bytes).map_err(|e| format!("can't write {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, path).map_err(|e| format!("can't replace {}: {e}", path.display()))
+}
+
+/// Saves a text project: the data files that changed, then the manifest.
+/// Returns the total size.
+fn write_text_project(path: &Path, manifest: &Value, files: Vec<(String, Vec<u8>)>, live: &mut super::live_reload::LiveProject) -> Result<usize, String> {
+    let dir = data_dir_of(path);
+    let mut manifest = manifest.clone();
+    name_generator_weights(&mut manifest);
+    let manifest = &manifest;
+    let text = pretty_json(manifest);
+    // Before writing: the file watcher must recognise these files as ours.
+    // What the file says, as read back (floats shortened), to compare edits against.
+    live.watch(path, serde_json::from_str(&text).unwrap_or_else(|_| manifest.clone()));
+    live.expect(super::live_reload::fingerprint(text.as_bytes(), files.iter().map(|(r, b)| (r.as_str(), b.as_slice()))));
+    let mut total = text.len();
+    let mut keep = std::collections::HashSet::new();
+    for (rel, bytes) in &files {
+        let full = data_path(&dir, rel)?;
+        total += bytes.len();
+        keep.insert(full.clone());
+        if std::fs::read(&full).is_ok_and(|old| old == *bytes) {
+            continue;
+        }
+        if let Some(parent) = full.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("can't create {}: {e}", parent.display()))?;
+        }
+        write_atomic(&full, bytes)?;
+    }
+    remove_stale(&dir, &keep);
+    write_atomic(path, text.as_bytes())?;
+    Ok(total)
+}
+
+/// Generator weights as `{input name: weight}` (nonzero only) instead of a
+/// list in input order, so a text project says what each weight is.
+fn name_generator_weights(v: &mut Value) {
+    match v {
+        Value::Object(o) => {
+            if o.get("kind").is_some() {
+                if let Some(Value::Array(a)) = o.get("weights") {
+                    let named: serde_json::Map<String, Value> = a
+                        .iter()
+                        .zip(crate::engine::GEN_INPUTS)
+                        .filter(|(w, _)| w.as_f64().is_some_and(|w| w != 0.0))
+                        .map(|(w, (name, _))| (name.to_string(), w.clone()))
+                        .collect();
+                    if a.len() == crate::engine::GEN_INPUT_COUNT {
+                        o.insert("weights".into(), Value::Object(named));
+                    }
+                }
+            }
+            o.values_mut().for_each(name_generator_weights);
+        }
+        Value::Array(a) => a.iter_mut().for_each(name_generator_weights),
+        _ => {}
+    }
+}
+
+/// Deletes files a previous save wrote that nothing refers to any more
+/// (deleted layers, removed masks). Only the folders saves write to are
+/// cleaned (`mesh`, `set<N>`); anything else in the data folder is left.
+fn remove_stale(dir: &Path, keep: &std::collections::HashSet<PathBuf>) {
+    let ours = |name: &str| name == "mesh" || name.strip_prefix("set").is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+    for sub in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        if !sub.path().is_dir() || !ours(&sub.file_name().to_string_lossy()) {
+            continue;
+        }
+        for file in std::fs::read_dir(sub.path()).into_iter().flatten().flatten() {
+            let p = file.path();
+            if p.is_file() && !keep.contains(&p) {
+                let _ = std::fs::remove_file(&p);
+            }
+        }
+    }
+}
+
+/// Reads a project of either kind: the manifest and its blobs.
+fn read_project(path: &Path) -> Result<(Value, Reader), String> {
+    let data = std::fs::read(path).map_err(|e| format!("can't read {}: {e}", path.display()))?;
+    let bad = || format!("{} isn't a Material Painter project (or is damaged)", path.display());
+    if data.first() == Some(&b'{') || data.starts_with(b"\xEF\xBB\xBF{") {
+        let manifest: Value = serde_json::from_slice(data.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(&data)).map_err(|e| format!("{}: {e}", path.display()))?;
+        if manifest["app"] != "Material Painter" {
+            return Err(bad());
+        }
+        return Ok((manifest, Reader { blobs: Vec::new(), dir: Some(data_dir_of(path)) }));
+    }
+    if data.len() < 24 || &data[..8] != MAGIC {
+        return Err(bad());
+    }
+    let mut at = 8;
+    let mut take = |n: usize| -> Result<&[u8], String> {
+        let slice = data.get(at..at + n).ok_or_else(bad)?;
+        at += n;
+        Ok(slice)
+    };
+    let u64_at = |b: &[u8]| u64::from_le_bytes(b.try_into().unwrap()) as usize;
+    let len = u64_at(take(8)?);
+    let manifest: Value = serde_json::from_slice(take(len)?).map_err(|e| format!("{}: {e}", bad()))?;
+    let count = u64_at(take(8)?);
+    let mut blobs = Vec::with_capacity(count);
+    for _ in 0..count {
+        let n = u64_at(take(8)?);
+        blobs.push(take(n)?.to_vec());
+    }
+    Ok((manifest, Reader { blobs, dir: None }))
+}
+
+/// Raw texels as a PNG, for the 8-bit formats PNG can hold losslessly.
+fn texels_to_png(format: wgpu::TextureFormat, w: u32, h: u32, raw: &[u8]) -> Option<Vec<u8>> {
+    use image::ImageEncoder;
+    let color = match format {
+        wgpu::TextureFormat::Rgba8Unorm => image::ExtendedColorType::Rgba8,
+        wgpu::TextureFormat::Rg8Unorm => image::ExtendedColorType::La8,
+        wgpu::TextureFormat::R8Unorm => image::ExtendedColorType::L8,
+        _ => return None,
+    };
+    let mut out = Vec::new();
+    image::codecs::png::PngEncoder::new_with_quality(&mut out, image::codecs::png::CompressionType::Fast, Default::default())
+        .write_image(raw, w, h, color)
+        .ok()?;
+    Some(out)
+}
+
+/// A PNG back to raw texels of `format`, scaled to `w`×`h` if it was
+/// replaced by an image of another size (a mask made by a script, say).
+fn png_to_texels(format: wgpu::TextureFormat, w: u32, h: u32, bytes: &[u8]) -> Result<Vec<u8>, String> {
+    let img = image::load_from_memory(bytes).map_err(|e| e.to_string())?;
+    let img = if (img.width(), img.height()) == (w, h) { img } else { img.resize_exact(w, h, image::imageops::FilterType::Triangle) };
+    Ok(match format {
+        wgpu::TextureFormat::Rgba8Unorm => img.into_rgba8().into_raw(),
+        wgpu::TextureFormat::Rg8Unorm => img.into_luma_alpha8().into_raw(),
+        wgpu::TextureFormat::R8Unorm => img.into_luma8().into_raw(),
+        _ => return Err(format!("{format:?} textures aren't stored as images")),
+    })
+}
+
+/// JSON with nested objects indented but short arrays of numbers, strings
+/// and booleans on one line (colors, offsets), so diffs stay readable.
+pub(super) fn pretty_json(v: &Value) -> String {
+    fn scalar(v: &Value) -> bool {
+        !matches!(v, Value::Array(_) | Value::Object(_))
+    }
+    fn write(v: &Value, depth: usize, out: &mut String) {
+        let pad = |d: usize| "  ".repeat(d);
+        match v {
+            Value::Array(a) if a.is_empty() => out.push_str("[]"),
+            Value::Array(a) if a.len() <= 16 && a.iter().all(scalar) => {
+                out.push('[');
+                for (i, x) in a.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    write(x, depth, out);
+                }
+                out.push(']');
+            }
+            Value::Array(a) => {
+                out.push_str("[\n");
+                for (i, x) in a.iter().enumerate() {
+                    out.push_str(&pad(depth + 1));
+                    write(x, depth + 1, out);
+                    out.push_str(if i + 1 < a.len() { ",\n" } else { "\n" });
+                }
+                out.push_str(&pad(depth));
+                out.push(']');
+            }
+            Value::Object(o) if o.is_empty() => out.push_str("{}"),
+            Value::Object(o) => {
+                out.push_str("{\n");
+                for (i, (k, x)) in o.iter().enumerate() {
+                    out.push_str(&pad(depth + 1));
+                    out.push_str(&Value::String(k.clone()).to_string());
+                    out.push_str(": ");
+                    write(x, depth + 1, out);
+                    out.push_str(if i + 1 < o.len() { ",\n" } else { "\n" });
+                }
+                out.push_str(&pad(depth));
+                out.push('}');
+            }
+            Value::Number(n) if n.is_f64() => out.push_str(&short_float(n.as_f64().unwrap_or(0.0))),
+            x => out.push_str(&x.to_string()),
+        }
+    }
+    /// Most values are f32 widened to f64; print the f32's shortest form.
+    fn short_float(x: f64) -> String {
+        let f = x as f32;
+        let s = if f as f64 == x || (f as f64 - x).abs() <= x.abs() * 1e-7 { format!("{f:?}") } else { format!("{x:?}") };
+        s
+    }
+    let mut out = String::new();
+    write(v, 0, &mut out);
+    out.push('\n');
+    out
 }
 
 fn f(v: &Value, key: &str, default: f32) -> f32 {
@@ -179,7 +448,8 @@ fn custom_map_from(v: &Value, fallback_id: u32) -> Option<crate::bake::CustomMap
 
 pub(super) fn fill_json(p: &FillParams) -> Value {
     json!({
-        "enabled": p.mat.enabled,
+        // color, roughness, metallic, height, normal, emission
+        "enabled": [p.mat.enabled[0], p.mat.enabled[1], p.mat.enabled[2], p.mat.enabled[3], p.normal_on, p.emission_on],
         "color": p.mat.color,
         "roughness": p.mat.rough,
         "metallic": p.mat.metal,
@@ -196,15 +466,55 @@ pub(super) fn fill_json(p: &FillParams) -> Value {
         "offset": p.offset,
         "triplanar_sharpness": p.tri_sharpness,
         "graph": p.graph,
+        "normal_strength": p.normal_strength,
+        "normal_directx": p.normal_dx,
+        "emission": p.emission,
+        "emission_strength": p.emission_strength,
+        "decal": decal_json(&p.decal),
+        "runoff": p.runoff.map(|r| json!({"source": r.source, "length": r.length, "seed": r.seed})),
     })
+}
+
+pub(super) fn decal_json(d: &crate::decal::Decal) -> Value {
+    json!({"center": d.center, "normal": d.normal, "size": d.size, "depth": d.depth, "facing": d.facing, "soft": d.soft, "mirror": d.mirror})
+}
+
+pub(super) fn decal_from(v: &Value) -> crate::decal::Decal {
+    let d = crate::decal::Decal::default();
+    crate::decal::Decal {
+        center: arr(v, "center", d.center),
+        normal: arr(v, "normal", d.normal),
+        size: arr(v, "size", d.size),
+        depth: f(v, "depth", d.depth),
+        facing: f(v, "facing", d.facing),
+        soft: f(v, "soft", d.soft),
+        mirror: v["mirror"].as_bool().unwrap_or(d.mirror),
+    }
+}
+
+pub(super) fn text_json(t: &crate::decal::TextSpec) -> Value {
+    json!({"text": t.text, "font": t.font, "weight": t.weight, "spacing": t.spacing})
+}
+
+pub(super) fn text_from(v: &Value) -> crate::decal::TextSpec {
+    let d = crate::decal::TextSpec::default();
+    crate::decal::TextSpec {
+        text: s(v, "text").map_or(d.text, str::to_string),
+        font: s(v, "font").map_or(d.font, str::to_string),
+        weight: f(v, "weight", d.weight),
+        spacing: f(v, "spacing", d.spacing),
+    }
 }
 
 pub(super) fn fill_from(v: &Value) -> FillParams {
     let d = FillParams::default();
-    let enabled = match v.get("enabled").and_then(Value::as_array) {
-        Some(a) if a.len() == 4 => std::array::from_fn(|i| a[i].as_bool().unwrap_or(true)),
-        _ => d.mat.enabled,
+    // [color, roughness, metallic, height] and, since normal/emission, [.., normal, emission].
+    let flags = v.get("enabled").and_then(Value::as_array).filter(|a| a.len() == 4 || a.len() == 6);
+    let enabled = match flags {
+        Some(a) => std::array::from_fn(|i| a[i].as_bool().unwrap_or(true)),
+        None => d.mat.enabled,
     };
+    let extra = |i: usize| flags.and_then(|a| a.get(i)).and_then(Value::as_bool).unwrap_or(false);
     FillParams {
         mat: MatValues {
             enabled,
@@ -225,6 +535,16 @@ pub(super) fn fill_from(v: &Value) -> FillParams {
         offset: arr(v, "offset", d.offset),
         tri_sharpness: f(v, "triplanar_sharpness", d.tri_sharpness),
         graph: v["graph"].as_u64(),
+        normal_on: extra(4),
+        normal_strength: f(v, "normal_strength", d.normal_strength),
+        normal_dx: v["normal_directx"].as_bool().unwrap_or(d.normal_dx),
+        emission_on: extra(5),
+        emission: arr(v, "emission", d.emission),
+        emission_strength: f(v, "emission_strength", d.emission_strength),
+        decal: v.get("decal").filter(|d| d.is_object()).map_or(d.decal, decal_from),
+        runoff: v.get("runoff").filter(|r| r.is_object()).and_then(|r| {
+            Some(crate::decal::Runoff { source: r["source"].as_u64()?, length: f(r, "length", 0.8), seed: f(r, "seed", 1.0) })
+        }),
     }
 }
 
@@ -305,8 +625,16 @@ pub(super) fn generator_from(v: &Value) -> Result<Generator, String> {
     let name = s(v, "kind").ok_or("generator without a kind")?;
     let kind = GenKind::ALL.into_iter().find(|k| k.name() == name).ok_or(format!("unknown generator '{name}'"))?;
     let d = kind.default_generator();
-    let mut weights = [0.0; crate::engine::GEN_INPUT_COUNT];
+    // Without weights (a hand-written generator) the kind's defaults apply.
+    let mut weights = if v.get("weights").is_some() { [0.0; crate::engine::GEN_INPUT_COUNT] } else { d.weights };
     let mut custom = [crate::engine::CustomInput::default(); crate::engine::MAX_CUSTOM_INPUTS];
+    // Text projects name the inputs: {"Edges": 1.0, "Noise": 0.35}.
+    if let Some(o) = v.get("weights").and_then(Value::as_object) {
+        for (name, w) in o {
+            let i = crate::engine::GEN_INPUTS.iter().position(|(n, _)| n.eq_ignore_ascii_case(name)).ok_or(format!("unknown generator input '{name}'"))?;
+            weights[i] = w.as_f64().unwrap_or(0.0) as f32;
+        }
+    }
     if let Some(a) = v.get("weights").and_then(Value::as_array) {
         // Older projects have fewer inputs; new ones default to 0.
         for (w, x) in weights.iter_mut().zip(a) {
@@ -340,10 +668,16 @@ pub(super) fn generator_from(v: &Value) -> Result<Generator, String> {
 }
 
 impl PainterApp {
-    fn tex_json(&self, w: &mut Writer, t: &Tex) -> Value {
+    /// `name` names the file in a text project, e.g. `set0/layer3_color`.
+    fn tex_json(&self, w: &mut Writer, t: &Tex, name: &str) -> Value {
         let format = FORMATS.iter().find(|&&x| x == t.format).map(|x| format!("{x:?}"));
+        let raw = self.engine.read_tex(t);
+        let png = w.files.as_ref().and_then(|_| texels_to_png(t.format, t.width, t.height, &raw));
         json!({
-            "blob": w.blob(&self.engine.read_tex(t)),
+            "blob": match png {
+                Some(png) => w.encoded(&png, name),
+                None => w.blob(&raw, name),
+            },
             "format": format.expect("only project formats are saved"),
             "width": t.width,
             "height": t.height,
@@ -354,7 +688,11 @@ impl PainterApp {
         let name = s(v, "format").ok_or("texture without a format")?;
         let format = FORMATS.into_iter().find(|x| format!("{x:?}") == name).ok_or(format!("unknown texture format '{name}'"))?;
         let (w, h) = (v["width"].as_u64().unwrap_or(0) as u32, v["height"].as_u64().unwrap_or(0) as u32);
-        let bytes = r.blob(&v["blob"])?;
+        let mut bytes = r.blob(&v["blob"])?;
+        if v["blob"].as_str().is_some_and(|p| p.ends_with(".png")) {
+            let file = v["blob"].as_str().unwrap_or_default();
+            bytes = png_to_texels(format, w, h, &bytes).map_err(|e| format!("{file}: {e}"))?;
+        }
         let expected = (w * h * crate::gpu::bytes_per_texel(format)) as usize;
         if w == 0 || bytes.len() != expected {
             return Err(format!("{label} texture has the wrong size"));
@@ -362,13 +700,19 @@ impl PainterApp {
         Ok(self.engine.texture_from_bytes(label, format, w, h, &bytes))
     }
 
-    /// One texture set's part of a project.
-    fn set_json(&self, w: &mut Writer, engine: &Engine) -> Value {
+    /// One texture set's part of a project; `set` is its index.
+    fn set_json(&self, w: &mut Writer, engine: &Engine, set: usize) -> Value {
+        const CHANNELS: [&str; 4] = ["color", "roughness", "metallic", "height"];
         let mut layers = Vec::new();
         for l in &engine.layers {
+            let base = format!("set{set}/layer{}", l.id);
             let content = match &l.content {
                 Content::Paint(ch) => {
-                    let channels: Vec<Value> = ch.iter().map(|t| t.as_ref().map_or(Value::Null, |t| self.tex_json(w, t))).collect();
+                    let channels: Vec<Value> = ch
+                        .iter()
+                        .zip(CHANNELS)
+                        .map(|(t, c)| t.as_ref().map_or(Value::Null, |t| self.tex_json(w, t, &format!("{base}_{c}"))))
+                        .collect();
                     json!({"kind": "paint", "channels": channels})
                 }
                 Content::Fill(p) => json!({"kind": "fill", "fill": fill_json(p)}),
@@ -376,7 +720,7 @@ impl PainterApp {
             };
             let mask = l.mask.as_ref().map(|m| {
                 json!({
-                    "paint": m.paint.as_ref().map(|t| self.tex_json(w, t)),
+                    "paint": m.paint.as_ref().map(|t| self.tex_json(w, t, &format!("{base}_mask"))),
                     "generator": m.generator.as_ref().map(generator_json),
                     "graph": m.graph,
                     "filters": mask_filters_json(&m.filters),
@@ -388,8 +732,17 @@ impl PainterApp {
             let images: Vec<Value> = l
                 .images
                 .iter()
-                .map(|im| im.as_ref().filter(|_| !from_graph))
-                .map(|im| im.map_or(Value::Null, |im| json!({"name": im.name, "data": w.blob(&im.encoded)})))
+                .enumerate()
+                .map(|(k, im)| (k, im.as_ref().filter(|_| !from_graph)))
+                .map(|(k, im)| {
+                    im.map_or(Value::Null, |im| {
+                        let mut v = json!({"name": im.name, "data": w.encoded(&im.encoded, &format!("{base}_image{k}"))});
+                        if let Some(t) = &im.text {
+                            v["text"] = text_json(t);
+                        }
+                        v
+                    })
+                })
                 .collect();
             layers.push(json!({
                 "images": images,
@@ -404,7 +757,7 @@ impl PainterApp {
             }));
         }
         let fixes: Vec<Value> = (0..engine.map_fix.len())
-            .filter_map(|i| Some(json!({"map": i, "texture": self.tex_json(w, engine.map_fix[i].as_ref()?)})))
+            .filter_map(|i| Some(json!({"map": i, "texture": self.tex_json(w, engine.map_fix[i].as_ref()?, &format!("set{set}/fix{i}"))})))
             .collect();
         let levels: Vec<Value> = engine.map_levels.iter().map(|l| json!([l.black, l.white, l.gamma])).collect();
         json!({
@@ -444,17 +797,18 @@ impl PainterApp {
     /// the document is saved to.
     fn write_project(&mut self, path: &Path) -> Result<usize, String> {
         self.engine.commit_props(&mut self.undo);
-        let mut w = Writer { blobs: Vec::new() };
+        let text = is_text_project(path);
+        let mut w = Writer { blobs: Vec::new(), files: text.then(Vec::new) };
         let mesh = &self.mesh;
         let mesh_json = json!({
             "name": mesh.name,
             "center": mesh.center.to_array(),
             "scale": mesh.scale,
-            "vertices": w.blob(bytemuck::cast_slice(&mesh.vertices)),
-            "indices": w.blob(bytemuck::cast_slice(&mesh.indices)),
+            "vertices": w.blob(bytemuck::cast_slice(&mesh.vertices), "mesh/vertices"),
+            "indices": w.blob(bytemuck::cast_slice(&mesh.indices), "mesh/indices"),
             "objects": mesh.objects,
-            "tri_object": w.blob(bytemuck::cast_slice(&mesh.tri_object)),
-            "tri_color": mesh.tri_color.as_ref().map(|c| w.blob(bytemuck::cast_slice(c))),
+            "tri_object": w.blob(bytemuck::cast_slice(&mesh.tri_object), "mesh/tri_object"),
+            "tri_color": mesh.tri_color.as_ref().map(|c| w.blob(bytemuck::cast_slice(c), "mesh/tri_color")),
         });
         // Every texture set: its layers, size and mesh-map corrections.
         let engines = super::texture_sets::engines(&self.engine, &self.sets, self.mesh.sets.len());
@@ -469,7 +823,7 @@ impl PainterApp {
                     Some(p) => p.selected,
                     None => self.selected,
                 };
-                let mut v = self.set_json(&mut w, engine);
+                let mut v = self.set_json(&mut w, engine, k);
                 v["name"] = json!(set.name);
                 v["tris"] = json!([set.tris.start, set.tris.end]);
                 v["selected"] = json!(selected);
@@ -488,6 +842,7 @@ impl PainterApp {
             "curvature_radius": bs.curvature_radius, "curvature_scale": bs.curvature_scale,
             "edge_threshold": bs.edge_threshold, "edge_max_distance": bs.edge_max_distance,
             "edge_auto": bs.edge_auto, "hard_edge_angle": bs.hard_edge_angle,
+            "part_crease_angle": bs.part_crease_angle,
             "match_by_name": bs.match_by_name,
             "cage": bs.cage.as_ref().map(|p| p.display().to_string()),
             "maps": bs.maps,
@@ -526,6 +881,9 @@ impl PainterApp {
             "bake": bake,
             "view": view,
         });
+        if let Some(files) = w.files {
+            return write_text_project(path, &manifest, files, &mut self.live);
+        }
         let text = serde_json::to_vec(&manifest).map_err(|e| e.to_string())?;
         let mut out = Vec::with_capacity(text.len() + w.blobs.iter().map(|b| b.len() + 8).sum::<usize>() + 32);
         out.extend_from_slice(MAGIC);
@@ -556,28 +914,157 @@ impl PainterApp {
         }
     }
 
+    /// A texture set's saved layer stack, decoded (textures uploaded) but not
+    /// yet in the document.
+    fn layers_from(&self, r: &Reader, sv: &Value) -> Result<Vec<Layer>, String> {
+        let bad = |what: &str| format!("layer stack: {what}");
+        let mut layers = Vec::new();
+        for lv in sv["layers_bottom_to_top"].as_array().ok_or_else(|| bad("'layers_bottom_to_top' is missing"))? {
+            let name = s(lv, "name").unwrap_or("Layer").to_string();
+            let c = &lv["content"];
+            let content = match s(c, "kind") {
+                Some("paint") => {
+                    let ch = c["channels"].as_array().ok_or_else(|| bad(&format!("'{name}' has no channels")))?;
+                    let mut out: [Option<Tex>; 4] = [None, None, None, None];
+                    for (k, t) in ch.iter().enumerate().take(4) {
+                        if !t.is_null() {
+                            out[k] = Some(self.tex_from(r, t, "layer")?);
+                        }
+                    }
+                    Content::Paint(out)
+                }
+                Some("fill") => Content::Fill(fill_from(&c["fill"])),
+                Some("folder") => Content::Folder(Folder { open: b(c, "open", true) }),
+                other => return Err(bad(&format!("'{name}' has unknown kind {other:?} (paint, fill or folder)"))),
+            };
+            let mask = match lv.get("mask").filter(|m| !m.is_null()) {
+                Some(mv) => Some(Mask {
+                    paint: match mv.get("paint").filter(|p| !p.is_null()) {
+                        Some(t) => Some(self.tex_from(r, t, "mask")?),
+                        None => None,
+                    },
+                    generator: match mv.get("generator").filter(|g| !g.is_null()) {
+                        Some(g) => Some(generator_from(g)?),
+                        None => None,
+                    },
+                    graph: mv["graph"].as_u64(),
+                    filters: mask_filters_from(&mv["filters"]),
+                    layers: mask_layers_from(&mv["layers"]),
+                }),
+                None => None,
+            };
+            let mut images: [Option<crate::engine::FillImage>; crate::engine::IMAGE_SLOTS] = Default::default();
+            for (k, iv) in lv["images"].as_array().into_iter().flatten().enumerate().take(crate::engine::IMAGE_SLOTS) {
+                if !iv.is_null() {
+                    // Text images: the text, rendered again when the stored image is missing.
+                    let text = iv.get("text").filter(|t| t.is_object()).map(text_from);
+                    let image = match (iv.get("data").filter(|d| !d.is_null()), &text) {
+                        (Some(d), _) => {
+                            let data = std::sync::Arc::new(r.blob(d)?);
+                            let mut im = self.engine.decode_fill_image(s(iv, "name").unwrap_or("image").to_string(), data)?;
+                            im.text = text.map(std::sync::Arc::new);
+                            im
+                        }
+                        (None, Some(t)) => self.engine.text_fill_image(t).map_err(|e| bad(&e))?.0,
+                        (None, None) => continue,
+                    };
+                    images[k] = Some(image);
+                }
+            }
+            let blend_name = s(lv, "blend").unwrap_or("Normal");
+            layers.push(Layer {
+                id: lv["id"].as_u64().ok_or_else(|| bad(&format!("'{name}' has no numeric 'id'")))?,
+                name,
+                visible: b(lv, "visible", true),
+                opacity: f(lv, "opacity", 1.0),
+                blend: Blend::ALL.into_iter().find(|x| x.name() == blend_name).unwrap_or(Blend::Normal),
+                content,
+                mask,
+                parent: lv["parent"].as_u64(),
+                images,
+                thumb: None,
+            });
+        }
+        let mut ids = std::collections::HashSet::new();
+        if let Some(l) = layers.iter().find(|l| !ids.insert(l.id)) {
+            return Err(bad(&format!("two layers have id {}", l.id)));
+        }
+        Ok(layers)
+    }
+
+    fn map_levels_from(&mut self, sv: &Value, version: u64) {
+        for (dst, lv) in self.engine.map_levels.iter_mut().zip(sv["map_levels"].as_array().into_iter().flatten()) {
+            if let Some(a) = lv.as_array().filter(|a| a.len() == 3) {
+                let g = |i: usize| a[i].as_f64().unwrap_or(0.0) as f32;
+                // Version 1 projects stored the inverse gamma; keep their look.
+                let gamma = if version < 2 { 1.0 / g(2).max(1e-3) } else { g(2) };
+                *dst = Levels { black: g(0), white: g(1), gamma };
+            }
+        }
+        self.engine.map_levels_changed();
+    }
+
+    /// Applies a text project edited on disk to the open document when only
+    /// its layers, graphs or view changed: one undo step, mesh maps kept.
+    /// Returns false when the mesh, bake settings or texture sets changed,
+    /// which need a full open instead.
+    /// `changed`: data files rewritten since the document last matched the
+    /// disk; texture sets that use one reload even if their JSON is the same.
+    pub(super) fn reload_in_place(
+        &mut self,
+        path: &Path,
+        before: &Value,
+        changed: &std::collections::HashSet<String>,
+        ctx: &egui::Context,
+    ) -> Result<bool, String> {
+        use super::live_reload::refers_to_any;
+        let (manifest, r) = read_project(path)?;
+        let same = |k: &str| manifest[k] == before[k] && !refers_to_any(&manifest[k], changed);
+        let sets_now = manifest["texture_sets"].as_array().map_or(0, Vec::len);
+        let sets_before = before["texture_sets"].as_array().map_or(0, Vec::len);
+        let set_ranges_same = (0..sets_now).all(|k| manifest["texture_sets"][k]["tris"] == before["texture_sets"][k]["tris"]);
+        if !same("mesh") || !same("bake") || sets_now != sets_before || sets_now != self.mesh.sets.len() || !set_ranges_same {
+            return Ok(false);
+        }
+        // Decode every set first, so a mistake in the file changes nothing.
+        let mut decoded = Vec::new();
+        for (k, sv) in manifest["texture_sets"].as_array().into_iter().flatten().enumerate() {
+            if *sv != before["texture_sets"][k] || refers_to_any(sv, changed) {
+                decoded.push((k, self.layers_from(&r, sv)?));
+            }
+        }
+        if !same("graphs") {
+            let mut graphs = Vec::new();
+            for gv in manifest["graphs"].as_array().into_iter().flatten() {
+                let id = gv["id"].as_u64().ok_or("graphs: entry without an 'id'")?;
+                graphs.push((id, crate::graph::Graph::from_json(&gv["graph"], &self.graphs.lib).map_err(|e| format!("graph {id}: {e}"))?));
+            }
+            self.graphs.clear(&self.rs);
+            for (id, g) in graphs {
+                self.graphs.insert(&self.rs, g, Some(id));
+            }
+            self.repush_graphs();
+        }
+        let active = self.sets.active;
+        let version = manifest["version"].as_u64().unwrap_or(1);
+        for (k, layers) in decoded {
+            self.switch_set(k);
+            self.engine.replace_layers(layers, "Reload from disk".into(), &mut self.undo);
+            let sv = &manifest["texture_sets"][k];
+            self.map_levels_from(sv, version);
+            self.selected = self.selected.min(self.engine.layers.len().saturating_sub(1));
+        }
+        self.switch_set(active);
+        if !same("view") {
+            self.view_from(&manifest["view"], ctx);
+        }
+        self.live.watch(path, manifest);
+        Ok(true)
+    }
+
     pub(super) fn open_project(&mut self, path: &Path, ctx: &egui::Context) -> Result<(), String> {
-        let data = std::fs::read(path).map_err(|e| format!("can't read {}: {e}", path.display()))?;
         let bad = || format!("{} isn't a Material Painter project (or is damaged)", path.display());
-        if data.len() < 24 || &data[..8] != MAGIC {
-            return Err(bad());
-        }
-        let mut at = 8;
-        let mut take = |n: usize| -> Result<&[u8], String> {
-            let slice = data.get(at..at + n).ok_or_else(bad)?;
-            at += n;
-            Ok(slice)
-        };
-        let u64_at = |b: &[u8]| u64::from_le_bytes(b.try_into().unwrap()) as usize;
-        let len = u64_at(take(8)?);
-        let manifest: Value = serde_json::from_slice(take(len)?).map_err(|e| format!("{}: {e}", bad()))?;
-        let count = u64_at(take(8)?);
-        let mut blobs = Vec::with_capacity(count);
-        for _ in 0..count {
-            let n = u64_at(take(8)?);
-            blobs.push(take(n)?.to_vec());
-        }
-        let r = Reader { blobs };
+        let (manifest, r) = read_project(path)?;
 
         // Everything is decoded before the open document is touched.
         let m = &manifest["mesh"];
@@ -624,6 +1111,7 @@ impl PainterApp {
         bs.edge_max_distance = f(bv, "edge_max_distance", bs.edge_max_distance);
         bs.edge_auto = b(bv, "edge_auto", bs.edge_auto);
         bs.hard_edge_angle = f(bv, "hard_edge_angle", bs.hard_edge_angle);
+        bs.part_crease_angle = f(bv, "part_crease_angle", bs.part_crease_angle);
         bs.match_by_name = b(bv, "match_by_name", bs.match_by_name);
         bs.cage = s(bv, "cage").map(PathBuf::from).filter(|p| p.is_file());
         // Projects from before map selection baked everything.
@@ -681,62 +1169,7 @@ impl PainterApp {
             if res != self.engine.res {
                 self.engine.set_resolution(res, &self.gpu_mesh, &mut self.undo);
             }
-            let mut layers = Vec::new();
-            for lv in sv["layers_bottom_to_top"].as_array().ok_or_else(bad)? {
-                let name = s(lv, "name").unwrap_or("Layer").to_string();
-                let c = &lv["content"];
-                let content = match s(c, "kind") {
-                    Some("paint") => {
-                        let ch = c["channels"].as_array().ok_or_else(bad)?;
-                        let mut out: [Option<Tex>; 4] = [None, None, None, None];
-                        for (k, t) in ch.iter().enumerate().take(4) {
-                            if !t.is_null() {
-                                out[k] = Some(self.tex_from(&r, t, "layer")?);
-                            }
-                        }
-                        Content::Paint(out)
-                    }
-                    Some("fill") => Content::Fill(fill_from(&c["fill"])),
-                    Some("folder") => Content::Folder(Folder { open: b(c, "open", true) }),
-                    _ => return Err(bad()),
-                };
-                let mask = match lv.get("mask").filter(|m| !m.is_null()) {
-                    Some(mv) => Some(Mask {
-                        paint: match mv.get("paint").filter(|p| !p.is_null()) {
-                            Some(t) => Some(self.tex_from(&r, t, "mask")?),
-                            None => None,
-                        },
-                        generator: match mv.get("generator").filter(|g| !g.is_null()) {
-                            Some(g) => Some(generator_from(g)?),
-                            None => None,
-                        },
-                        graph: mv["graph"].as_u64(),
-                        filters: mask_filters_from(&mv["filters"]),
-                        layers: mask_layers_from(&mv["layers"]),
-                    }),
-                    None => None,
-                };
-                let mut images: [Option<crate::engine::FillImage>; 4] = Default::default();
-                for (k, iv) in lv["images"].as_array().into_iter().flatten().enumerate().take(4) {
-                    if !iv.is_null() {
-                        let data = std::sync::Arc::new(r.blob(&iv["data"])?);
-                        images[k] = Some(self.engine.decode_fill_image(s(iv, "name").unwrap_or("image").to_string(), data)?);
-                    }
-                }
-                let blend_name = s(lv, "blend").unwrap_or("Normal");
-                layers.push(Layer {
-                    id: lv["id"].as_u64().ok_or_else(bad)?,
-                    name,
-                    visible: b(lv, "visible", true),
-                    opacity: f(lv, "opacity", 1.0),
-                    blend: Blend::ALL.into_iter().find(|x| x.name() == blend_name).unwrap_or(Blend::Normal),
-                    content,
-                    mask,
-                    parent: lv["parent"].as_u64(),
-                    images,
-                    thumb: None,
-                });
-            }
+            let layers = self.layers_from(&r, sv)?;
             self.engine.restore_layers(layers);
             self.engine.map_fix = Default::default();
             for fv in sv["map_fixes"].as_array().into_iter().flatten() {
@@ -745,22 +1178,34 @@ impl PainterApp {
                     self.engine.map_fix[map] = Some(self.tex_from(&r, &fv["texture"], "map fix")?);
                 }
             }
-            for (dst, lv) in self.engine.map_levels.iter_mut().zip(sv["map_levels"].as_array().into_iter().flatten()) {
-                let a = lv.as_array().filter(|a| a.len() == 3);
-                if let Some(a) = a {
-                    let g = |i: usize| a[i].as_f64().unwrap_or(0.0) as f32;
-                    // Version 1 projects stored the inverse gamma; keep their look.
-                    let gamma = if manifest["version"].as_u64().unwrap_or(1) < 2 { 1.0 / g(2).max(1e-3) } else { g(2) };
-                    *dst = Levels { black: g(0), white: g(1), gamma };
-                }
-            }
-            self.engine.map_levels_changed();
+            self.map_levels_from(sv, manifest["version"].as_u64().unwrap_or(1));
             self.selected = sv["selected"].as_u64().map_or(0, |x| x as usize).min(self.engine.layers.len().saturating_sub(1));
         }
         self.switch_set(manifest["active_set"].as_u64().map_or(0, |x| x as usize).min(set_count - 1));
         self.repush_graphs();
+        self.view_from(&manifest["view"], ctx);
 
-        let v = &manifest["view"];
+        self.undo.clear();
+        self.saved_serial = self.undo.state_serial();
+        self.autosaved_serial = self.saved_serial;
+        if is_autosave(path) {
+            // Recovered work isn't saved anywhere yet; its file goes once opened.
+            remove_recovery(path);
+            self.project_path = None;
+            self.saved_serial = u64::MAX;
+            self.status = "Recovered your unsaved work. Save it to keep it.".into();
+        } else {
+            self.project_path = Some(path.to_path_buf());
+            self.remember_recent(path);
+            self.status = format!("Opened {}.", path.display());
+        }
+        self.live.watch(path, manifest);
+        super::live_reload::mark_loaded(&mut self.live, path);
+        Ok(())
+    }
+
+    /// The saved preview settings: camera, lighting, environment, post.
+    fn view_from(&mut self, v: &Value, ctx: &egui::Context) {
         let d = crate::viewport::ViewSettings::default();
         let vs = &mut self.view;
         vs.exposure = f(v, "exposure", d.exposure);
@@ -818,22 +1263,6 @@ impl PainterApp {
         if let Some(src) = source.filter(|src| *src != self.env.source) {
             self.load_env(src, ctx);
         }
-
-        self.undo.clear();
-        self.saved_serial = self.undo.state_serial();
-        self.autosaved_serial = self.saved_serial;
-        if is_autosave(path) {
-            // Recovered work isn't saved anywhere yet; its file goes once opened.
-            remove_recovery(path);
-            self.project_path = None;
-            self.saved_serial = u64::MAX;
-            self.status = "Recovered your unsaved work. Save it to keep it.".into();
-        } else {
-            self.project_path = Some(path.to_path_buf());
-            self.remember_recent(path);
-            self.status = format!("Opened {}.", path.display());
-        }
-        Ok(())
     }
 
     /// Unsaved edits since the last save or open.
@@ -846,17 +1275,85 @@ impl PainterApp {
             || format!("{}.{EXTENSION}", self.mesh.name.replace(' ', "")),
             |n| n.to_string_lossy().into_owned(),
         );
-        rfd::FileDialog::new().add_filter("Material Painter project", &[EXTENSION]).set_file_name(name).save_file()
+        rfd::FileDialog::new()
+            .add_filter("Material Painter project", &[EXTENSION])
+            .add_filter("Material Painter text project (editable, live reload)", &["json"])
+            .set_file_name(name)
+            .save_file()
     }
 
     pub(super) fn open_dialog() -> Option<PathBuf> {
-        rfd::FileDialog::new().add_filter("Material Painter project", &[EXTENSION]).pick_file()
+        rfd::FileDialog::new().add_filter("Material Painter project", &[EXTENSION, "json"]).pick_file()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Data paths from a hand-edited manifest can't leave the data folder.
+    #[test]
+    fn data_paths_stay_inside() {
+        let dir = Path::new("proj.data");
+        assert_eq!(data_path(dir, "set0/layer3_mask.png").unwrap(), dir.join("set0/layer3_mask.png"));
+        for bad in ["", "../x.png", "set0/../../x", "/etc/passwd", "C:/x.png"] {
+            assert!(data_path(dir, bad).is_err(), "{bad} was accepted");
+        }
+    }
+
+    #[test]
+    fn pretty_json_round_trips_and_keeps_short_arrays_inline() {
+        let v = json!({"b": {"color": [0.5, 0.25, 1.0], "names": ["a", "b"]}, "a": [], "layers": [{"id": 1}, {"id": 2}]});
+        let text = pretty_json(&v);
+        assert_eq!(serde_json::from_str::<Value>(&text).unwrap(), v);
+        assert!(text.contains("\"color\": [0.5, 0.25, 1.0]"), "{text}");
+        assert!(text.contains("\"layers\": [\n"), "{text}");
+    }
+
+    #[test]
+    fn pngs_hold_8_bit_texels() {
+        let raw: Vec<u8> = (0..4 * 4 * 2).map(|i| (i * 7) as u8).collect();
+        let png = texels_to_png(wgpu::TextureFormat::Rg8Unorm, 4, 4, &raw).unwrap();
+        assert_eq!(png_to_texels(wgpu::TextureFormat::Rg8Unorm, 4, 4, &png).unwrap(), raw);
+        assert!(texels_to_png(wgpu::TextureFormat::R16Float, 4, 4, &[0; 32]).is_none());
+        // A replacement image of another size is scaled to the texture's.
+        let small = texels_to_png(wgpu::TextureFormat::R8Unorm, 2, 2, &[255; 4]).unwrap();
+        assert_eq!(png_to_texels(wgpu::TextureFormat::R8Unorm, 4, 4, &small).unwrap(), vec![255; 16]);
+    }
+
+    #[test]
+    fn named_weights_round_trip() {
+        let g = generator_from(&json!({"kind": "Edge Wear"})).unwrap();
+        let mut v = json!({"mask": {"generator": generator_json(&g)}});
+        name_generator_weights(&mut v);
+        let named = &v["mask"]["generator"]["weights"];
+        assert!(named.is_object() && named["Edges"].as_f64().is_some(), "{named}");
+        assert_eq!(generator_from(&v["mask"]["generator"]).unwrap(), g);
+        assert!(generator_from(&json!({"kind": "Dirt", "weights": {"Nope": 1}})).is_err());
+    }
+
+    /// What a save records must equal what the watcher computes from disk,
+    /// or every save would reload itself.
+    #[test]
+    fn save_fingerprint_matches_disk() {
+        let dir = std::env::temp_dir().join(format!("mp-fp-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("p.json");
+        let mut w = Writer { blobs: Vec::new(), files: Some(Vec::new()) };
+        let manifest = json!({
+            "app": "Material Painter",
+            "mesh": {"vertices": w.blob(&[1, 2, 3], "mesh/vertices"), "tri_color": null},
+            "texture_sets": [{"layers_bottom_to_top": [{"images": [{"name": "x", "data": w.encoded(&texels_to_png(wgpu::TextureFormat::R8Unorm, 1, 1, &[9]).unwrap(), "set0/layer1_image0")}]}]}],
+        });
+        let mut live = crate::app::live_reload::LiveProject::default();
+        write_text_project(&path, &manifest, w.files.take().unwrap(), &mut live).unwrap();
+        assert!(dir.join("p.data/set0/layer1_image0.png").is_file());
+        assert_eq!(live.seen_for_test(), crate::app::live_reload::disk_fingerprint_for_test(&path));
+        let (back, r) = read_project(&path).unwrap();
+        assert_eq!(r.blob(&back["mesh"]["vertices"]).unwrap(), [1, 2, 3]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// Projects from the four fixed custom slots load as maps with ids 1-4
     /// (empty slots skipped), and their masks' extra weights as inputs on

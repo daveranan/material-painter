@@ -32,10 +32,12 @@ pub enum Source {
     Metallic,
     /// Painted height, mid-gray at rest.
     Height,
-    /// Final tangent-space normal (baked plus painted height), OpenGL (Y+).
+    /// Final tangent-space normal (baked, painted normal detail and painted height), OpenGL (Y+).
     NormalGl,
     /// The same normal with Y flipped (DirectX, Y-).
     NormalDx,
+    /// Emitted light (the emission channel), sRGB unless exported linear.
+    Emissive,
     /// A baked mesh map, by index into `MAPS`.
     Mesh(usize),
     WorldNormal,
@@ -57,6 +59,7 @@ impl Source {
             Source::Height,
             Source::NormalGl,
             Source::NormalDx,
+            Source::Emissive,
         ];
         v.extend((0..MAPS.len()).map(Source::Mesh));
         v.extend([Source::WorldNormal, Source::Position, Source::Zero, Source::One]);
@@ -74,6 +77,7 @@ impl Source {
             Source::Height => "Height".into(),
             Source::NormalGl => "Normal (OpenGL)".into(),
             Source::NormalDx => "Normal (DirectX)".into(),
+            Source::Emissive => "Emissive".into(),
             Source::Mesh(i) => format!("Baked {}", MAPS[i].name),
             Source::WorldNormal => "World space normal".into(),
             Source::Position => "Position".into(),
@@ -99,7 +103,14 @@ impl Source {
     /// Color-like sources have three components; the rest one.
     pub fn components(self) -> usize {
         match self {
-            Source::BaseColor | Source::Diffuse | Source::Specular | Source::NormalGl | Source::NormalDx | Source::WorldNormal | Source::Position => 3,
+            Source::BaseColor
+            | Source::Diffuse
+            | Source::Specular
+            | Source::NormalGl
+            | Source::NormalDx
+            | Source::Emissive
+            | Source::WorldNormal
+            | Source::Position => 3,
             Source::Mesh(i) if MAPS[i].kind != MapKind::Scalar => 3,
             _ => 1,
         }
@@ -226,6 +237,7 @@ pub fn builtin_templates() -> Vec<Template> {
                 OutputMap::rgb("T_$mesh_BaseColor", BaseColor),
                 OutputMap::rgb("T_$mesh_Normal", NormalDx),
                 OutputMap::packed("T_$mesh_OcclusionRoughnessMetallic", Layout::Rgb, [ao, rough, metal, C1]),
+                OutputMap::rgb("T_$mesh_Emissive", Emissive),
             ],
         ),
         t(
@@ -235,6 +247,7 @@ pub fn builtin_templates() -> Vec<Template> {
                 OutputMap::rgb("$mesh_Normal", NormalGl),
                 OutputMap::packed("$mesh_MaskMap", Layout::Rgba, [metal, ao, C0, smooth]),
                 OutputMap::height("$mesh_Height"),
+                OutputMap::rgb("$mesh_Emission", Emissive),
             ],
         ),
         t(
@@ -244,6 +257,7 @@ pub fn builtin_templates() -> Vec<Template> {
                 OutputMap::rgb("$mesh_Normal", NormalGl),
                 OutputMap::packed("$mesh_MaskMap", Layout::Rgba, [metal, ao, C1, smooth]),
                 OutputMap::height("$mesh_Height"),
+                OutputMap::rgb("$mesh_Emission", Emissive),
             ],
         ),
         t(
@@ -263,6 +277,7 @@ pub fn builtin_templates() -> Vec<Template> {
                 OutputMap::packed("$mesh_ORM", Layout::Rgb, [ao, rough, metal, C1]),
                 OutputMap::rgb("$mesh_Normal", NormalGl),
                 OutputMap::height("$mesh_Height"),
+                OutputMap::rgb("$mesh_Emission", Emissive),
             ],
         ),
         t(
@@ -271,6 +286,7 @@ pub fn builtin_templates() -> Vec<Template> {
                 OutputMap::rgb("$mesh_baseColor", BaseColor),
                 OutputMap::packed("$mesh_occlusionRoughnessMetallic", Layout::Rgb, [ao, rough, metal, C1]),
                 OutputMap::rgb("$mesh_normal", NormalGl),
+                OutputMap::rgb("$mesh_emissive", Emissive),
             ],
         ),
         t(
@@ -290,6 +306,7 @@ pub fn builtin_templates() -> Vec<Template> {
                 OutputMap::gray("$mesh_Metallic", metal),
                 OutputMap::rgb("$mesh_Normal", NormalGl),
                 OutputMap::height("$mesh_Height"),
+                OutputMap::rgb("$mesh_Emission", Emissive),
             ],
         ),
         t(
@@ -301,6 +318,7 @@ pub fn builtin_templates() -> Vec<Template> {
                 OutputMap::gray("$mesh_Metallic", metal),
                 OutputMap::gray("$mesh_AmbientOcclusion", ao),
                 OutputMap::height("$mesh_Height"),
+                OutputMap::rgb("$mesh_Emissive", Emissive),
             ],
         ),
         t(
@@ -525,6 +543,7 @@ fn read_plane(device: &wgpu::Device, queue: &wgpu::Queue, tex: &Tex) -> Plane {
             raw.chunks_exact(4).map(|c| [c[0], c[1], c[2], c[3]].map(|v| v as f32 / 255.0)).collect()
         }
         wgpu::TextureFormat::R8Unorm => raw.iter().map(|&v| [v as f32 / 255.0, 0.0, 0.0, 1.0]).collect(),
+        wgpu::TextureFormat::Rg8Unorm => raw.chunks_exact(2).map(|c| [c[0] as f32 / 255.0, c[1] as f32 / 255.0, 0.0, 1.0]).collect(),
         wgpu::TextureFormat::R16Float => raw.chunks_exact(2).map(|b| [f16_to_f32(u16::from_le_bytes([b[0], b[1]])), 0.0, 0.0, 1.0]).collect(),
         wgpu::TextureFormat::Rgba16Float => raw
             .chunks_exact(8)
@@ -574,6 +593,9 @@ pub struct Snapshot {
     rough: Plane,
     metal: Plane,
     height: Plane,
+    /// Painted normal detail (tangent xy at 0.5 + 0.5 n) and emission (linear).
+    normal: Plane,
+    emission: Plane,
     mesh: [Plane; crate::bake::MAP_TEXTURES],
     world_normal: Plane,
     position: Plane,
@@ -599,6 +621,15 @@ pub fn snapshot(engine: &Engine, device: &wgpu::Device, queue: &wgpu::Queue, mes
         rough: read_plane(device, queue, engine.final_tex(1)),
         metal: read_plane(device, queue, engine.final_tex(2)),
         height: read_plane(device, queue, engine.final_tex(3)),
+        // Without normal or emission layers these are 1x1 defaults.
+        normal: {
+            let t = engine.final_tex(crate::engine::NORMAL_CH);
+            resample(read_plane(device, queue, t), t.width, res)
+        },
+        emission: {
+            let t = engine.final_tex(crate::engine::EMISSION_CH);
+            resample(read_plane(device, queue, t), t.width, res)
+        },
         mesh: mesh_maps,
         world_normal: resample(read_plane(device, queue, nrm), nrm.width, res),
         position: resample(read_plane(device, queue, pos), pos.width, res),
@@ -670,12 +701,19 @@ impl Sources<'_> {
             Source::Height => (0..n).map(|i| [s.height.data[i][0] * 0.5 + 0.5; 3]).collect(),
             Source::NormalGl | Source::NormalDx => {
                 let use_baked = self.settings.use_baked_normal && s.has_bake;
-                normal_map(s, self.settings.normal_strength, use_baked, src == Source::NormalDx)
+                normal_map(s, self.settings.normal_strength, use_baked, src == Source::NormalDx, true)
             }
+            Source::Emissive => (0..n)
+                .into_par_iter()
+                .map(|i| {
+                    let e = s.emission.data[i];
+                    enc([e[0], e[1], e[2]], linear)
+                })
+                .collect(),
             Source::Mesh(i) => {
                 let info = &MAPS[i];
                 if info.kind == MapKind::Normal {
-                    return normal_map(s, 0.0, true, false);
+                    return normal_map(s, 0.0, true, false, false);
                 }
                 let p = &s.mesh[info.tex];
                 if info.kind == MapKind::Scalar {
@@ -707,7 +745,7 @@ impl Sources<'_> {
 
 /// Final tangent-space normal, encoded 0..1: baked normal plus painted
 /// height detail, matching the viewport.
-fn normal_map(m: &Snapshot, strength: f32, use_baked: bool, directx: bool) -> Vec<[f32; 3]> {
+fn normal_map(m: &Snapshot, strength: f32, use_baked: bool, directx: bool, painted: bool) -> Vec<[f32; 3]> {
     let r = m.res as i64;
     let h = |x: i64, y: i64| m.height.data[(y.clamp(0, r - 1) * r + x.clamp(0, r - 1)) as usize][0];
     let k = strength * m.res as f32 / 256.0;
@@ -719,7 +757,15 @@ fn normal_map(m: &Snapshot, strength: f32, use_baked: bool, directx: bool) -> Ve
             let ht = (h(x, y + 1) - h(x, y - 1)) * 0.5 * k;
             let d = m.mesh[3].data[i];
             let base = if use_baked { Vec3::new(d[0], d[1], (1.0 - d[0] * d[0] - d[1] * d[1]).max(0.0).sqrt()) } else { Vec3::Z };
-            let mut n = Vec3::new(base.x - hu, base.y + ht, base.z).normalize();
+            // Whiteout blend with the painted normal detail, as the viewport shows it.
+            let p = if painted {
+                let t = m.normal.data[i];
+                let xy = Vec2::new(t[0] * 2.0 - 1.0, t[1] * 2.0 - 1.0);
+                Vec3::new(xy.x, xy.y, (1.0 - xy.length_squared()).max(0.0).sqrt())
+            } else {
+                Vec3::Z
+            };
+            let mut n = Vec3::new(base.x + p.x - hu, base.y + p.y + ht, base.z * p.z).normalize();
             if directx {
                 n.y = -n.y;
             }

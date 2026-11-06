@@ -215,7 +215,7 @@ pub enum Edit {
     /// The folder a layer is in.
     Parent { id: u64, parent: Option<u64> },
     /// A fill layer's channel images.
-    Images { id: u64, images: [Option<crate::engine::FillImage>; 4] },
+    Images { id: u64, images: [Option<crate::engine::FillImage>; crate::engine::IMAGE_SLOTS] },
     Mask { id: u64, mask: Option<Mask> },
     Props(DocProps),
     /// Painted correction texture of a baked map.

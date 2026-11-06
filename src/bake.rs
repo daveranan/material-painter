@@ -250,6 +250,11 @@ pub struct BakeSettings {
     pub edge_auto: bool,
     /// Mesh edges whose faces meet at more than this angle count as hard edges.
     pub hard_edge_angle: f32,
+    /// Above 0: part random and part gradient treat every region bounded by
+    /// folds sharper than this many degrees as its own part, so the panels of
+    /// a one-piece mesh (scans, AI-generated models) vary plate by plate.
+    /// Edges, occlusion and IDs still follow the connected parts.
+    pub part_crease_angle: f32,
     /// Project each low-poly object only onto the high-poly objects with the
     /// same name (suffixes like _low/_high ignored), so parts close together
     /// don't capture each other's detail.
@@ -295,6 +300,7 @@ impl Default for BakeSettings {
             edge_max_distance: 0.2,
             edge_auto: true,
             hard_edge_angle: 35.0,
+            part_crease_angle: 0.0,
             match_by_name: true,
             cage: None,
             maps: ALL_MAPS,
@@ -373,7 +379,7 @@ impl BakeSettings {
     /// prepared scene and only redo the GPU passes.
     pub fn prepare_key(&self) -> String {
         format!(
-            "{:?}|{:?}|{:?}|{}|{}|{}|{}|{}",
+            "{:?}|{:?}|{:?}|{}|{}|{}|{}|{}|{}",
             self.high_poly,
             self.cage,
             self.id_source,
@@ -382,6 +388,7 @@ impl BakeSettings {
             self.edge_max_distance,
             self.curvature_scale,
             self.hard_edge_angle,
+            self.part_crease_angle,
         )
     }
 
@@ -444,6 +451,8 @@ pub struct PreparedScene {
     tri_pos: Vec<[f32; 4]>,
     tri_nrm: Vec<[f32; 4]>,
     parts: Vec<[f32; 4]>,
+    /// Per triangle in BVH order: its entry in `parts`.
+    tri_vpart: Vec<u32>,
     ids: Vec<[f32; 4]>,
     /// Hard-edge segments (two entries each) and their BVH: convex edges, then concave creases.
     seg_nodes: Vec<[f32; 4]>,
@@ -578,6 +587,58 @@ pub(crate) fn components(positions: &[Vec3], indices: &[u32]) -> (Vec<u32>, u32)
         .chunks_exact(3)
         .map(|tri| {
             let root = find(&mut parent, weld[tri[0] as usize] as u32);
+            let next = remap.len() as u32;
+            *remap.entry(root).or_insert(next)
+        })
+        .collect();
+    let count = remap.len() as u32;
+    (tri_part, count)
+}
+
+/// Like [`components`], but also split where faces meet at more than
+/// `crease_deg` degrees: the panels of a one-piece hard-surface mesh.
+pub(crate) fn crease_components(positions: &[Vec3], indices: &[u32], crease_deg: f32) -> (Vec<u32>, u32) {
+    let weld = weld_positions(positions);
+    let tris = indices.len() / 3;
+    let normals: Vec<Vec3> = indices
+        .chunks_exact(3)
+        .map(|t| {
+            let [a, b, c] = [t[0], t[1], t[2]].map(|i| positions[i as usize]);
+            (b - a).cross(c - a).normalize_or_zero()
+        })
+        .collect();
+    let mut by_edge: std::collections::HashMap<(usize, usize), Vec<u32>> = std::collections::HashMap::new();
+    for (t, tri) in indices.chunks_exact(3).enumerate() {
+        for k in 0..3 {
+            let (a, b) = (weld[tri[k] as usize], weld[tri[(k + 1) % 3] as usize]);
+            by_edge.entry((a.min(b), a.max(b))).or_default().push(t as u32);
+        }
+    }
+    let mut parent: Vec<u32> = (0..tris as u32).collect();
+    fn find(p: &mut [u32], mut x: u32) -> u32 {
+        while p[x as usize] != x {
+            p[x as usize] = p[p[x as usize] as usize];
+            x = p[x as usize];
+        }
+        x
+    }
+    let cos_max = crease_deg.to_radians().cos();
+    for faces in by_edge.values() {
+        for pair in faces.windows(2) {
+            let (na, nb) = (normals[pair[0] as usize], normals[pair[1] as usize]);
+            // Degenerate triangles join their neighbours instead of splitting them.
+            if na == Vec3::ZERO || nb == Vec3::ZERO || na.dot(nb) >= cos_max {
+                let (a, b) = (find(&mut parent, pair[0]), find(&mut parent, pair[1]));
+                if a != b {
+                    parent[b as usize] = a;
+                }
+            }
+        }
+    }
+    let mut remap = std::collections::HashMap::new();
+    let tri_part: Vec<u32> = (0..tris as u32)
+        .map(|t| {
+            let root = find(&mut parent, t);
             let next = remap.len() as u32;
             *remap.entry(root).or_insert(next)
         })
@@ -1015,16 +1076,22 @@ pub fn prepare(low: &Mesh, settings: &BakeSettings, set: usize) -> Result<Prepar
     });
 
     let (tri_part, part_count) = components(&positions, &indices);
-    let mut part_lo = vec![f32::MAX; part_count as usize];
-    let mut part_hi = vec![f32::MIN; part_count as usize];
+    // What part random and gradient vary by (see `part_crease_angle`).
+    let (tri_vpart, vpart_count) = if settings.part_crease_angle > 0.0 {
+        crease_components(&positions, &indices, settings.part_crease_angle)
+    } else {
+        (tri_part.clone(), part_count)
+    };
+    let mut part_lo = vec![f32::MAX; vpart_count as usize];
+    let mut part_hi = vec![f32::MIN; vpart_count as usize];
     for (t, tri) in indices.chunks_exact(3).enumerate() {
-        let p = tri_part[t] as usize;
+        let p = tri_vpart[t] as usize;
         for &v in tri {
             part_lo[p] = part_lo[p].min(positions[v as usize].y);
             part_hi[p] = part_hi[p].max(positions[v as usize].y);
         }
     }
-    let parts: Vec<[f32; 4]> = (0..part_count as usize)
+    let parts: Vec<[f32; 4]> = (0..vpart_count as usize)
         .map(|p| [hash01(p as u32 + 1), part_lo[p], (part_hi[p] - part_lo[p]).max(1e-5), 0.0])
         .collect();
     let use_materials = settings.id_source == IdSource::Materials && material_count > 1;
@@ -1078,6 +1145,7 @@ pub fn prepare(low: &Mesh, settings: &BakeSettings, set: usize) -> Result<Prepar
     // Curvature comes from the source mesh's vertices (see
     // `vertex_curvature`) and rides in the normal's w.
     let curvature = vertex_curvature(&positions, &normals, &indices, 1.0 / settings.curvature_scale_for(low).max(1e-6));
+    let tri_vpart: Vec<u32> = bvh.order.iter().map(|&t| tri_vpart[t as usize]).collect();
     let mut tri_pos = Vec::with_capacity(bvh.order.len() * 3);
     let mut tri_nrm = Vec::with_capacity(bvh.order.len() * 3);
     for &t in &bvh.order {
@@ -1140,6 +1208,7 @@ pub fn prepare(low: &Mesh, settings: &BakeSettings, set: usize) -> Result<Prepar
         tri_pos,
         tri_nrm,
         parts,
+        tri_vpart,
         ids,
         seg_nodes,
         segs,
@@ -1457,6 +1526,7 @@ impl GpuBaker {
                 (6, Storage(false)),
                 (7, Storage(false)),
                 (8, Storage(false)),
+                (38, Storage(false)),
                 (9, StorageTex(F::Rgba32Float)),
                 (10, StorageTex(F::Rgba16Float)),
                 (11, StorageTex(F::Rgba16Float)),
@@ -1768,6 +1838,12 @@ impl GpuBaker {
         let tri_pos = Self::storage(device, "tri positions", &scene.tri_pos);
         let tri_nrm = Self::storage(device, "tri normals", &scene.tri_nrm);
         let parts = Self::storage(device, "parts", &scene.parts);
+        let tri_vpart = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("tri variation parts"),
+            // Never empty: a bake has triangles, but keep the binding valid.
+            contents: bytemuck::cast_slice(if scene.tri_vpart.is_empty() { &[0u32][..] } else { &scene.tri_vpart }),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
         let ids = Self::storage(device, "ids", &scene.ids);
         let seg_nodes = Self::storage(device, "edge bvh nodes", &scene.seg_nodes);
         let segs = Self::storage(device, "edge segments", &scene.segs);
@@ -1803,6 +1879,7 @@ impl GpuBaker {
                 (6, tri_nrm.as_entire_binding()),
                 (7, parts.as_entire_binding()),
                 (8, ids.as_entire_binding()),
+                (38, tri_vpart.as_entire_binding()),
                 (9, v(&surf_pos)),
                 (10, v(&surf_nrm)),
                 (11, v(&maps[3])),
@@ -2173,6 +2250,20 @@ pub(crate) mod tests {
                 (p.distance(a + e * t) - s.half_width.max(0.0)).max(0.0)
             })
             .fold(f32::MAX, f32::min)
+    }
+
+    /// A cube is one connected part but six panels at a 30° split, and one
+    /// again when the split angle is wider than its folds.
+    #[test]
+    fn crease_split_finds_panels() {
+        let p: Vec<Vec3> = (0..8).map(|i| Vec3::new((i & 1) as f32, ((i >> 1) & 1) as f32, ((i >> 2) & 1) as f32)).collect();
+        let quads = [[0, 2, 3, 1], [4, 5, 7, 6], [0, 1, 5, 4], [2, 6, 7, 3], [0, 4, 6, 2], [1, 3, 7, 5]];
+        let idx: Vec<u32> = quads.iter().flat_map(|q| [q[0], q[1], q[2], q[0], q[2], q[3]]).collect();
+        assert_eq!(components(&p, &idx).1, 1);
+        let (tri_part, n) = crease_components(&p, &idx, 30.0);
+        assert_eq!(n, 6);
+        assert!(tri_part.chunks(2).all(|q| q[0] == q[1]), "both triangles of a face share its panel");
+        assert_eq!(crease_components(&p, &idx, 95.0).1, 1);
     }
 
     #[test]

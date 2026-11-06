@@ -307,7 +307,8 @@ impl RayTracer {
         let usage = wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING;
         let out = Tex::new(device, "rt output", size[0], size[1], HDR_FORMAT, usage);
         let display_usage = wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC;
-        let display = Tex::new(device, "rt display", size[0], size[1], wgpu::TextureFormat::Rgba8UnormSrgb, display_usage);
+        // Plain format for egui (see `viewport::IMAGE_FORMAT`); post writes the sRGB view.
+        let display = Tex::new(device, "rt display", size[0], size[1], wgpu::TextureFormat::Rgba8Unorm, display_usage);
         let mut renderer = rs.renderer.write();
         match self.egui_id {
             Some(id) => renderer.update_egui_texture_from_wgpu_texture(device, &display.view, wgpu::FilterMode::Linear, id),
@@ -385,7 +386,7 @@ impl RayTracer {
             // Only the grading changed: redo post on the finished image.
             let target = self.target.as_ref().unwrap();
             let mut encoder = rs.device.create_command_encoder(&Default::default());
-            self.post.record(rs, &mut encoder, &target.out, &target.display.view, &post.0, post.1, post.2);
+            self.post.record(rs, &mut encoder, &target.out, target.display.srgb(), &post.0, post.1, post.2);
             rs.queue.submit([encoder.finish()]);
             self.shown_post = Some(post);
             return true;
@@ -460,7 +461,7 @@ impl RayTracer {
             pass.set_bind_group(0, &group, &[]);
             pass.dispatch_workgroups(size[0].div_ceil(8), size[1].div_ceil(8), 1);
         }
-        self.post.record(rs, &mut encoder, &target.out, &target.display.view, &post.0, post.1, post.2);
+        self.post.record(rs, &mut encoder, &target.out, target.display.srgb(), &post.0, post.1, post.2);
         rs.queue.submit([encoder.finish()]);
         self.shown_post = Some(post);
         self.samples += 1;

@@ -223,6 +223,7 @@ impl Behavior<Pane> for DockBehavior<'_> {
             Pane::ShaderCode => app.shader_code_pane(ui),
             Pane::ShaderPreview => app.shader_preview_pane(ui),
         };
+        let t0 = std::time::Instant::now();
         if pane.padded() {
             egui::Frame::new().inner_margin(egui::Margin::same(10)).show(ui, |ui| {
                 ui.set_min_size(ui.available_size());
@@ -230,6 +231,9 @@ impl Behavior<Pane> for DockBehavior<'_> {
             });
         } else {
             draw(ui, app);
+        }
+        if app.profile {
+            app.prof.push((pane.title(), t0.elapsed().as_secs_f32() * 1000.0));
         }
         // A clear edge around every panel.
         ui.painter().rect_stroke(rect, 0.0, Stroke::new(1.0, theme::OUTLINE), egui::StrokeKind::Inside);

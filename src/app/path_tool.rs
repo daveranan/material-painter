@@ -346,7 +346,7 @@ impl PainterApp {
         ui.add_space(6.0);
         ui.label(egui::RichText::new("Spacing").color(theme::TEXT_DIM));
         let mut p = self.brush.spacing * 100.0;
-        if ui.add(egui::Slider::new(&mut p, 2.0..=300.0).max_decimals(0).suffix("%")).on_hover_text("Distance between stamps, in brush sizes").changed() {
+        if ui.add(egui::Slider::new(&mut p, 2.0..=300.0).max_decimals(0).suffix("%").clamping(egui::SliderClamping::Edits)).on_hover_text("Distance between stamps, in brush sizes").changed() {
             self.brush.spacing = p / 100.0;
         }
         ui.label(egui::RichText::new("Size").color(theme::TEXT_DIM));

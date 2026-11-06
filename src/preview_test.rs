@@ -1712,3 +1712,351 @@ fn spp_screenshot() {
     harness.run_steps(1);
     harness.render().expect("renders").save(dir.join("shot_raytraced.png")).unwrap();
 }
+
+/// Normal and emission channels: a dome normal image stays a dome under UV
+/// and tri-planar projection and under rotation, tri-planar agrees with UV
+/// where the two map the same way, and emission comes out linear times
+/// strength.
+#[test]
+#[ignore]
+fn normal_and_emission_channels() {
+    use crate::engine::{Content, EMISSION_CH, FillParams, MatValues, NORMAL_CH, Projection};
+    let rs = render_state();
+    // The plane: u along +x, v along +z, facing +y, so its tri-planar top
+    // projection (image right +x, up -z) matches its UVs.
+    let mesh = crate::mesh::Primitive::Plane.build();
+    let gpu_mesh = GpuMesh::new(&rs.device, &mesh);
+    const RES: u32 = 256;
+    let mut engine = Engine::new(&rs, &gpu_mesh, (mesh.bounds_min, mesh.bounds_max), RES);
+    let mut undo = crate::undo::UndoStack::default();
+    // A dome: normals point away from the image center (OpenGL, green up).
+    let n = 128u32;
+    let dome = image::RgbaImage::from_fn(n, n, |x, y| {
+        let (dx, dy) = ((x as f32 + 0.5) / n as f32 - 0.5, (y as f32 + 0.5) / n as f32 - 0.5);
+        let (mut nx, mut ny) = (dx * 1.6, -dy * 1.6);
+        if nx * nx + ny * ny > 0.64 {
+            (nx, ny) = (0.0, 0.0);
+        }
+        let nz = (1.0 - nx * nx - ny * ny).max(0.0).sqrt();
+        image::Rgba([nx, ny, nz, 1.0].map(|v| ((v * 0.5 + 0.5) * 255.0).round() as u8))
+    });
+    let mut png = Vec::new();
+    dome.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
+    let dome = engine.decode_fill_image("dome".into(), Arc::new(png)).unwrap();
+    let fill = FillParams { mat: MatValues { enabled: [false; 4], ..Default::default() }, normal_on: true, ..Default::default() };
+    let idx = engine.add_fill_layer(0, None, "Dome".into(), fill, &mut undo);
+    engine.set_fill_image(idx, NORMAL_CH, Some(dome), &mut undo);
+
+    let normals = |e: &mut Engine| -> Vec<[f32; 2]> {
+        e.composite();
+        let px = read_texture(&rs.device, &rs.queue, e.final_tex(NORMAL_CH));
+        px.chunks_exact(2).map(|c| [c[0] as f32 / 255.0 * 2.0 - 1.0, c[1] as f32 / 255.0 * 2.0 - 1.0]).collect()
+    };
+    let at = |v: &[[f32; 2]], u: f32, w: f32| v[((w * RES as f32) as usize).min(RES as usize - 1) * RES as usize + ((u * RES as f32) as usize).min(RES as usize - 1)];
+    // Average slope along the outward direction (tangent x right, y up) on a
+    // circle around the dome's center, and across it.
+    let dome_check = |v: &[[f32; 2]]| {
+        let (mut out, mut across) = (0.0, 0.0);
+        for k in 0..16 {
+            let a = k as f32 / 16.0 * std::f32::consts::TAU;
+            let (dx, dy) = (a.cos(), a.sin());
+            let s = at(v, 0.5 + 0.15 * dx, 0.5 - 0.15 * dy);
+            out += (s[0] * dx + s[1] * dy) / 16.0;
+            across += (s[0] * -dy + s[1] * dx).abs() / 16.0;
+        }
+        (out, across)
+    };
+    let set = |e: &mut Engine, proj: Projection, tiling: f32, rot: f32, offset: [f32; 2]| {
+        if let Content::Fill(f) = &mut e.layers[idx].content {
+            (f.projection, f.tiling, f.rotation, f.offset) = (proj, tiling, rot, offset);
+        }
+        e.mark_dirty();
+    };
+    let diff = |a: &[[f32; 2]], b: &[[f32; 2]]| {
+        let r = RES as usize;
+        let mut sum = 0.0;
+        let mut cnt = 0.0;
+        for y in r / 8..r * 7 / 8 {
+            for x in r / 8..r * 7 / 8 {
+                let (p, q) = (a[y * r + x], b[y * r + x]);
+                sum += (p[0] - q[0]).abs() + (p[1] - q[1]).abs();
+                cnt += 2.0;
+            }
+        }
+        sum / cnt
+    };
+    for rot in [0.0, 90.0, 37.0] {
+        set(&mut engine, Projection::Uv, 1.0, rot, [0.0, 0.0]);
+        let uv = normals(&mut engine);
+        let (out, across) = dome_check(&uv);
+        println!("  uv rotation {rot}: outward {out:.3}, across {across:.3}");
+        assert!(out > 0.15 && across < 0.06, "UV dome at {rot} degrees: outward {out}, across {across}");
+        set(&mut engine, Projection::Triplanar, 0.5, rot, [0.5, 0.5]);
+        let tri = normals(&mut engine);
+        let d = diff(&uv, &tri);
+        println!("  tri-planar vs uv at {rot}: mean difference {d:.4}");
+        assert!(d < 0.03, "tri-planar should match UV on the plane at {rot} degrees: {d}");
+    }
+    // Strength scales the slopes; DirectX flips green.
+    if let Content::Fill(f) = &mut engine.layers[idx].content {
+        (f.projection, f.tiling, f.rotation, f.offset, f.normal_dx) = (Projection::Uv, 1.0, 0.0, [0.0, 0.0], true);
+    }
+    engine.mark_dirty();
+    let dx = normals(&mut engine);
+    let s = at(&dx, 0.5, 0.35);
+    assert!(s[1] < -0.15, "DirectX flips the slope above the center: {s:?}");
+
+    // Emission: linear color times strength, on top of the normal layer.
+    let glow = FillParams {
+        mat: MatValues { enabled: [false; 4], ..Default::default() },
+        emission_on: true,
+        emission: [1.0, 0.5, 0.0],
+        emission_strength: 2.0,
+        ..Default::default()
+    };
+    engine.add_fill_layer(idx + 1, None, "Glow".into(), glow, &mut undo);
+    engine.composite();
+    let px = read_texture(&rs.device, &rs.queue, engine.final_tex(EMISSION_CH));
+    let h = |b: &[u8]| {
+        let h = u16::from_le_bytes([b[0], b[1]]);
+        let (s, e, m) = ((h >> 15) as i32, ((h >> 10) & 0x1f) as i32, (h & 0x3ff) as f32);
+        let v = if e == 0 { m / 1024.0 * 2f32.powi(-14) } else { (1.0 + m / 1024.0) * 2f32.powi(e - 15) };
+        if s == 1 { -v } else { v }
+    };
+    let mid = ((RES / 2) * RES + RES / 2) as usize * 8;
+    let (r, g, b) = (h(&px[mid..]), h(&px[mid + 2..]), h(&px[mid + 4..]));
+    println!("  emission at the center: {r:.3} {g:.3} {b:.3}");
+    assert!((r - 2.0).abs() < 0.02 && (g - 0.428).abs() < 0.02 && b.abs() < 0.01, "emission {r} {g} {b}");
+}
+
+/// Where a real document's composite time goes: opens `MP_PERF_PROJECT`,
+/// times a full composite, then each visible layer's share (hidden one at a
+/// time). Prints the costliest layers.
+///
+/// `MP_PERF_PROJECT=path/to/ship.json cargo test --bin material_painter project_composite_profile -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn project_composite_profile() {
+    use crate::app::PainterApp;
+    let Ok(path) = std::env::var("MP_PERF_PROJECT") else {
+        println!("set MP_PERF_PROJECT to a project of your own");
+        return;
+    };
+    let mut setup = egui_wgpu::WgpuSetupCreateNew::without_display_handle();
+    setup.device_descriptor = Arc::new(|adapter| wgpu::DeviceDescriptor {
+        label: Some("perf test device"),
+        required_limits: adapter.limits(),
+        ..Default::default()
+    });
+    let mut harness = egui_kittest::Harness::builder()
+        .with_size([1200.0, 800.0])
+        .with_pixels_per_point(1.0)
+        .with_accessibility_check(false)
+        .wgpu_setup(egui_wgpu::WgpuSetup::CreateNew(setup))
+        .build_eframe(|cc| PainterApp::new(cc).expect("app starts"));
+    harness.run_steps(2);
+    harness.state_mut().test_close_welcome();
+    let ctx = harness.ctx.clone();
+    harness.state_mut().test_open_project(Path::new(&path), &ctx).expect("opens");
+    let mut steps = 0;
+    while harness.state().test_baking() && steps < 20_000 {
+        harness.run_steps(1);
+        steps += 1;
+    }
+    harness.run_steps(2);
+    let rs = harness.state().test_render_state();
+    let engine = harness.state_mut().test_engine();
+    let time = |e: &mut Engine| {
+        let mut best = f64::MAX;
+        for _ in 0..3 {
+            e.mark_dirty();
+            rs.device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+            let t = std::time::Instant::now();
+            e.composite();
+            rs.device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+            best = best.min(t.elapsed().as_secs_f64() * 1000.0);
+        }
+        best
+    };
+    let full = time(engine);
+    println!("  {} layers at {}²: full composite {full:.1} ms", engine.layers.len(), engine.res);
+    // Editing one layer's settings: after the first composite records the
+    // stack below it, later edits start at that layer.
+    let visible: Vec<usize> = (0..engine.layers.len()).filter(|&i| engine.layers[i].visible && !engine.layers[i].is_folder()).collect();
+    for (label, i) in [("top", *visible.last().unwrap()), ("middle", visible[visible.len() / 2]), ("bottom", visible[0])] {
+        engine.mark_layer_dirty(i);
+        engine.composite();
+        let mut best = f64::MAX;
+        for _ in 0..3 {
+            engine.mark_layer_dirty(i);
+            rs.device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+            let t = std::time::Instant::now();
+            engine.composite();
+            rs.device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+            best = best.min(t.elapsed().as_secs_f64() * 1000.0);
+        }
+        println!("  editing the {label} layer ({}): {best:.1} ms per change", engine.layers[i].name);
+    }
+    let mut costs = Vec::new();
+    for i in 0..engine.layers.len() {
+        if !engine.layers[i].visible || engine.layers[i].is_folder() {
+            continue;
+        }
+        engine.layers[i].visible = false;
+        let without = time(engine);
+        engine.layers[i].visible = true;
+        let l = &engine.layers[i];
+        let mask_kind = l.mask.as_ref().and_then(|m| m.generator.as_ref()).map_or("-".to_string(), |g| g.kind.name().to_string());
+        let filters = l.mask.as_ref().map_or(0, |m| m.filters.iter().filter(|f| f.enabled).count());
+        costs.push((full - without, l.name.clone(), mask_kind, filters));
+    }
+    costs.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+    for (ms, name, generator, filters) in costs.iter().take(20) {
+        println!("    {ms:6.1} ms  {name:<34} mask: {generator}{}", if *filters > 0 { format!(" + {filters} filters") } else { String::new() });
+    }
+    let total: f64 = costs.iter().map(|c| c.0).sum();
+    println!("  sum of layer shares {total:.1} ms");
+}
+
+/// A decal fill shows only inside its box on faces turned toward it, and a
+/// text decal only where its letters are.
+#[test]
+#[ignore]
+fn decal_projection_covers_its_box() {
+    use crate::engine::{Content, FillParams, MatValues, Projection};
+    let rs = render_state();
+    // The plane: u along +x, v along +z, facing +y.
+    let mesh = crate::mesh::Primitive::Plane.build();
+    let gpu_mesh = GpuMesh::new(&rs.device, &mesh);
+    const RES: u32 = 256;
+    let (lo, hi) = (mesh.bounds_min, mesh.bounds_max);
+    let mut engine = Engine::new(&rs, &gpu_mesh, (lo, hi), RES);
+    let mut undo = crate::undo::UndoStack::default();
+    let black = FillParams { mat: MatValues { enabled: [true, false, false, false], color: [0.0; 3], ..Default::default() }, ..Default::default() };
+    engine.add_fill_layer(0, None, "Base".into(), black, &mut undo);
+    let mut fill = FillParams { mat: MatValues { enabled: [true, false, false, false], color: [1.0; 3], ..Default::default() }, ..Default::default() };
+    fill.projection = Projection::Decal;
+    fill.decal = crate::decal::Decal { center: [0.0, 0.0, 0.0], normal: [0.0, 1.0, 0.0], size: [0.5, 0.25], depth: 0.1, facing: 80.0, soft: 0.0, mirror: false };
+    let idx = engine.add_fill_layer(1, None, "Decal".into(), fill, &mut undo);
+
+    let shot = |e: &mut Engine| -> Vec<u8> {
+        e.mark_dirty();
+        e.composite();
+        read_texture(&rs.device, &rs.queue, e.final_tex(0)).chunks_exact(4).map(|c| c[0]).collect()
+    };
+    // The texel at a point (x, z) of the plane.
+    let at = |v: &[u8], x: f32, z: f32| {
+        let u = ((x - lo.x) / (hi.x - lo.x) * RES as f32) as usize;
+        let w = ((z - lo.z) / (hi.z - lo.z) * RES as f32) as usize;
+        v[w.min(RES as usize - 1) * RES as usize + u.min(RES as usize - 1)]
+    };
+    let v = shot(&mut engine);
+    println!("  box: center {} inside x {} inside z {} | outside x {} outside z {}", at(&v, 0.0, 0.0), at(&v, 0.2, 0.0), at(&v, 0.0, 0.1), at(&v, 0.35, 0.0), at(&v, 0.0, 0.2));
+    assert!(at(&v, 0.0, 0.0) > 240 && at(&v, 0.2, 0.0) > 240 && at(&v, 0.0, 0.1) > 240, "inside the box");
+    assert!(at(&v, 0.35, 0.0) < 10 && at(&v, 0.0, 0.2) < 10 && at(&v, -0.35, 0.0) < 10, "outside the box");
+
+    // Turned away from the surface: nothing.
+    if let Content::Fill(f) = &mut engine.layers[idx].content {
+        f.decal.normal = [0.0, -1.0, 0.0];
+    }
+    let v = shot(&mut engine);
+    assert!(at(&v, 0.0, 0.0) < 10, "a decal facing away leaves the surface alone");
+    // Unless it wraps around (facing 180).
+    if let Content::Fill(f) = &mut engine.layers[idx].content {
+        f.decal.facing = 180.0;
+    }
+    let v = shot(&mut engine);
+    assert!(at(&v, 0.0, 0.0) > 240, "facing 180 takes every face in the box");
+
+    // Rotated 90 degrees: the box's long side runs along z.
+    if let Content::Fill(f) = &mut engine.layers[idx].content {
+        f.decal.normal = [0.0, 1.0, 0.0];
+        f.decal.facing = 80.0;
+        f.rotation = 90.0;
+    }
+    let v = shot(&mut engine);
+    assert!(at(&v, 0.0, 0.2) > 240 && at(&v, 0.2, 0.0) < 10, "rotation turns the box");
+
+    // Text: covered only where the letters are, never outside the box.
+    if crate::decal::font_path("bahnschrift").or_else(|| crate::decal::font_path("arialbd")).is_some() {
+        if let Content::Fill(f) = &mut engine.layers[idx].content {
+            f.rotation = 0.0;
+        }
+        let spec = crate::decal::TextSpec { text: "HI".into(), ..Default::default() };
+        let (img, aspect) = engine.text_fill_image(&spec).unwrap();
+        engine.set_fill_image(idx, 0, Some(img), &mut undo);
+        if let Content::Fill(f) = &mut engine.layers[idx].content {
+            f.decal.size = [0.25 * aspect, 0.25];
+        }
+        let v = shot(&mut engine);
+        let (mut inside, mut lit, mut outside_lit) = (0, 0, 0);
+        let half = [0.125 * aspect, 0.125];
+        for k in 0..RES as usize * RES as usize {
+            let (u, w) = ((k % RES as usize) as f32 + 0.5, (k / RES as usize) as f32 + 0.5);
+            let x = lo.x + u / RES as f32 * (hi.x - lo.x);
+            let z = lo.z + w / RES as f32 * (hi.z - lo.z);
+            let is_in = x.abs() < half[0] && z.abs() < half[1];
+            if is_in {
+                inside += 1;
+                lit += (v[k] > 128) as u32;
+            } else if v[k] > 128 {
+                outside_lit += 1;
+            }
+        }
+        let frac = lit as f32 / inside.max(1) as f32;
+        println!("  text: {frac:.2} of the box lit, {outside_lit} texels outside");
+        assert!(frac > 0.08 && frac < 0.7, "letters, not the whole box: {frac}");
+        assert_eq!(outside_lit, 0);
+    }
+}
+
+/// A draft composite matches the full one at the texels it samples.
+#[test]
+#[ignore]
+fn draft_composite_matches_full() {
+    use crate::engine::{FillParams, GenKind, MatValues};
+    let rs = render_state();
+    let mesh = crate::mesh::Primitive::Sphere.build();
+    let gpu_mesh = GpuMesh::new(&rs.device, &mesh);
+    const RES: u32 = 256;
+    let mut engine = Engine::new(&rs, &gpu_mesh, (mesh.bounds_min, mesh.bounds_max), RES);
+    let mut undo = crate::undo::UndoStack::default();
+    let base = FillParams { mat: MatValues { color: [0.2, 0.3, 0.4], ..Default::default() }, ..Default::default() };
+    engine.add_fill_layer(0, None, "Base".into(), base, &mut undo);
+    let mut spots = FillParams { mat: MatValues { color: [0.9, 0.6, 0.1], ..Default::default() }, ..Default::default() };
+    spots.color_var = 0.3;
+    let i = engine.add_fill_layer(1, None, "Spots".into(), spots, &mut undo);
+    engine.add_mask(i, true, Some(GenKind::Clouds.default_generator()), &mut undo);
+    engine.layers[i].opacity = 0.7;
+    let read = |e: &Engine| -> (u32, Vec<u8>) {
+        let t = e.view_tex(0);
+        (t.width, read_texture(&rs.device, &rs.queue, t).chunks_exact(4).map(|c| c[0]).collect())
+    };
+    engine.mark_dirty();
+    engine.composite();
+    let (fw, full) = read(&engine);
+    engine.draft = true;
+    engine.mark_dirty();
+    engine.composite();
+    let (dw, draft) = read(&engine);
+    assert_eq!(dw * 2, fw, "the draft is half the size at 256");
+    let (mut sum, mut n, mut worst) = (0.0f64, 0, 0u8);
+    for y in 0..dw as usize {
+        for x in 0..dw as usize {
+            let a = draft[y * dw as usize + x];
+            let b = full[(2 * y) * fw as usize + 2 * x];
+            let d = a.abs_diff(b);
+            sum += d as f64;
+            n += 1;
+            worst = worst.max(d);
+        }
+    }
+    let mean = sum / n as f64;
+    println!("  draft vs full: mean {mean:.2}, worst {worst} (of 255)");
+    assert!(mean < 3.0, "draft differs from full: mean {mean}");
+    // Back to full size once the draft ends.
+    engine.draft = false;
+    engine.mark_dirty();
+    engine.composite();
+    assert_eq!(read(&engine).0, fw);
+}

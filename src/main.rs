@@ -8,6 +8,7 @@ mod brushes;
 mod bvh;
 mod cage;
 mod crash;
+mod decal;
 mod engine;
 mod environment;
 mod export;

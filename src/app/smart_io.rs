@@ -282,8 +282,8 @@ impl PainterApp {
                 Some("folder") => Content::Folder(Folder { open: true }),
                 _ => continue,
             };
-            let mut images: [Option<crate::engine::FillImage>; 4] = Default::default();
-            for (ch, iv) in lv["images"].as_array().into_iter().flatten().enumerate().take(4) {
+            let mut images: [Option<crate::engine::FillImage>; crate::engine::IMAGE_SLOTS] = Default::default();
+            for (ch, iv) in lv["images"].as_array().into_iter().flatten().enumerate().take(crate::engine::IMAGE_SLOTS) {
                 let Some(file) = iv["file"].as_str() else { continue };
                 let data = Arc::new(read(file)?);
                 images[ch] = Some(self.engine.decode_fill_image(iv["name"].as_str().unwrap_or("image").to_string(), data)?);

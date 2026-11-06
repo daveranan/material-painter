@@ -189,6 +189,9 @@ impl PainterApp {
                 if let Some(v) = f32_arg(args, "front") {
                     self.bake_settings.front = v.clamp(0.0005, 2.0);
                 }
+                if let Some(v) = f32_arg(args, "part_crease_angle") {
+                    self.bake_settings.part_crease_angle = v.clamp(0.0, 180.0);
+                }
                 if let Some(v) = f32_arg(args, "rear") {
                     self.bake_settings.rear = v.clamp(0.0005, 2.0);
                 }
@@ -260,10 +263,10 @@ impl PainterApp {
                 let mut images = Vec::new();
                 if let Some(obj) = args.get("images").and_then(Value::as_object) {
                     for (key, v) in obj {
-                        let ch = ["color", "roughness", "metallic", "height"]
+                        let ch = ["color", "roughness", "metallic", "height", "normal", "emission"]
                             .iter()
                             .position(|c| c == key)
-                            .ok_or(format!("unknown image channel '{key}' (color, roughness, metallic, height)"))?;
+                            .ok_or(format!("unknown image channel '{key}' (color, roughness, metallic, height, normal, emission)"))?;
                         let img = match v.as_str() {
                             None => None,
                             Some(path) => {
@@ -275,6 +278,57 @@ impl PainterApp {
                         images.push((ch, img));
                     }
                 }
+                // Text decals: render the text before anything changes, too.
+                let mut text_image = None;
+                if let Some(t) = args.get("text") {
+                    let prev = self.engine.layers[i].images[0].as_ref().and_then(|im| im.text.as_deref().cloned()).unwrap_or_default();
+                    let spec = match t {
+                        Value::String(s) => crate::decal::TextSpec { text: s.clone(), ..prev },
+                        Value::Object(_) => crate::decal::TextSpec {
+                            text: str_arg(t, "text").map_or(prev.text, str::to_string),
+                            font: str_arg(t, "font").map_or(prev.font, str::to_string),
+                            weight: f32_arg(t, "weight").unwrap_or(prev.weight),
+                            spacing: f32_arg(t, "spacing").unwrap_or(prev.spacing),
+                        },
+                        _ => return Err("'text' is a string or {text, font, weight, spacing}".into()),
+                    };
+                    text_image = Some(self.engine.text_fill_image(&spec)?);
+                }
+                // Decal placement from a pixel of a render_view image (same camera
+                // arguments) or a 3D point: the surface there, facing the camera.
+                let mut placed = None;
+                if let Some(at) = args.get("decal_at") {
+                    let (cam, [w, h]) = self.tool_camera(at);
+                    placed = Some(if let Some(pt) = at.get("point").and_then(Value::as_array) {
+                        let c: Vec<f32> = pt.iter().map(|v| v.as_f64().unwrap_or(0.0) as f32).collect();
+                        if c.len() != 3 {
+                            return Err("'decal_at.point' needs 3 numbers".into());
+                        }
+                        let p = glam::Vec3::new(c[0], c[1], c[2]);
+                        let tri = select::nearest_triangle(&self.mesh, p).ok_or("the mesh has no triangles")?;
+                        let face = super::face_normal(&self.mesh, tri as u32);
+                        (p, if face.dot(cam.eye() - p) < 0.0 { -face } else { face })
+                    } else {
+                        let x = f32_arg(at, "x").ok_or("'decal_at' needs a pixel 'x' and 'y', or a 'point'")?;
+                        let y = f32_arg(at, "y").ok_or("missing 'decal_at.y'")?;
+                        let (o, d) = cam.ray(glam::Vec2::new(x, y), glam::Vec2::new(w as f32, h as f32));
+                        super::decal_hit(&self.mesh, &self.bvh, o, d).ok_or(format!("pixel ({x}, {y}) does not hit the mesh"))?
+                    });
+                }
+                // A run-off follows the text decal at this layer index.
+                let runoff = match args.get("runoff") {
+                    Some(Value::Null) => Some(None),
+                    Some(r) if r.is_object() => {
+                        let si = r.get("source").and_then(Value::as_u64).ok_or("'runoff' needs 'source' (the text layer's index)")? as usize;
+                        let src = self.engine.layers.get(si).ok_or(format!("no layer {si}"))?;
+                        Some(Some(crate::decal::Runoff {
+                            source: src.id,
+                            length: f32_arg(r, "length").unwrap_or(0.8),
+                            seed: f32_arg(r, "seed").unwrap_or(1.0),
+                        }))
+                    }
+                    _ => None,
+                };
                 let layer = &mut self.engine.layers[i];
                 if let Some(n) = str_arg(args, "name") {
                     layer.name = n.to_string();
@@ -288,7 +342,16 @@ impl PainterApp {
                 if let Some(b) = blend {
                     layer.blend = b;
                 }
-                const FILL_KEYS: [&str; 16] = [
+                const FILL_KEYS: [&str; 25] = [
+                    "runoff",
+                    "decal",
+                    "decal_at",
+                    "text",
+                    "normal",
+                    "normal_strength",
+                    "normal_directx",
+                    "emission",
+                    "emission_strength",
                     "images",
                     "projection",
                     "tiling",
@@ -346,7 +409,7 @@ impl PainterApp {
                         match str_arg(args, "projection") {
                             Some(p) => {
                                 f.projection = crate::engine::Projection::from_key(p).ok_or(format!(
-                                    "projection must be uv, triplanar, planar_x, planar_y, planar_z, spherical or cylindrical, not '{p}'"
+                                    "projection must be uv, triplanar, planar_x, planar_y, planar_z, spherical, cylindrical or decal, not '{p}'"
                                 ))?
                             }
                             None => {}
@@ -365,6 +428,76 @@ impl PainterApp {
                         if let Some(v) = f32_arg(args, "triplanar_sharpness") {
                             f.tri_sharpness = v.clamp(1.0, 64.0);
                         }
+                        if let Some(v) = args.get("normal").and_then(Value::as_bool) {
+                            f.normal_on = v;
+                        }
+                        if let Some(v) = f32_arg(args, "normal_strength") {
+                            f.normal_strength = v.clamp(0.0, 8.0);
+                            f.normal_on = true;
+                        }
+                        if let Some(v) = args.get("normal_directx").and_then(Value::as_bool) {
+                            f.normal_dx = v;
+                        }
+                        match args.get("emission") {
+                            Some(Value::Bool(on)) => f.emission_on = *on,
+                            Some(Value::Array(c)) => {
+                                for (k, v) in c.iter().take(3).enumerate() {
+                                    f.emission[k] = v.as_f64().unwrap_or(0.0).clamp(0.0, 1.0) as f32;
+                                }
+                                f.emission_on = true;
+                            }
+                            _ => {}
+                        }
+                        if let Some(v) = f32_arg(args, "emission_strength") {
+                            f.emission_strength = v.max(0.0);
+                            f.emission_on = true;
+                        }
+                        if let Some(r) = runoff {
+                            f.runoff = r;
+                        }
+                        if let Some((p, n)) = placed {
+                            f.decal.center = p.to_array();
+                            f.decal.normal = n.to_array();
+                            f.projection = crate::engine::Projection::Decal;
+                        }
+                        if let Some((_, aspect)) = &text_image {
+                            // Text keeps its proportions: the height stays, the width follows.
+                            f.decal.size[0] = f.decal.size[1] * aspect;
+                            f.projection = crate::engine::Projection::Decal;
+                        }
+                        if let Some(d) = args.get("decal").filter(|d| d.is_object()) {
+                            let num3 = |k: &str, out: &mut [f32; 3]| {
+                                if let Some(a) = d.get(k).and_then(Value::as_array) {
+                                    for (j, v) in a.iter().take(3).enumerate() {
+                                        out[j] = v.as_f64().unwrap_or(0.0) as f32;
+                                    }
+                                }
+                            };
+                            num3("center", &mut f.decal.center);
+                            num3("normal", &mut f.decal.normal);
+                            if let Some(a) = d.get("size").and_then(Value::as_array) {
+                                for (j, v) in a.iter().take(2).enumerate() {
+                                    f.decal.size[j] = (v.as_f64().unwrap_or(0.1) as f32).max(1e-4);
+                                }
+                            } else if let Some(hgt) = f32_arg(d, "height") {
+                                // Height alone keeps the width over height ratio.
+                                let ratio = f.decal.size[0] / f.decal.size[1].max(1e-5);
+                                f.decal.size = [hgt.max(1e-4) * ratio, hgt.max(1e-4)];
+                            }
+                            if let Some(v) = f32_arg(d, "depth") {
+                                f.decal.depth = v.max(1e-4);
+                            }
+                            if let Some(v) = f32_arg(d, "facing") {
+                                f.decal.facing = v.clamp(0.0, 180.0);
+                            }
+                            if let Some(v) = f32_arg(d, "soft") {
+                                f.decal.soft = v.clamp(0.0, 0.5);
+                            }
+                            if let Some(v) = d.get("mirror").and_then(Value::as_bool) {
+                                f.decal.mirror = v;
+                            }
+                            f.projection = crate::engine::Projection::Decal;
+                        }
                     }
                     Content::Paint(_) | Content::Folder(_) if material => {
                         return Err("material and variation values apply to fill layers only".into());
@@ -375,6 +508,9 @@ impl PainterApp {
                 self.engine.commit_props(&mut self.undo);
                 for (ch, img) in images {
                     self.engine.set_fill_image(i, ch, img, &mut self.undo);
+                }
+                if let Some((img, _)) = text_image {
+                    self.engine.set_fill_image(i, 0, Some(img), &mut self.undo);
                 }
                 text(format!("Updated layer {i}."))
             }
@@ -724,6 +860,19 @@ impl PainterApp {
                 self.save_project(&path)?;
                 text(self.status.clone())
             }
+            "quit" => {
+                let flag = |k: &str| args.get(k).and_then(Value::as_bool).unwrap_or(false);
+                if self.is_modified() {
+                    if flag("save") {
+                        let path = self.project_path.clone().ok_or("the project has no file yet: save_project with a 'path' first")?;
+                        self.save_project(&path)?;
+                    } else if !flag("discard") {
+                        return Err("there are unsaved changes: pass save=true or discard=true".into());
+                    }
+                }
+                self.run_unchecked(super::Action::Exit, ctx);
+                text("Closing.".to_string())
+            }
             "open_project" => {
                 let path = str_arg(args, "path").ok_or("missing 'path'")?;
                 self.open_project(std::path::Path::new(path), ctx)?;
@@ -1057,6 +1206,10 @@ impl PainterApp {
             },
             "undo": self.undo.undo.iter().rev().take(10).map(|e| e.label.as_str()).collect::<Vec<_>>(),
             "redo": self.undo.redo.iter().rev().take(10).map(|e| e.label.as_str()).collect::<Vec<_>>(),
+            "project": self.project_path.as_ref().map(|p| p.display().to_string()),
+            "unsaved_changes": self.is_modified(),
+            "live_reload": self.live_reload_json(),
+            "status": self.status,
         })
     }
 }

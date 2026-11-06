@@ -7,8 +7,10 @@ license = "GPL-3.0-or-later"
 repository = "https://github.com/alla2001/material-painter"
 readme = "README.md"
 publish = false
+default-run = "material_painter"
 
 [dependencies]
+ab_glyph = "0.2.32"
 bytemuck = { version = "1.25.2", features = ["derive"] }
 eframe = "0.37.0"
 egui_tiles = { version = "0.18", features = ["serde"] }
