@@ -461,6 +461,11 @@ pub fn tool_list() -> Vec<Value> {
             "Close the app cleanly (no crash-recovery prompt next start). With unsaved changes, pass save=true (saves to the project's file first) or discard=true.",
             schema(json!({"save": {"type": "boolean"}, "discard": {"type": "boolean"}}), &[]),
         ),
+        tool(
+            "set_auto_smooth",
+            "Auto smooth: rebuild the mesh's normals from its faces, smooth across edges meeting below `angle` degrees and hard above (tri-planar layers then follow each face). off=true restores the mesh's own normals. Keeps the layers; re-bakes the mesh maps and replies when done. Saved with the project.",
+            schema(json!({"angle": {"type": "number", "minimum": 1, "maximum": 180}, "off": {"type": "boolean"}}), &[]),
+        ),
         tool("delete_layer", "Delete a layer.", schema(json!({"index": {"type": "integer"}}), &["index"])),
         tool("duplicate_layer", "Duplicate a layer.", schema(json!({"index": {"type": "integer"}}), &["index"])),
         tool(

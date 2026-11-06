@@ -396,6 +396,8 @@ enum Action {
     /// Puts the selected layer into a new folder.
     GroupIntoFolder,
     SetResolution(u32),
+    /// Auto smooth at an angle (degrees), or off.
+    AutoSmooth(Option<f32>),
     /// Bakes the texture set being edited.
     Bake,
     /// Bakes every texture set.
@@ -408,7 +410,17 @@ enum Action {
 
 pub struct PainterApp {
     rs: egui_wgpu::RenderState,
+    /// The mesh as painted: `mesh_source` with auto smooth applied (the same
+    /// mesh when it's off).
     mesh: Arc<Mesh>,
+    /// The mesh as imported (or saved); projects save this one.
+    mesh_source: Arc<Mesh>,
+    /// Auto smooth: normals rebuilt from the faces, hard above this angle
+    /// (degrees); `None` keeps the imported normals. Saved with the project.
+    auto_smooth: Option<f32>,
+    saved_auto_smooth: Option<f32>,
+    /// The angle the Auto smooth control offers when switched on.
+    auto_smooth_angle: f32,
     bvh: Arc<Bvh>,
     gpu_mesh: GpuMesh,
     /// The texture set being edited (see `texture_sets`).
@@ -1602,9 +1614,14 @@ impl PainterApp {
             })
             .collect();
 
+        let mesh = Arc::new(mesh);
         let mut app = PainterApp {
             rs,
-            mesh: Arc::new(mesh),
+            mesh_source: mesh.clone(),
+            mesh,
+            auto_smooth: None,
+            saved_auto_smooth: None,
+            auto_smooth_angle: 30.0,
             bvh: Arc::new(bvh),
             gpu_mesh,
             engine,
@@ -1879,6 +1896,40 @@ impl PainterApp {
         if self.stroke.is_some() {
             return;
         }
+        self.mesh_source = Arc::new(mesh);
+        self.install_mesh(true, ctx);
+        self.status = match self.mesh.sets.len() {
+            1 => format!("Loaded '{}' ({} triangles).", self.mesh.name, self.mesh.triangle_count()),
+            n => format!("Loaded '{}' ({} triangles, {n} texture sets).", self.mesh.name, self.mesh.triangle_count()),
+        };
+    }
+
+    /// Turns auto smooth on at an angle (degrees) or off, rebuilding the
+    /// painted mesh from the imported one and re-baking its mesh maps. The
+    /// layers stay: triangles, UVs and texture sets don't change.
+    fn set_auto_smooth(&mut self, angle: Option<f32>, ctx: &egui::Context) {
+        let angle = angle.map(|a| a.clamp(1.0, 180.0));
+        if angle == self.auto_smooth || self.stroke.is_some() {
+            return;
+        }
+        if let Some(a) = angle {
+            self.auto_smooth_angle = a;
+        }
+        self.auto_smooth = angle;
+        self.install_mesh(false, ctx);
+        self.status = match angle {
+            Some(a) => format!("Auto smooth at {a:.0}°: {} vertices.", self.mesh.vertices.len()),
+            None => "Auto smooth off: the mesh's own normals.".to_string(),
+        };
+    }
+
+    /// Makes `mesh_source` (with auto smooth, when on) the painted mesh: GPU
+    /// buffers, ray tracing, texture sets; `reset_camera` for a new mesh.
+    fn install_mesh(&mut self, reset_camera: bool, ctx: &egui::Context) {
+        let mesh = match self.auto_smooth {
+            Some(a) => Arc::new(self.mesh_source.auto_smoothed(a)),
+            None => self.mesh_source.clone(),
+        };
         // A bake of the old mesh can't land on the new one.
         self.bake_job = None;
         self.end_preview(false);
@@ -1886,19 +1937,18 @@ impl PainterApp {
         self.bvh = Arc::new(Bvh::from_mesh(&mesh));
         self.raytracer.set_mesh(&self.rs.device, &mesh, &self.bvh);
         self.export.mesh_name = mesh.name.replace(' ', "");
-        self.status = match mesh.sets.len() {
-            1 => format!("Loaded '{}' ({} triangles).", mesh.name, mesh.triangle_count()),
-            n => format!("Loaded '{}' ({} triangles, {n} texture sets).", mesh.name, mesh.triangle_count()),
-        };
         let old_names: Vec<String> = self.mesh.sets.iter().map(|s| s.name.clone()).collect();
-        self.mesh = Arc::new(mesh);
+        self.mesh = mesh;
         self.rebuild_sets(&old_names);
         // Mesh-dependent helpers rebuild for the new mesh on demand.
         self.poly.topo = None;
         self.poly.shown = None;
         self.overlays.clear(OverlaySlot::Selection);
-        self.cam = OrbitCam { fov_y: self.cam.fov_y, ..OrbitCam::default() };
-        if self.prefs.bake_on_load {
+        if reset_camera {
+            self.cam = OrbitCam { fov_y: self.cam.fov_y, ..OrbitCam::default() };
+        }
+        // Normals feed the mesh maps (edges, bent normals): a smoothing change re-bakes.
+        if self.prefs.bake_on_load || !reset_camera {
             self.start_bake_all(ctx);
         }
     }
@@ -2242,6 +2292,7 @@ impl PainterApp {
                     }
                     self.status = format!("Texture set resolution: {r}x{r}.");
                 }
+                Action::AutoSmooth(a) => self.set_auto_smooth(a, ctx),
                 Action::Bake => self.start_bake(ctx),
                 Action::BakeAll => self.start_bake_all(ctx),
             }
@@ -2281,6 +2332,8 @@ impl PainterApp {
                 self.selected = self.engine.add_paint_layer(0, None, None, &mut self.undo);
                 self.undo.clear();
                 self.saved_serial = self.undo.state_serial();
+                self.auto_smooth = None;
+                self.saved_auto_smooth = None;
                 self.project_path = None;
                 self.target = StrokeTarget::Content;
                 self.apply_project_defaults();
@@ -3363,6 +3416,28 @@ impl PainterApp {
 
             section(ui, "Normal");
             slider(ui, "Height scale", &mut self.view.height_strength, 0.0..=8.0);
+            let mut on = self.auto_smooth.is_some();
+            let mut angle = self.auto_smooth.unwrap_or(self.auto_smooth_angle);
+            let mut changed = false;
+            labeled(ui, "Auto smooth", |ui| {
+                changed |= ui
+                    .checkbox(&mut on, "")
+                    .on_hover_text("Rebuild the mesh's normals from its faces: smooth across edges below the angle, hard above it. Tri-planar layers follow the faces too. Off: the mesh's own normals.")
+                    .changed();
+            });
+            ui.add_enabled_ui(on, |ui| {
+                labeled(ui, "Angle (°)", |ui| {
+                    // Applied on release: each change rebuilds the mesh and re-bakes its maps.
+                    let r = ui.add(egui::Slider::new(&mut angle, 1.0..=180.0).max_decimals(0));
+                    changed |= r.drag_stopped() || (r.changed() && !r.dragged());
+                    if r.dragged() {
+                        self.auto_smooth_angle = angle;
+                    }
+                });
+            });
+            if changed {
+                self.pending.push(Action::AutoSmooth(on.then_some(angle)));
+            }
 
             section(ui, "Mesh maps");
             if ui.button("Open baker…").clicked() {

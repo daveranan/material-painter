@@ -167,23 +167,7 @@ impl Mesh {
         let bounds_max = (hi - center) * scale;
 
         let normals = normals.unwrap_or_else(|| smooth_normals(&positions, &indices));
-        let (indices, source, tangents) = match mikk_tangents(&positions, &normals, &uvs, &indices) {
-            Some(t) => t,
-            None => {
-                let t = compute_tangents(&positions, &normals, &uvs, &indices);
-                (indices, (0..positions.len()).collect(), t)
-            }
-        };
-        let vertices: Vec<Vertex> = source
-            .iter()
-            .zip(tangents)
-            .map(|(&i, tangent)| Vertex {
-                pos: positions[i].to_array(),
-                normal: normals[i].normalize_or_zero().to_array(),
-                uv: uvs[i].to_array(),
-                tangent,
-            })
-            .collect();
+        let (vertices, indices) = with_tangents(&positions, &normals, &uvs, indices);
         let mut mesh = Mesh {
             name,
             vertices,
@@ -323,6 +307,97 @@ impl Mesh {
     pub fn triangle_count(&self) -> usize {
         self.indices.len() / 3
     }
+
+    /// A copy with normals rebuilt from the faces ("auto smooth"): averaged
+    /// across edges whose faces meet at less than `angle_deg`, hard at
+    /// sharper ones. Positions, UVs, triangle order and texture sets stay;
+    /// vertices split where a corner's normal differs, tangents are rebuilt.
+    pub fn auto_smoothed(&self, angle_deg: f32) -> Mesh {
+        let positions: Vec<Vec3> = self.vertices.iter().map(|v| Vec3::from_array(v.pos)).collect();
+        let weld = weld_positions(&positions);
+        let tris = self.triangle_count();
+        // Area-weighted face normals, and their directions for the angle test.
+        let face: Vec<Vec3> = (0..tris)
+            .map(|t| {
+                let [a, b, c] = [0, 1, 2].map(|k| positions[self.indices[t * 3 + k] as usize]);
+                (b - a).cross(c - a)
+            })
+            .collect();
+        let unit: Vec<Vec3> = face.iter().map(|n| n.normalize_or_zero()).collect();
+        let mut around: Vec<Vec<u32>> = vec![Vec::new(); positions.len()];
+        for t in 0..tris {
+            for k in 0..3 {
+                around[weld[self.indices[t * 3 + k] as usize]].push(t as u32);
+            }
+        }
+        let cos = angle_deg.clamp(0.0, 180.0).to_radians().cos();
+        let mut pos = Vec::with_capacity(positions.len());
+        let mut uvs = Vec::with_capacity(positions.len());
+        let mut normals = Vec::with_capacity(positions.len());
+        let mut indices = Vec::with_capacity(self.indices.len());
+        let mut seen: HashMap<(u32, [i32; 3]), u32> = HashMap::with_capacity(positions.len());
+        for t in 0..tris {
+            for k in 0..3 {
+                let v = self.indices[t * 3 + k];
+                let mut n = Vec3::ZERO;
+                for &f in &around[weld[v as usize]] {
+                    if unit[f as usize].dot(unit[t]) >= cos {
+                        n += face[f as usize];
+                    }
+                }
+                let n = n.try_normalize().unwrap_or(unit[t]);
+                let key = (v, (n * 1.0e4).round().as_ivec3().to_array());
+                let i = *seen.entry(key).or_insert_with(|| {
+                    pos.push(positions[v as usize]);
+                    uvs.push(Vec2::from_array(self.vertices[v as usize].uv));
+                    normals.push(n);
+                    (pos.len() - 1) as u32
+                });
+                indices.push(i);
+            }
+        }
+        let (vertices, indices) = with_tangents(&pos, &normals, &uvs, indices);
+        let mut mesh = Mesh {
+            name: self.name.clone(),
+            vertices,
+            indices,
+            uv_edges: Vec::new(),
+            seam_edges: Vec::new(),
+            bounds_min: self.bounds_min,
+            bounds_max: self.bounds_max,
+            center: self.center,
+            scale: self.scale,
+            tri_object: self.tri_object.clone(),
+            objects: self.objects.clone(),
+            tri_color: self.tri_color.clone(),
+            sets: Vec::new(),
+        };
+        mesh.set_ranges(self.sets.iter().map(|s| (s.name.clone(), s.tris.clone())).collect());
+        mesh
+    }
+}
+
+/// Vertices with MikkTSpace tangents (the standard; a simpler fallback if it
+/// fails), and the index buffer to go with them. Triangle order is kept.
+fn with_tangents(positions: &[Vec3], normals: &[Vec3], uvs: &[Vec2], indices: Vec<u32>) -> (Vec<Vertex>, Vec<u32>) {
+    let (indices, source, tangents) = match mikk_tangents(positions, normals, uvs, &indices) {
+        Some(t) => t,
+        None => {
+            let t = compute_tangents(positions, normals, uvs, &indices);
+            (indices, (0..positions.len()).collect(), t)
+        }
+    };
+    let vertices = source
+        .iter()
+        .zip(tangents)
+        .map(|(&i, tangent)| Vertex {
+            pos: positions[i].to_array(),
+            normal: normals[i].normalize_or_zero().to_array(),
+            uv: uvs[i].to_array(),
+            tangent,
+        })
+        .collect();
+    (vertices, indices)
 }
 
 pub fn smooth_normals(positions: &[Vec3], indices: &[u32]) -> Vec<Vec3> {
@@ -764,6 +839,35 @@ fn fix_winding(p: &[Vec3], n: &[Vec3], idx: &mut [u32]) {
         if face.dot(n[a] + n[b] + n[c]) < 0.0 {
             tri.swap(1, 2);
         }
+    }
+}
+
+#[cfg(test)]
+mod auto_smooth_tests {
+    use super::*;
+
+    /// A cube's corners: at 30 degrees every face is flat (90 degree edges
+    /// split), at 100 degrees the normals average across them.
+    #[test]
+    fn auto_smooth_splits_at_the_angle() {
+        let cube = Primitive::RoundedCube.build();
+        let hard = cube.auto_smoothed(30.0);
+        let soft = cube.auto_smoothed(179.0);
+        assert_eq!(hard.triangle_count(), cube.triangle_count());
+        assert!(hard.vertices.len() >= soft.vertices.len());
+        // Every corner normal of a hard version lies within the angle of its face.
+        for t in 0..hard.triangle_count() {
+            let p = [0, 1, 2].map(|k| Vec3::from_array(hard.vertices[hard.indices[t * 3 + k] as usize].pos));
+            let f = (p[1] - p[0]).cross(p[2] - p[0]).normalize_or_zero();
+            if f == Vec3::ZERO {
+                continue;
+            }
+            for k in 0..3 {
+                let n = Vec3::from_array(hard.vertices[hard.indices[t * 3 + k] as usize].normal);
+                assert!(n.dot(f) > 0.5, "corner normal far from its face at 30 degrees");
+            }
+        }
+        assert_eq!(hard.sets.len(), cube.sets.len());
     }
 }
 

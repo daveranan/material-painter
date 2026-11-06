@@ -873,6 +873,12 @@ impl PainterApp {
                 self.run_unchecked(super::Action::Exit, ctx);
                 text("Closing.".to_string())
             }
+            "set_auto_smooth" => {
+                let off = args.get("off").and_then(Value::as_bool).unwrap_or(false);
+                let angle = if off { None } else { Some(f32_arg(args, "angle").ok_or("pass an 'angle' in degrees, or off=true")?) };
+                self.set_auto_smooth(angle, ctx);
+                if self.bake_job.is_some() { Reply::AfterBake } else { text(self.status.clone()) }
+            }
             "open_project" => {
                 let path = str_arg(args, "path").ok_or("missing 'path'")?;
                 self.open_project(std::path::Path::new(path), ctx)?;
@@ -1196,6 +1202,7 @@ impl PainterApp {
             "layers_bottom_to_top": layers,
             "bake": self.bake_summary(),
             "baking": self.bake_job.is_some(),
+            "auto_smooth": self.auto_smooth,
             "baked_maps": MAPS.iter().map(|m| m.name).collect::<Vec<_>>(),
             "view": {
                 "mode": self.view.mode.name(),

@@ -772,6 +772,7 @@ impl PainterApp {
         let bytes = self.write_project(path)?;
         self.project_path = Some(path.to_path_buf());
         self.saved_serial = self.undo.state_serial();
+        self.saved_auto_smooth = self.auto_smooth;
         self.status = format!("Saved {} ({:.1} MB).", path.display(), bytes as f64 / 1048576.0);
         self.remember_recent(path);
         remove_autosave();
@@ -799,8 +800,10 @@ impl PainterApp {
         self.engine.commit_props(&mut self.undo);
         let text = is_text_project(path);
         let mut w = Writer { blobs: Vec::new(), files: text.then(Vec::new) };
-        let mesh = &self.mesh;
+        // The imported mesh; auto smooth is a setting applied to it on open.
+        let mesh = &self.mesh_source;
         let mesh_json = json!({
+            "auto_smooth": self.auto_smooth,
             "name": mesh.name,
             "center": mesh.center.to_array(),
             "scale": mesh.scale,
@@ -1149,6 +1152,11 @@ impl PainterApp {
 
         // Switch mesh first, then each set's size: layers are created at it.
         self.bake_settings = bs;
+        self.auto_smooth = m["auto_smooth"].as_f64().map(|a| (a as f32).clamp(1.0, 180.0));
+        self.saved_auto_smooth = self.auto_smooth;
+        if let Some(a) = self.auto_smooth {
+            self.auto_smooth_angle = a;
+        }
         self.load_mesh(mesh, ctx);
         self.graphs.clear(&self.rs);
         for gv in manifest["graphs"].as_array().into_iter().flatten() {
@@ -1267,7 +1275,7 @@ impl PainterApp {
 
     /// Unsaved edits since the last save or open.
     pub(super) fn is_modified(&self) -> bool {
-        self.undo.state_serial() != self.saved_serial || self.engine.has_uncommitted_props()
+        self.undo.state_serial() != self.saved_serial || self.engine.has_uncommitted_props() || self.auto_smooth != self.saved_auto_smooth
     }
 
     pub(super) fn save_dialog(&self) -> Option<PathBuf> {
