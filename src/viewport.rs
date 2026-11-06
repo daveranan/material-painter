@@ -457,6 +457,8 @@ pub struct ViewRenderer {
     /// view (each set has its own resolution, bake and custom maps).
     globals: Vec<wgpu::Buffer>,
     sampler: wgpu::Sampler,
+    /// Repeating and mipmapped: live-detail images (see `Engine::live_detail`).
+    live_sampler: wgpu::Sampler,
     pub view3d: ViewTarget,
     pub view2d: ViewTarget,
 }
@@ -515,6 +517,19 @@ impl ViewRenderer {
                     count: None,
                 },
                 gpu::uniform_entry(18, false),
+                // Live detail: sampler, weights, slots, then each slot's color, roughness and normal image.
+                gpu::sampler_entry(23),
+                gpu::tex_entry(24, true),
+                gpu::uniform_entry(25, false),
+                gpu::tex_entry(26, true),
+                gpu::tex_entry(27, true),
+                gpu::tex_entry(28, true),
+                gpu::tex_entry(29, true),
+                gpu::tex_entry(30, true),
+                gpu::tex_entry(31, true),
+                gpu::tex_entry(32, true),
+                gpu::tex_entry(33, true),
+                gpu::tex_entry(34, true),
             ],
         });
         let layout = gpu::layout(device, &bgl);
@@ -680,6 +695,16 @@ impl ViewRenderer {
                 anisotropy_clamp: 8,
                 ..Default::default()
             }),
+            live_sampler: device.create_sampler(&wgpu::SamplerDescriptor {
+                label: Some("live detail"),
+                address_mode_u: wgpu::AddressMode::Repeat,
+                address_mode_v: wgpu::AddressMode::Repeat,
+                address_mode_w: wgpu::AddressMode::Repeat,
+                mag_filter: wgpu::FilterMode::Linear,
+                min_filter: wgpu::FilterMode::Linear,
+                mipmap_filter: wgpu::MipmapFilterMode::Linear,
+                ..Default::default()
+            }),
             view3d: ViewTarget::new(rs, true),
             view2d: ViewTarget::new(rs, false),
         }
@@ -759,6 +784,7 @@ impl ViewRenderer {
         fn v(view: &wgpu::TextureView) -> wgpu::BindingResource<'_> {
             wgpu::BindingResource::TextureView(view)
         }
+        let (live_w, live_img, live_u) = engine.live_detail();
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("view"),
             layout: &self.bgl,
@@ -786,6 +812,18 @@ impl ViewRenderer {
                 wgpu::BindGroupEntry { binding: 16, resource: v(&self.shadow_map.view) },
                 wgpu::BindGroupEntry { binding: 17, resource: wgpu::BindingResource::Sampler(&self.shadow_sampler) },
                 wgpu::BindGroupEntry { binding: 18, resource: self.custom_params.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 23, resource: wgpu::BindingResource::Sampler(&self.live_sampler) },
+                wgpu::BindGroupEntry { binding: 24, resource: v(live_w) },
+                wgpu::BindGroupEntry { binding: 25, resource: live_u.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 26, resource: v(live_img[0][0]) },
+                wgpu::BindGroupEntry { binding: 27, resource: v(live_img[0][1]) },
+                wgpu::BindGroupEntry { binding: 28, resource: v(live_img[0][2]) },
+                wgpu::BindGroupEntry { binding: 29, resource: v(live_img[1][0]) },
+                wgpu::BindGroupEntry { binding: 30, resource: v(live_img[1][1]) },
+                wgpu::BindGroupEntry { binding: 31, resource: v(live_img[1][2]) },
+                wgpu::BindGroupEntry { binding: 32, resource: v(live_img[2][0]) },
+                wgpu::BindGroupEntry { binding: 33, resource: v(live_img[2][1]) },
+                wgpu::BindGroupEntry { binding: 34, resource: v(live_img[2][2]) },
             ],
         })
     }

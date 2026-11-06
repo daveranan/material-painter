@@ -45,6 +45,28 @@ struct Globals {
 // Parameters of a custom preview shader (a shading graph), 4 floats each.
 @group(0) @binding(18) var<uniform> cp: array<vec4<f32>, 128>;
 
+// Live detail (engine::LIVE_SLOTS): tri-planar fill layers re-sampled here at
+// full resolution, on top of the texture set that holds them only down to one
+// of its texels. Per slot: (tiling, rotation, offset), (sharpness, normal
+// strength, normal is DirectX, on), (has color, roughness, normal).
+struct LiveSlot {
+    img: vec4<f32>,
+    tri: vec4<f32>,
+    has: vec4<f32>,
+};
+@group(0) @binding(23) var live_samp: sampler;
+@group(0) @binding(24) var live_w: texture_2d<f32>;  // per slot: how much of the layer shows
+@group(0) @binding(25) var<uniform> live: array<LiveSlot, 3>;
+@group(0) @binding(26) var live0_c: texture_2d<f32>;
+@group(0) @binding(27) var live0_r: texture_2d<f32>;
+@group(0) @binding(28) var live0_n: texture_2d<f32>;
+@group(0) @binding(29) var live1_c: texture_2d<f32>;
+@group(0) @binding(30) var live1_r: texture_2d<f32>;
+@group(0) @binding(31) var live1_n: texture_2d<f32>;
+@group(0) @binding(32) var live2_c: texture_2d<f32>;
+@group(0) @binding(33) var live2_r: texture_2d<f32>;
+@group(0) @binding(34) var live2_n: texture_2d<f32>;
+
 const PI: f32 = 3.14159265;
 
 fn rot_y(d: vec3<f32>, a: f32) -> vec3<f32> {
@@ -161,6 +183,90 @@ fn sample_surface(uv: vec2<f32>) -> Surface {
     // Whiteout blend of baked normal, painted normal detail and height detail.
     s.ts = normalize(vec3<f32>(base.xy + painted.xy + vec2<f32>(-hu, ht), base.z * painted.z));
     return s;
+}
+
+fn live_rot(q: vec2<f32>, deg: f32) -> vec2<f32> {
+    let a = radians(deg);
+    let c = cos(a);
+    let s = sin(a);
+    return vec2<f32>(q.x * c - q.y * s, q.x * s + q.y * c);
+}
+
+fn live_blend_w(n: vec3<f32>, sharp: f32) -> vec3<f32> {
+    let w = pow(abs(n), vec3<f32>(max(sharp, 1.0)));
+    return w / max(w.x + w.y + w.z, 1e-4);
+}
+
+// Tri-planar image sample, matching composite.wgsl's fill_image.
+fn live_tri(t: texture_2d<f32>, p: vec3<f32>, n: vec3<f32>, s: LiveSlot, lod: f32) -> vec4<f32> {
+    let w = live_blend_w(n, s.tri.x);
+    let q = p * max(s.img.x, 1e-3);
+    return textureSampleLevel(t, live_samp, live_rot(vec2<f32>(q.z, -q.y), s.img.y) + s.img.zw, lod) * w.x
+        + textureSampleLevel(t, live_samp, live_rot(q.xz, s.img.y) + s.img.zw, lod) * w.y
+        + textureSampleLevel(t, live_samp, live_rot(vec2<f32>(q.x, -q.y), s.img.y) + s.img.zw, lod) * w.z;
+}
+
+fn live_plane_n(t: texture_2d<f32>, q: vec2<f32>, lod: f32, s: LiveSlot, r: vec3<f32>, up: vec3<f32>, f: vec3<f32>) -> vec3<f32> {
+    var m = textureSampleLevel(t, live_samp, live_rot(q, s.img.y) + s.img.zw, lod).xyz * 2.0 - 1.0;
+    if (s.tri.z > 0.5) {
+        m.y = -m.y;
+    }
+    let xy = live_rot(m.xy * s.tri.y, s.img.y);
+    return r * xy.x + up * xy.y + f * max(m.z, 1e-3);
+}
+
+// World-space tri-planar normal, matching composite.wgsl's fill_normal.
+fn live_tri_n(t: texture_2d<f32>, p: vec3<f32>, n: vec3<f32>, s: LiveSlot, lod: f32) -> vec3<f32> {
+    let w = live_blend_w(n, s.tri.x);
+    let q = p * max(s.img.x, 1e-3);
+    let sg = sign(n + vec3<f32>(1e-6));
+    return live_plane_n(t, vec2<f32>(q.z, -q.y), lod, s, vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(sg.x, 0.0, 0.0)) * w.x
+        + live_plane_n(t, q.xz, lod, s, vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 0.0, -1.0), vec3<f32>(0.0, sg.y, 0.0)) * w.y
+        + live_plane_n(t, vec2<f32>(q.x, -q.y), lod, s, vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(0.0, 0.0, sg.z)) * w.z;
+}
+
+// Mip levels of an image for this pixel (x) and for one texel of the texture
+// set (y, what the composite sampled): the detail between them is missing.
+fn live_lods(t: texture_2d<f32>, s: LiveSlot, texel_world: f32, pixel_world: f32) -> vec2<f32> {
+    let k = max(s.img.x, 1e-3) * f32(textureDimensions(t).x);
+    let lo = log2(max(texel_world * k, 1.0));
+    return vec2<f32>(clamp(log2(max(pixel_world * k, 1e-4)), 0.0, lo), lo);
+}
+
+// What one live slot adds: color factor - 1 (linear), roughness and world normal offsets.
+struct LiveAdd {
+    col: vec3<f32>,
+    rough: f32,
+    nrm: vec3<f32>,
+};
+
+fn live_add(tc: texture_2d<f32>, tr: texture_2d<f32>, tn: texture_2d<f32>, s: LiveSlot, w: f32, p: vec3<f32>, n: vec3<f32>, tw: f32, pw: f32) -> LiveAdd {
+    var a: LiveAdd;
+    a.col = vec3<f32>(0.0);
+    a.rough = 0.0;
+    a.nrm = vec3<f32>(0.0);
+    if (s.tri.w < 0.5 || w < 0.002) {
+        return a;
+    }
+    let lc = live_lods(tc, s, tw, pw);
+    if (lc.y - lc.x > 0.05) {
+        let hi = pow(live_tri(tc, p, n, s, lc.x).rgb, vec3<f32>(2.2));
+        let lo = pow(live_tri(tc, p, n, s, lc.y).rgb, vec3<f32>(2.2));
+        a.col = w * (clamp(hi / max(lo, vec3<f32>(0.01)), vec3<f32>(0.0), vec3<f32>(4.0)) - 1.0);
+    }
+    if (s.has.y > 0.5) {
+        let lr = live_lods(tr, s, tw, pw);
+        if (lr.y - lr.x > 0.05) {
+            a.rough = w * (live_tri(tr, p, n, s, lr.x).r - live_tri(tr, p, n, s, lr.y).r);
+        }
+    }
+    if (s.has.z > 0.5) {
+        let ln = live_lods(tn, s, tw, pw);
+        if (ln.y - ln.x > 0.05) {
+            a.nrm = w * (live_tri_n(tn, p, n, s, ln.x) - live_tri_n(tn, p, n, s, ln.y));
+        }
+    }
+    return a;
 }
 
 fn hue(h: f32) -> vec3<f32> {
@@ -352,6 +458,21 @@ struct Shade {
 fn mesh_shade_inputs(in: MeshOut, front: bool) -> Shade {
     var c: Shade;
     c.s = sample_surface(in.uv);
+    // Live detail. World size of one texture-set texel and of this pixel
+    // (with the painted channels' sharpening bias), from screen derivatives.
+    let dpx = dpdx(in.wpos);
+    let dpy = dpdy(in.wpos);
+    let duv = (length(dpdx(in.uv)) + length(dpdy(in.uv))) * g.params.w;
+    let tw = (length(dpx) + length(dpy)) / max(duv, 1e-6);
+    let pw = max(length(dpx), length(dpy)) * VIEW_LOD_SCALE;
+    let lw = textureSampleLevel(live_w, samp, in.uv, 0.0).rgb;
+    let mn = normalize(in.n);
+    let l0 = live_add(live0_c, live0_r, live0_n, live[0], lw.x, in.wpos, mn, tw, pw);
+    let l1 = live_add(live1_c, live1_r, live1_n, live[1], lw.y, in.wpos, mn, tw, pw);
+    let l2 = live_add(live2_c, live2_r, live2_n, live[2], lw.z, in.wpos, mn, tw, pw);
+    c.s.albedo = clamp(c.s.albedo * (1.0 + l0.col + l1.col + l2.col), vec3<f32>(0.0), vec3<f32>(1.0));
+    c.s.rough = clamp(c.s.rough + l0.rough + l1.rough + l2.rough, 0.0, 1.0);
+    let live_dn = l0.nrm + l1.nrm + l2.nrm;
     var rn = in.n;
     if (!front) {
         rn = -rn;
@@ -363,6 +484,7 @@ fn mesh_shade_inputs(in: MeshOut, front: bool) -> Shade {
     // this, and so do Unity, Unreal, Godot and Blender.
     let b_up = -cross(rn, in.t.xyz) * in.t.w;
     c.n = normalize(in.t.xyz * c.s.ts.x + b_up * c.s.ts.y + rn * c.s.ts.z);
+    c.n = normalize(c.n + select(live_dn, -live_dn, !front));
     c.v = normalize(g.cam_pos.xyz - in.wpos);
     c.l = normalize(g.sun.xyz);
     c.light = g.sun_c.rgb * g.sun.w * g.sun_c.w;

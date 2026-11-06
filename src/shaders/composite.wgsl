@@ -496,6 +496,37 @@ fn fs_cover(in: FsOut) -> @location(0) vec4<f32> {
     return vec4<f32>(m, 0.0, 0.0, 1.0);
 }
 
+// Live detail (engine::encode_live_weights): carries, per texel, how much of
+// each live layer's color reaches the final result (one slot per channel).
+// The stack-below color slot holds the weights so far; `u.gx.w` is this
+// layer's slot + 1 (0: not live).
+@fragment
+fn fs_live_weight(in: FsOut) -> @location(0) vec4<f32> {
+    let c = vec2<i32>(in.pos.xy);
+    let uv = in.pos.xy / vec2<f32>(textureDimensions(pos_map));
+    var w = textureLoad(prev_color, c, 0);
+    let p = textureLoad(pos_map, full(c), 0).xyz;
+    let n = normalize(textureLoad(nrm_map, full(c), 0).xyz * 2.0 - 1.0);
+    var a = u.p0.x * layer_mask(c, p, n, uv);
+    if (u.p0.z > 0.5 && u.p0.z < 1.5 && i32(u.var1.z + 0.5) == 7) {
+        a *= decal_both(p, n, texel_size(c, p)).a;
+    }
+    // Color coverage: a fill's color channel switch, a paint layer's alpha.
+    var ac = select(0.0, 1.0, u.ch.x > 0.5);
+    if (u.p0.z < 0.5 && u.ch.x > 0.5) {
+        ac = textureLoad(l_color, full(c), 0).a;
+    }
+    a = clamp(a * ac, 0.0, 1.0);
+    if (i32(u.p0.y) == 0) {
+        w *= 1.0 - a;
+    }
+    let slot = i32(u.gx.w + 0.5) - 1;
+    w.x = select(w.x, a, slot == 0);
+    w.y = select(w.y, a, slot == 1);
+    w.z = select(w.z, a, slot == 2);
+    return vec4<f32>(w.xyz, 1.0);
+}
+
 // The four paint channels alone: documents without normal or emission layers
 // composite through these, skipping those channels' reads and writes.
 struct AccumOut4 {
