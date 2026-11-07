@@ -356,9 +356,10 @@ impl PainterApp {
                 if let Some(b) = blend {
                     layer.blend = b;
                 }
-                const FILL_KEYS: [&str; 27] = [
+                const FILL_KEYS: [&str; 28] = [
                     "height_blend",
                     "height_detail",
+                    "displacement",
                     "runoff",
                     "decal",
                     "decal_at",
@@ -438,6 +439,9 @@ impl PainterApp {
                         }
                         if let Some(v) = args.get("height_detail").and_then(Value::as_bool) {
                             f.height_detail = v;
+                        }
+                        if let Some(v) = args.get("displacement").and_then(Value::as_bool) {
+                            f.displacement = v;
                         }
                         if let Some(v) = f32_arg(args, "rotation") {
                             f.rotation = v;
@@ -968,6 +972,12 @@ impl PainterApp {
                 }
                 if let Some(on) = args.get("key_light").and_then(Value::as_bool) {
                     v.key.on = on;
+                }
+                if let Some(on) = args.get("show_displacement").and_then(Value::as_bool) {
+                    if self.engine.displacement_pass != on {
+                        self.engine.displacement_pass = on;
+                        self.engine.mark_dirty();
+                    }
                 }
                 let p = &mut v.post;
                 for (key, field, lo, hi) in [

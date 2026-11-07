@@ -58,8 +58,9 @@ bland (chroma under ~0.06) and say so.
 
 The "Game material (features)" export (see `material-painter-agent`'s
 project-json reference): `<material>_ColorHeight.png`,
-`<material>_NormalMasks.png`, `<material>_AO.png`, `<material>.material.json`
-(feature names, tile_m, relief_m, rest_height, channel layout), into the
+`<material>_NormalMasks.png`, `<material>_AO.png`, `<material>_Displacement.png`,
+`<material>.material.json` (version 2: feature names, tile_m, relief_m,
+displacement_m, rest_height, channel layout), into the
 game's ground-materials folder. The game should lift displacement from
 `rest_height` (not the tile mean) and shade with the AO map.
 Plus the MP project (`<material>.json` + `.data/`) so any later pass edits

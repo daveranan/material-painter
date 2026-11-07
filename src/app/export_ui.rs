@@ -241,14 +241,15 @@ impl PainterApp {
             self.engine.composite();
         }
         self.composite_parked();
-        let engines = self.set_engines();
-        self.mesh
-            .sets
-            .iter()
-            .zip(engines)
-            .map(|(set, engine)| {
-                let snapshot = export::snapshot(engine, &self.rs.device, &self.rs.queue, self.mesh.clone());
-                (snapshot, export::Settings { set_name: set.name.replace(' ', ""), ..settings.clone() })
+        let names: Vec<String> = self.mesh.sets.iter().map(|s| s.name.replace(' ', "")).collect();
+        let (rs, mesh) = (self.rs.clone(), self.mesh.clone());
+        names
+            .into_iter()
+            .enumerate()
+            .filter_map(|(k, set_name)| {
+                let engine = self.set_engine_mut(k)?;
+                let snapshot = export::snapshot_for_export(engine, &rs.device, &rs.queue, mesh.clone());
+                Some((snapshot, export::Settings { set_name, ..settings.clone() }))
             })
             .collect()
     }

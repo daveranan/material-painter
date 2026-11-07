@@ -46,6 +46,11 @@ pub enum Source {
     /// Where the texture set's features show (see `engine::Features`):
     /// feature 1, feature 2 and the main feature, summing to 1.
     Features,
+    /// The soft displacement map a game moves its vertex grid with: the
+    /// displacement layers (or, without any, the height), low-passed so
+    /// nothing is narrower than ~10 cm, 0.5 at the mean, 0..1 spanning the
+    /// features' `displacement_m`.
+    Displacement,
     /// Ambient occlusion from the final height: contact shading where raised
     /// pieces meet the ground, at the material's physical scale (the
     /// features' tile and relief); white is open.
@@ -69,7 +74,7 @@ impl Source {
             Source::Emissive,
         ];
         v.extend((0..MAPS.len()).map(Source::Mesh));
-        v.extend([Source::WorldNormal, Source::Position, Source::Features, Source::Occlusion, Source::Zero, Source::One]);
+        v.extend([Source::WorldNormal, Source::Position, Source::Features, Source::Occlusion, Source::Displacement, Source::Zero, Source::One]);
         v
     }
 
@@ -90,6 +95,7 @@ impl Source {
             Source::Position => "Position".into(),
             Source::Features => "Feature masks (1, 2, main)".into(),
             Source::Occlusion => "Ambient occlusion (from height)".into(),
+            Source::Displacement => "Displacement (soft, game grid)".into(),
             Source::Zero => "Black (0)".into(),
             Source::One => "White (1)".into(),
         }
@@ -308,6 +314,7 @@ pub fn builtin_templates() -> Vec<Template> {
                 OutputMap::packed("$project_ColorHeight", Layout::Rgba, [Chan::of(BaseColor, 0), Chan::of(BaseColor, 1), Chan::of(BaseColor, 2), Chan::of(Height, 0)]),
                 OutputMap::packed("$project_NormalMasks", Layout::Rgba, [Chan::of(NormalDx, 0), Chan::of(NormalDx, 1), Chan::of(Features, 0), Chan::of(Features, 1)]),
                 OutputMap::gray("$project_AO", Chan::of(Occlusion, 0)),
+                OutputMap { force_16: true, ..OutputMap::gray("$project_Displacement", Chan::of(Displacement, 0)) },
             ],
         ),
         t(
@@ -614,6 +621,9 @@ pub struct Snapshot {
     rough: Plane,
     metal: Plane,
     pub(crate) height: Plane,
+    /// The displacement pass's height (see `displacement_pass`), when the
+    /// stack has displacement layers.
+    pub(crate) displacement: Option<Plane>,
     /// Painted normal detail (tangent xy at 0.5 + 0.5 n) and emission (linear).
     normal: Plane,
     emission: Plane,
@@ -644,6 +654,7 @@ pub fn snapshot(engine: &Engine, device: &wgpu::Device, queue: &wgpu::Queue, mes
         rough: read_plane(device, queue, engine.final_tex(1)),
         metal: read_plane(device, queue, engine.final_tex(2)),
         height: read_plane(device, queue, engine.final_tex(3)),
+        displacement: None,
         // Without normal or emission layers these are 1x1 defaults.
         normal: {
             let t = engine.final_tex(crate::engine::NORMAL_CH);
@@ -662,6 +673,97 @@ pub fn snapshot(engine: &Engine, device: &wgpu::Device, queue: &wgpu::Queue, mes
         uvs: mesh,
         tris: engine.triangles(),
     }
+}
+
+/// A snapshot for export: the material's maps plus, when the stack has
+/// displacement layers, their own pass (`Engine::displacement_pass`),
+/// whatever the viewport shows now. The engine is left as it was (dirty if
+/// it was showing the displacement pass).
+pub fn snapshot_for_export(engine: &mut Engine, device: &wgpu::Device, queue: &wgpu::Queue, mesh: Arc<Mesh>) -> Snapshot {
+    let was = engine.displacement_pass;
+    let mut displacement = None;
+    if engine.has_displacement() {
+        engine.displacement_pass = true;
+        engine.mark_dirty();
+        engine.composite();
+        displacement = Some(read_plane(device, queue, engine.final_tex(3)));
+    }
+    if engine.displacement_pass || engine.dirty {
+        engine.displacement_pass = false;
+        engine.mark_dirty();
+        engine.composite();
+    }
+    let mut s = snapshot(engine, device, queue, mesh);
+    s.displacement = displacement;
+    if was {
+        engine.displacement_pass = true;
+        engine.mark_dirty();
+    }
+    s
+}
+
+/// Separable box blur, wrapping (the tile repeats), radius in texels.
+fn box_blur_wrap(v: &[f32], res: usize, radius: usize) -> Vec<f32> {
+    if radius == 0 {
+        return v.to_vec();
+    }
+    let w = (2 * radius + 1) as f32;
+    let r = radius as i64;
+    // Blurs each row, then returns the result transposed, so two calls blur
+    // both directions and end the right way round.
+    let rows_t = |src: &[f32]| -> Vec<f32> {
+        let rows: Vec<Vec<f32>> = (0..res)
+            .into_par_iter()
+            .map(|y| {
+                let at = |k: i64| src[y * res + k.rem_euclid(res as i64) as usize];
+                let mut sum: f32 = (-r..=r).map(at).sum();
+                let mut out = vec![0.0; res];
+                for (x, o) in out.iter_mut().enumerate() {
+                    *o = sum / w;
+                    sum += at(x as i64 + r + 1) - at(x as i64 - r);
+                }
+                out
+            })
+            .collect();
+        let mut t = vec![0.0; res * res];
+        for (y, row) in rows.iter().enumerate() {
+            for (x, &v) in row.iter().enumerate() {
+                t[x * res + y] = v;
+            }
+        }
+        t
+    };
+    rows_t(&rows_t(v))
+}
+
+/// The displacement in metres, mean 0, per texel: the displacement pass
+/// (0..1 spanning `displacement_m`) or, without displacement layers, the
+/// height (0..1 spanning `relief_m`), low-passed (three box blurs, about a
+/// 3 cm Gaussian) so nothing narrower than ~10 cm (two cells of a 5 cm
+/// grid) is left to zigzag.
+fn displacement_metres(s: &Snapshot) -> Vec<f32> {
+    soft_metres(s, s.displacement.is_some())
+}
+
+/// The height alone in metres, low-passed and mean 0 like the displacement.
+fn soft_height_metres(s: &Snapshot) -> Vec<f32> {
+    soft_metres(s, false)
+}
+
+fn soft_metres(s: &Snapshot, from_pass: bool) -> Vec<f32> {
+    let res = s.res as usize;
+    let (tile, relief, disp) = s.features.as_ref().map_or((2.0, 0.1, 0.2), |(_, f)| (f.tile_m, f.relief_m, f.displacement_m));
+    let mut m: Vec<f32> = match s.displacement.as_ref().filter(|_| from_pass) {
+        Some(p) => p.data.iter().map(|v| (v[0] * 0.5 + 0.5) * disp).collect(),
+        None => s.height.data.iter().map(|v| (v[0] * 0.5 + 0.5) * relief).collect(),
+    };
+    let texel = tile.max(1e-3) / res as f32;
+    let radius = ((0.03 / texel) / 3f32.sqrt()).round() as usize;
+    for _ in 0..3 {
+        m = box_blur_wrap(&m, res, radius);
+    }
+    let mean = (m.iter().map(|&v| v as f64).sum::<f64>() / m.len().max(1) as f64) as f32;
+    m.iter().map(|&v| v - mean).collect()
 }
 
 // ------------------------------------------------------------------ evaluation
@@ -770,6 +872,10 @@ impl Sources<'_> {
                     .collect(),
                 None => vec![[0.0, 0.0, 1.0]; n],
             },
+            Source::Displacement => {
+                let disp_m = s.features.as_ref().map_or(0.2, |(_, f)| f.displacement_m);
+                displacement_metres(s).into_iter().map(|d| [(0.5 + d / disp_m).clamp(0.0, 1.0); 3]).collect()
+            }
             Source::Occlusion => {
                 let (tile, relief) = s.features.as_ref().map_or((2.0, 0.1), |(_, f)| (f.tile_m, f.relief_m));
                 height_occlusion(s, tile, relief).into_iter().map(|a| [a; 3]).collect()
@@ -822,12 +928,24 @@ fn normal_map(m: &Snapshot, strength: f32, use_baked: bool, directx: bool, paint
     let r = m.res as i64;
     let h = |x: i64, y: i64| m.height.data[(y.clamp(0, r - 1) * r + x.clamp(0, r - 1)) as usize][0];
     let k = strength * m.res as f32 / 256.0;
+    // The displacement layers' forms beyond the height (mounds, ruts), as
+    // real slopes (metres over metres), so the light follows the shape the
+    // game displaces; nothing without displacement layers.
+    let extra: Option<Vec<f32>> = (painted && m.displacement.is_some()).then(|| {
+        let tile = m.features.as_ref().map_or(2.0, |(_, f)| f.tile_m);
+        let texel = tile.max(1e-3) / m.res as f32;
+        let d = displacement_metres(m);
+        let h = soft_height_metres(m);
+        d.iter().zip(&h).map(|(a, b)| (a - b) / (2.0 * texel)).collect()
+    });
+    let e = |x: i64, y: i64| extra.as_ref().map_or(0.0, |v| v[(y.rem_euclid(r) * r + x.rem_euclid(r)) as usize]);
     (0..(r * r) as usize)
         .into_par_iter()
         .map(|i| {
             let (x, y) = ((i as i64) % r, (i as i64) / r);
             let hu = (h(x + 1, y) - h(x - 1, y)) * 0.5 * k;
-            let ht = (h(x, y + 1) - h(x, y - 1)) * 0.5 * k;
+            let ht = (h(x, y + 1) - h(x, y - 1)) * 0.5 * k + (e(x, y + 1) - e(x, y - 1));
+            let hu = hu + (e(x + 1, y) - e(x - 1, y));
             let d = m.mesh[3].data[i];
             let base = if use_baked { Vec3::new(d[0], d[1], (1.0 - d[0] * d[0] - d[1] * d[1]).max(0.0).sqrt()) } else { Vec3::Z };
             // Whiteout blend with the painted normal detail, as the viewport shows it.
@@ -1087,6 +1205,7 @@ fn write_manifest(template: &Template, settings: &Settings, f: &Features, size: 
             Source::Features => ["mask1", "mask2", "main"][c.comp.min(2) as usize].to_string(),
             Source::Height => "height".into(),
             Source::Occlusion => "ao".into(),
+            Source::Displacement => "displacement".into(),
             s => format!("{}.{}", s.key().to_lowercase(), c.comp),
         };
         json!(if c.invert { format!("1-{what}") } else { what })
@@ -1099,9 +1218,10 @@ fn write_manifest(template: &Template, settings: &Settings, f: &Features, size: 
             json!({"file": settings.file_name(m), "channels": chans, "srgb": m.chans[0].src == Source::BaseColor && settings.format != Format::Exr})
         })
         .collect();
-    let v = json!({
+    let has_disp = template.maps.iter().any(|m| m.chans[..m.layout.channels()].iter().any(|c| c.src == Source::Displacement));
+    let mut v = json!({
         "format": "material-painter/feature-material",
-        "version": 1,
+        "version": if has_disp { 2 } else { 1 },
         "name": manifest_stem(settings),
         "features": {"main": f.names[0], "mask1": f.names[1], "mask2": f.names[2]},
         // Rounded so the file reads as typed (f32 noise otherwise).
@@ -1111,6 +1231,9 @@ fn write_manifest(template: &Template, settings: &Settings, f: &Features, size: 
         "size": size,
         "maps": maps,
     });
+    if has_disp {
+        v["displacement_m"] = json!((f.displacement_m as f64 * 1e4).round() / 1e4);
+    }
     let path = settings.folder.join(format!("{}.material.json", manifest_stem(settings)));
     let text = serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?;
     std::fs::write(&path, text).map_err(|e| format!("Failed to write {}: {e}", path.display()))?;

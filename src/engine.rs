@@ -477,6 +477,11 @@ pub struct FillParams {
     /// channel and its height into nothing, so fine detail (grain, litter,
     /// bark) shades without moving a game's displacement or height blend.
     pub height_detail: bool,
+    /// Displacement layer: composited only in the displacement pass (the
+    /// soft, large-form height a game displaces its vertex grid with), never
+    /// in the material's own maps. In that pass heights span the features'
+    /// `displacement_m`, and only displacement layers draw.
+    pub displacement: bool,
 }
 
 /// The order is the shader's projection index (`composite.wgsl`).
@@ -579,6 +584,7 @@ impl Default for FillParams {
             runoff: None,
             height_blend: 0.0,
             height_detail: false,
+            displacement: false,
         }
     }
 }
@@ -860,11 +866,14 @@ pub struct Features {
     pub tile_m: f32,
     /// Metres between the lowest and highest height.
     pub relief_m: f32,
+    /// Metres between 0 and 1 in the displacement map (lift is
+    /// (value - 0.5) x this).
+    pub displacement_m: f32,
 }
 
 impl Default for Features {
     fn default() -> Self {
-        Features { names: Default::default(), tile_m: 2.0, relief_m: 0.1 }
+        Features { names: Default::default(), tile_m: 2.0, relief_m: 0.1, displacement_m: 0.2 }
     }
 }
 
@@ -1132,6 +1141,10 @@ pub struct Engine {
     live_ubuf: wgpu::Buffer,
     /// What the texture set is made of (see [`Features`]).
     pub features: Features,
+    /// Composite the displacement layers instead of the material (see
+    /// `FillParams::displacement`): the export's displacement map, or a
+    /// viewport view of it.
+    pub displacement_pass: bool,
     /// Per texel, how much of feature 1 and 2 shows (R, G; the main feature
     /// is the rest), in `feature_w[feature_final]`, from the layer uniforms
     /// in `feature_ubuf`. Only made while some layer has a feature tag.
@@ -1300,6 +1313,7 @@ impl Engine {
             live_final: 0,
             live_layers: [None; LIVE_SLOTS],
             features: Features::default(),
+            displacement_pass: false,
             feature_w: None,
             feature_final: 0,
             feature_ubuf: None,
@@ -3439,6 +3453,11 @@ impl Engine {
         u
     }
 
+    /// Any displacement layer (see `FillParams::displacement`) in the stack.
+    pub fn has_displacement(&self) -> bool {
+        self.layers.iter().any(|l| matches!(&l.content, Content::Fill(f) if f.displacement))
+    }
+
     /// Shown: the layer and every folder around it are visible.
     fn shown(&self, idx: usize) -> bool {
         self.layers[idx].visible && self.ancestors(idx).all(|a| self.layers[a].visible) && self.solo_keeps(idx)
@@ -3491,7 +3510,8 @@ impl Engine {
                 Content::Fill(f) => f.mat.enabled.iter().any(|&e| e) || f.normal_on || f.emission_on,
                 Content::Folder(_) => false,
             };
-            if has_content && l.opacity > 0.0 && self.shown(i) {
+            let in_pass = matches!(&l.content, Content::Fill(f) if f.displacement) == self.displacement_pass;
+            if has_content && in_pass && l.opacity > 0.0 && self.shown(i) {
                 passes.push(Pass::Layer(i));
             }
             if self.isolates(i) && self.shown(i) {

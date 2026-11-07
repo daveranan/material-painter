@@ -136,6 +136,20 @@ rise there. Helldivers 2's ground sets solve this, and so do ours now:
   occlusion from the final height at the material's real tile and relief
   (white open). Don't bake strong contact AO into colour as well; keep
   colour contrast moderate.
+- **A separate displacement map (contract v2).** The game displaces its
+  grid with `$project_Displacement.png` when the manifest lists it, not
+  with the blend height. Make it with a **Displacement layer** (a fill with
+  `displacement: true`; colour and roughness off, height on): only these
+  layers draw in the displacement pass, where 0..1 spans the features'
+  `displacement_m` (0.25: HD2's scale). Put in it only big forms: rolling
+  mounds and hollows 0.3-2 m across (noise scale 2 and 6 on a 3 m tile),
+  plus soft swells under roots and stones 10 cm and up. Aim for a 15-25 cm
+  range with nothing clipped (keep the raw sum under 1). The export
+  low-passes it to ~10 cm, recentres it on 0.5, writes 16 bits and adds the
+  forms' slopes to the normal map. Preview with `preview_settings
+  show_displacement=true`. With the displacement apart, the blend height
+  (ColorHeight alpha) can carry full HD2-style detail again: tapered,
+  stacked pieces, moderate contrast, not soft swells.
 - **Rest height.** The manifest's `rest_height` is the main feature's
   median height (0..1, as stored). Engines should lift displacement from it,
   not the tile mean, so soil sits at rest and features rise above it.

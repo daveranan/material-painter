@@ -43,7 +43,7 @@ impl PainterApp {
         if self.engine.dirty {
             self.engine.composite();
         }
-        let snapshot = crate::export::snapshot(&self.engine, &self.rs.device, &self.rs.queue, self.mesh.clone());
+        let snapshot = crate::export::snapshot_for_export(&mut self.engine, &self.rs.device, &self.rs.queue, self.mesh.clone());
         let mut settings = self.export_settings();
         settings.size = Some(terrain::MAT_SIZE);
         settings.padding = crate::export::Padding::None;

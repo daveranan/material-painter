@@ -275,6 +275,69 @@ fn height_detail_leaves_height() {
     assert!((before - after).abs() < 1e-3, "height moved: {before} -> {after}");
 }
 
+/// A displacement layer draws only in the displacement pass: the material's
+/// height ignores it, the exported Displacement map follows it (soft, mean
+/// 0.5), and the viewport is left as it was.
+#[test]
+#[ignore]
+fn displacement_layer_exports_apart() {
+    use crate::engine::{FillParams, MatValues};
+    use crate::export::{self, Format, Padding, Settings};
+    let mesh = Arc::new(crate::mesh::Primitive::Plane.build());
+    let rs = render_state();
+    let gpu_mesh = GpuMesh::new(&rs.device, &mesh);
+    let res = 128;
+    let mut engine = Engine::new(&rs, &gpu_mesh, (mesh.bounds_min, mesh.bounds_max), res);
+    let mut undo = crate::undo::UndoStack::default();
+    while !engine.layers.is_empty() {
+        engine.delete_layer(0, &mut undo);
+    }
+    let fill = |height: f32| FillParams {
+        mat: MatValues { enabled: [true, true, false, true], color: [0.4; 3], rough: 0.7, metal: 0.0, height },
+        ..FillParams::default()
+    };
+    let soil = engine.add_fill_layer(0, None, "Soil".into(), fill(0.2), &mut undo);
+    engine.layers[soil].feature = Some(0);
+    // Displacement mounds: a raised fill in clouds.
+    let mut disp = fill(0.9);
+    disp.displacement = true;
+    let d = engine.add_fill_layer(1, None, "Displacement".into(), disp, &mut undo);
+    let mut g = crate::engine::GenKind::Clouds.default_generator();
+    g.seed = 5.0;
+    engine.add_mask(d, true, Some(g), &mut undo);
+    engine.features = crate::engine::Features { names: ["soil".into(), String::new(), String::new()], tile_m: 2.0, relief_m: 0.1, displacement_m: 0.2 };
+    engine.mark_dirty();
+    engine.composite();
+    let snap = export::snapshot_for_export(&mut engine, &rs.device, &rs.queue, mesh.clone());
+    assert!(!engine.displacement_pass, "the viewport shows the material again");
+    let flat_height = snap.height.data.iter().all(|v| (v[0] - snap.height.data[0][0]).abs() < 1e-3);
+    assert!(flat_height, "the displacement layer moved the material's height");
+
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/bake_test/displacement");
+    let _ = std::fs::remove_dir_all(&root);
+    let template = export::builtin_templates().into_iter().find(|t| t.name == "Game material (features)").expect("built in");
+    let settings = Settings {
+        folder: root.clone(),
+        mesh_name: "Plane".into(),
+        project_name: "Mound".into(),
+        set_name: "Plane".into(),
+        set_count: 1,
+        format: Format::Png,
+        depth: crate::export::Depth::U8,
+        size: None,
+        padding: Padding::Infinite,
+        normal_strength: 1.0,
+        use_baked_normal: false,
+    };
+    export::export(&snap, &template, &settings).expect("exports");
+    let disp = image::open(root.join("Mound_Displacement.png")).unwrap().to_luma16();
+    let v: Vec<f32> = disp.pixels().map(|p| p.0[0] as f32 / 65535.0).collect();
+    let mean = v.iter().sum::<f32>() / v.len() as f32;
+    let (lo, hi) = v.iter().fold((1f32, 0f32), |(a, b), &x| (a.min(x), b.max(x)));
+    assert!((mean - 0.5).abs() < 0.01, "displacement mean at level ground: {mean}");
+    assert!(hi - lo > 0.1, "the mound shows in the displacement: {lo}..{hi}");
+}
+
 /// A ground tile made of three features exports the game layout: masks say
 /// where each tagged layer still shows (layers above cover those below,
 /// untagged layers change nothing), and the manifest names the features.
@@ -308,7 +371,7 @@ fn feature_material_export() {
         engine.layers[i].opacity = opacity;
         engine.layers[i].feature = feature;
     }
-    engine.features = crate::engine::Features { names: ["rock".into(), "moss".into(), "pebbles".into()], tile_m: 2.0, relief_m: 0.05 };
+    engine.features = crate::engine::Features { names: ["rock".into(), "moss".into(), "pebbles".into()], tile_m: 2.0, relief_m: 0.05, ..Default::default() };
     engine.mark_dirty();
     engine.composite();
     let snap = export::snapshot(&engine, &rs.device, &rs.queue, mesh.clone());
@@ -330,7 +393,12 @@ fn feature_material_export() {
         use_baked_normal: false,
     };
     let files = export::export(&snap, &template, &settings).expect("exports");
-    assert_eq!(files.len(), 4, "three maps and the manifest: {files:?}");
+    assert_eq!(files.len(), 5, "four maps and the manifest: {files:?}");
+    // Flat: the displacement sits at level ground (0.5), 16 bits.
+    let disp = image::open(root.join("RockMoss_Displacement.png")).unwrap();
+    assert!(matches!(disp, image::DynamicImage::ImageLuma16(_)), "16-bit grey displacement");
+    let d = disp.to_luma16().get_pixel(res / 2, res / 2).0[0] as f32 / 65535.0;
+    assert!((d - 0.5).abs() < 0.01, "flat displacement at 0.5: {d}");
     // A flat tile is open everywhere: its AO is white.
     let ao = image::open(root.join("RockMoss_AO.png")).unwrap().to_luma8();
     assert!(ao.get_pixel(res / 2, res / 2).0[0] > 250, "flat AO is open");
@@ -347,6 +415,10 @@ fn feature_material_export() {
     // The rest height: the main feature's median height, as stored (0..1).
     let rest = manifest["rest_height"].as_f64().expect("rest_height");
     assert!((0.0..=1.0).contains(&rest), "rest height in 0..1: {rest}");
+    assert_eq!(manifest["version"], 2);
+    assert_eq!(manifest["displacement_m"], 0.2);
+    assert_eq!(manifest["maps"][3]["channels"][0], "displacement");
+    assert_eq!(manifest["maps"][3]["srgb"], false);
 
     // Without tags the template refuses rather than writing empty masks.
     for l in &mut engine.layers {
@@ -415,7 +487,7 @@ fn height_blend_features() {
     engine.add_fill_layer(1, None, "Grass".into(), top, &mut undo);
     engine.layers[0].feature = Some(0);
     engine.layers[1].feature = Some(1);
-    engine.features = crate::engine::Features { names: ["soil".into(), "grass".into(), String::new()], tile_m: 1.0, relief_m: 0.05 };
+    engine.features = crate::engine::Features { names: ["soil".into(), "grass".into(), String::new()], tile_m: 1.0, relief_m: 0.05, ..Default::default() };
     engine.mark_dirty();
     engine.composite();
     let snap = export::snapshot(&engine, &rs.device, &rs.queue, mesh);

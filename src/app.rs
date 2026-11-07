@@ -4229,6 +4229,11 @@ impl PainterApp {
                             .on_hover_text("This layer's height shades the normal map only: fine detail (grain, litter, bark) without moving the height a game displaces or height-blends with")
                             .changed()
                     });
+                    dirty |= labeled(ui, "Displacement", |ui| {
+                        ui.checkbox(&mut f.displacement, "")
+                            .on_hover_text("A displacement layer: its height is the soft, large-form map a game displaces with (exported as the Displacement map, spanning the features' displacement_m); it draws nothing in the material itself")
+                            .changed()
+                    });
                 }
             }
             // Which of the texture set's features this layer is (export masks).

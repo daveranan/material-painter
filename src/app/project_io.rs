@@ -477,6 +477,7 @@ pub(super) fn fill_json(p: &FillParams) -> Value {
         "tiling": p.tiling,
         "height_blend": p.height_blend,
         "height_detail": p.height_detail,
+        "displacement": p.displacement,
         "rotation": p.rotation,
         "offset": p.offset,
         "triplanar_sharpness": p.tri_sharpness,
@@ -548,6 +549,7 @@ pub(super) fn fill_from(v: &Value) -> FillParams {
         tiling: f(v, "tiling", d.tiling),
         height_blend: f(v, "height_blend", d.height_blend).max(0.0),
         height_detail: b(v, "height_detail", d.height_detail),
+        displacement: b(v, "displacement", d.displacement),
         rotation: f(v, "rotation", d.rotation),
         offset: arr(v, "offset", d.offset),
         tri_sharpness: f(v, "triplanar_sharpness", d.tri_sharpness),
@@ -619,7 +621,7 @@ pub(super) fn mask_layers_json(layers: &[crate::engine::MaskLayer]) -> Value {
 
 /// A texture set's features (see `engine::Features`): names by slot, and size.
 fn features_json(f: &crate::engine::Features) -> Value {
-    json!({"main": f.names[0], "mask1": f.names[1], "mask2": f.names[2], "tile_m": f.tile_m, "relief_m": f.relief_m})
+    json!({"main": f.names[0], "mask1": f.names[1], "mask2": f.names[2], "tile_m": f.tile_m, "relief_m": f.relief_m, "displacement_m": f.displacement_m})
 }
 
 fn features_from(v: &Value) -> crate::engine::Features {
@@ -629,6 +631,7 @@ fn features_from(v: &Value) -> crate::engine::Features {
         names: [name("main"), name("mask1"), name("mask2")],
         tile_m: f(v, "tile_m", d.tile_m).max(1e-3),
         relief_m: f(v, "relief_m", d.relief_m).max(0.0),
+        displacement_m: f(v, "displacement_m", d.displacement_m).max(1e-4),
     }
 }
 
