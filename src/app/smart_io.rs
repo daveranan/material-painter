@@ -307,6 +307,7 @@ impl PainterApp {
                 parent: lv["parent"].as_u64(),
                 images,
                 thumb: None,
+                feature: None,
             });
         }
         if layers.is_empty() {

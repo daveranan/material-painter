@@ -255,6 +255,16 @@ S2, as a comparison sheet). Lessons:
   ~100-150 px/m, a Quixel surface ~1000+, so without it close-ups look
   smeared. Exports and the path tracer still get the UV-space result.
 
+## Game ground materials (feature masks, CLI handoff)
+For games that grade ground per feature (soil, moss, pebbles...): build the
+material from simple scans on a Plane (one fill each, `update_layer images=`
+with color, roughness, height, normal), let upper scans rise through by
+height (`height_blend`), name the features and tag the layers in the project
+JSON (see `references/project-json.md`, "Feature materials"), then export
+with the "Game material (features)" template. The game loads the folder from
+`<set>.material.json`. Pre-blended scans (grass and rubble in one) can't be
+split yet: pick simple scans.
+
 ## Gaps, and what to do instead
 - **No emissive**: lights and engines are bright low-roughness color; say so.
 - **No atlas decals or stencil text**: no way to place a baked detail

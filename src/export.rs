@@ -4,7 +4,7 @@
 //! mask map are data the user can copy and edit. File format, bit depth,
 //! size and UV padding apply to the whole export.
 
-use crate::engine::{Engine, MAPS, MapKind};
+use crate::engine::{Engine, Features, MAPS, MapKind};
 use crate::gpu::{self, Tex, f16_to_f32};
 use crate::mesh::Mesh;
 use eframe::wgpu;
@@ -43,6 +43,9 @@ pub enum Source {
     WorldNormal,
     /// Object-space position, normalized to the mesh bounds.
     Position,
+    /// Where the texture set's features show (see `engine::Features`):
+    /// feature 1, feature 2 and the main feature, summing to 1.
+    Features,
     Zero,
     One,
 }
@@ -62,7 +65,7 @@ impl Source {
             Source::Emissive,
         ];
         v.extend((0..MAPS.len()).map(Source::Mesh));
-        v.extend([Source::WorldNormal, Source::Position, Source::Zero, Source::One]);
+        v.extend([Source::WorldNormal, Source::Position, Source::Features, Source::Zero, Source::One]);
         v
     }
 
@@ -81,6 +84,7 @@ impl Source {
             Source::Mesh(i) => format!("Baked {}", MAPS[i].name),
             Source::WorldNormal => "World space normal".into(),
             Source::Position => "Position".into(),
+            Source::Features => "Feature masks (1, 2, main)".into(),
             Source::Zero => "Black (0)".into(),
             Source::One => "White (1)".into(),
         }
@@ -110,7 +114,8 @@ impl Source {
             | Source::NormalDx
             | Source::Emissive
             | Source::WorldNormal
-            | Source::Position => 3,
+            | Source::Position
+            | Source::Features => 3,
             Source::Mesh(i) if MAPS[i].kind != MapKind::Scalar => 3,
             _ => 1,
         }
@@ -287,6 +292,16 @@ pub fn builtin_templates() -> Vec<Template> {
                 OutputMap::packed("$mesh_occlusionRoughnessMetallic", Layout::Rgb, [ao, rough, metal, C1]),
                 OutputMap::rgb("$mesh_normal", NormalGl),
                 OutputMap::rgb("$mesh_emissive", Emissive),
+            ],
+        ),
+        // Feature-graded game materials (one grading per feature, as in
+        // Helldivers 2's terrain): color and height, then the DirectX normal
+        // and two feature masks; `$set.material.json` names the features.
+        t(
+            "Game material (features)",
+            vec![
+                OutputMap::packed("$set_ColorHeight", Layout::Rgba, [Chan::of(BaseColor, 0), Chan::of(BaseColor, 1), Chan::of(BaseColor, 2), Chan::of(Height, 0)]),
+                OutputMap::packed("$set_NormalMasks", Layout::Rgba, [Chan::of(NormalDx, 0), Chan::of(NormalDx, 1), Chan::of(Features, 0), Chan::of(Features, 1)]),
             ],
         ),
         t(
@@ -599,6 +614,8 @@ pub struct Snapshot {
     mesh: [Plane; crate::bake::MAP_TEXTURES],
     world_normal: Plane,
     position: Plane,
+    /// Feature weights and what the features are, when layers are tagged.
+    features: Option<(Plane, Features)>,
     bounds: (Vec3, Vec3),
     has_bake: bool,
     /// UV triangles, for the island coverage that padding needs.
@@ -633,6 +650,7 @@ pub fn snapshot(engine: &Engine, device: &wgpu::Device, queue: &wgpu::Queue, mes
         mesh: mesh_maps,
         world_normal: resample(read_plane(device, queue, nrm), nrm.width, res),
         position: resample(read_plane(device, queue, pos), pos.width, res),
+        features: engine.feature_view().map(|t| (resample(read_plane(device, queue, t), t.width, res), engine.features.clone())),
         bounds: engine.bounds(),
         has_bake: engine.has_bake,
         uvs: mesh,
@@ -737,6 +755,15 @@ impl Sources<'_> {
                     })
                     .collect()
             }
+            Source::Features => match &s.features {
+                Some((p, _)) => (0..n)
+                    .map(|i| {
+                        let (a, b) = (p.data[i][0], p.data[i][1]);
+                        [a, b, (1.0 - a - b).max(0.0)]
+                    })
+                    .collect(),
+                None => vec![[0.0, 0.0, 1.0]; n],
+            },
             Source::Zero => vec![[0.0; 3]; n],
             Source::One => vec![[1.0; 3]; n],
         }
@@ -866,8 +893,12 @@ pub fn export(s: &Snapshot, template: &Template, settings: &Settings) -> Result<
     }
     let cache = sources.cache;
     let out_size = settings.size.unwrap_or(res);
+    let uses_features = template.maps.iter().any(|m| m.chans[..m.layout.channels()].iter().any(|c| c.src == Source::Features));
+    if uses_features && s.features.is_none() {
+        return Err("This template exports feature masks: name the texture set's features and tag layers with them first.".into());
+    }
 
-    template
+    let mut files: Vec<PathBuf> = template
         .maps
         .par_iter()
         .map(|map| {
@@ -901,8 +932,11 @@ pub fn export(s: &Snapshot, template: &Template, settings: &Settings) -> Result<
             let mut img: ImageBuffer<Rgba<f32>, Vec<f32>> = ImageBuffer::from_vec(res, res, px.into_iter().flatten().collect()).expect("sized");
             if out_size != res {
                 let filter = if out_size < res { image::imageops::FilterType::Triangle } else { image::imageops::FilterType::CatmullRom };
-                img = image::imageops::resize(&img, out_size, out_size, filter);
-                if map.chans[..chans.min(3)].iter().any(|c| c.src.is_normal()) {
+                img = resize_straight(&img, out_size, filter);
+                // Only a whole normal (x, y, z in R, G, B) renormalizes; packed
+                // maps with a normal's xy and data in B keep their B.
+                let whole_normal = chans >= 3 && map.chans[..3].iter().enumerate().all(|(k, c)| c.src.is_normal() && c.comp as usize == k);
+                if whole_normal {
                     for p in img.pixels_mut() {
                         let v = Vec3::new(p[0], p[1], p[2]) * 2.0 - Vec3::ONE;
                         let v = v.normalize_or(Vec3::Z) * 0.5 + Vec3::splat(0.5);
@@ -914,7 +948,70 @@ pub fn export(s: &Snapshot, template: &Template, settings: &Settings) -> Result<
             write(&img, map, settings, &path).map_err(|e| format!("Failed to write {}: {e}", path.display()))?;
             Ok(path)
         })
-        .collect()
+        .collect::<Result<_, String>>()?;
+    if let Some((_, features)) = s.features.as_ref().filter(|_| uses_features) {
+        files.push(write_manifest(template, settings, features, out_size)?);
+    }
+    Ok(files)
+}
+
+/// Resizes every channel on its own. `imageops::resize` weights color by
+/// alpha, which bleeds packed data (a mask, smoothness) in the alpha channel
+/// into the color channels.
+fn resize_straight(img: &ImageBuffer<Rgba<f32>, Vec<f32>>, size: u32, filter: image::imageops::FilterType) -> ImageBuffer<Rgba<f32>, Vec<f32>> {
+    let (w, h) = img.dimensions();
+    let rgb: ImageBuffer<Rgb<f32>, Vec<f32>> = ImageBuffer::from_fn(w, h, |x, y| {
+        let p = img.get_pixel(x, y);
+        Rgb([p[0], p[1], p[2]])
+    });
+    let alpha: ImageBuffer<Luma<f32>, Vec<f32>> = ImageBuffer::from_fn(w, h, |x, y| Luma([img.get_pixel(x, y)[3]]));
+    let rgb = image::imageops::resize(&rgb, size, size, filter);
+    let alpha = image::imageops::resize(&alpha, size, size, filter);
+    ImageBuffer::from_fn(size, size, |x, y| {
+        let (c, a) = (rgb.get_pixel(x, y), alpha.get_pixel(x, y));
+        Rgba([c[0], c[1], c[2], a[0]])
+    })
+}
+
+/// `$set.material.json` beside a feature export: the features by slot, the
+/// size the textures stand for, and what each file's channels hold, so a game
+/// can set the material up from the files alone.
+fn write_manifest(template: &Template, settings: &Settings, f: &Features, size: u32) -> Result<PathBuf, String> {
+    let chan = |c: &Chan| -> Value {
+        let what = match c.src {
+            Source::BaseColor => ["base_color.r", "base_color.g", "base_color.b"][c.comp.min(2) as usize].to_string(),
+            Source::NormalDx => ["normal_dx.x", "normal_dx.y", "normal_dx.z"][c.comp.min(2) as usize].to_string(),
+            Source::NormalGl => ["normal_gl.x", "normal_gl.y", "normal_gl.z"][c.comp.min(2) as usize].to_string(),
+            Source::Features => ["mask1", "mask2", "main"][c.comp.min(2) as usize].to_string(),
+            Source::Height => "height".into(),
+            s => format!("{}.{}", s.key().to_lowercase(), c.comp),
+        };
+        json!(if c.invert { format!("1-{what}") } else { what })
+    };
+    let maps: Vec<Value> = template
+        .maps
+        .iter()
+        .map(|m| {
+            let chans: Vec<Value> = m.chans[..m.layout.channels()].iter().map(chan).collect();
+            json!({"file": settings.file_name(m), "channels": chans, "srgb": m.chans[0].src == Source::BaseColor && settings.format != Format::Exr})
+        })
+        .collect();
+    let v = json!({
+        "format": "material-painter/feature-material",
+        "version": 1,
+        "name": settings.set_name,
+        "features": {"main": f.names[0], "mask1": f.names[1], "mask2": f.names[2]},
+        // Rounded so the file reads as typed (f32 noise otherwise).
+        "tile_m": (f.tile_m as f64 * 1e4).round() / 1e4,
+        "relief_m": (f.relief_m as f64 * 1e4).round() / 1e4,
+        "size": size,
+        "maps": maps,
+    });
+    let stem: String = settings.set_name.chars().map(|c| if r#"\/:*?"<>|"#.contains(c) { '_' } else { c }).collect();
+    let path = settings.folder.join(format!("{stem}.material.json"));
+    let text = serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?;
+    std::fs::write(&path, text).map_err(|e| format!("Failed to write {}: {e}", path.display()))?;
+    Ok(path)
 }
 
 fn write(img: &ImageBuffer<Rgba<f32>, Vec<f32>>, map: &OutputMap, settings: &Settings, path: &Path) -> image::ImageResult<()> {

@@ -521,6 +521,12 @@ fn fs_live_weight(in: FsOut) -> @location(0) vec4<f32> {
     if (u.p0.z < 0.5 && u.ch.x > 0.5) {
         ac = textureLoad(l_color, full(c), 0).a;
     }
+    if (u.bmin.w > 0.0 && a > 0.0) {
+        // The weights pass runs before the layer composites, so
+        // prev_height holds the stack below it, as layer_pass sees it.
+        let lv = layer_values(c, uv, p, n, false, vec4<f32>(1.0), false);
+        a = height_blended(a, lv.sh, textureLoad(prev_height, c, 0).r);
+    }
     a = clamp(a * ac, 0.0, 1.0);
     if (i32(u.p0.y) == 0) {
         w *= 1.0 - a;
@@ -552,50 +558,25 @@ fn fs_layer4(in: FsOut) -> AccumOut4 {
     return AccumOut4(o.color, o.rough, o.metal, o.height);
 }
 
-fn layer_pass(in: FsOut, extra: bool) -> AccumOut {
-    let c = vec2<i32>(in.pos.xy);
-    let dims = vec2<f32>(textureDimensions(prev_color));
-    let uv = in.pos.xy / dims;
+// A layer's own values at a texel before blending: channel values and
+// alphas, and (fill layers) normal and emission. `dimg` is a decal image's
+// color, used to tint the fill.
+struct LayerValues {
+    sc: vec3<f32>,
+    sr: f32,
+    sm: f32,
+    sh: f32,
+    ac: f32,
+    ar: f32,
+    am: f32,
+    ah: f32,
+    sn: vec3<f32>,
+    se: vec3<f32>,
+    an: f32,
+    ae: f32,
+};
 
-    let pc = textureLoad(prev_color, c, 0).rgb;
-    let pr = textureLoad(prev_rough, c, 0).r;
-    let pm = textureLoad(prev_metal, c, 0).r;
-    let ph = textureLoad(prev_height, c, 0).r;
-    var pn = vec3<f32>(0.0, 0.0, 1.0);
-    var pe = vec3<f32>(0.0);
-    if (extra) {
-        pn = unpack_normal(textureLoad(prev_normal, c, 0).rg);
-        pe = textureLoad(prev_emis, c, 0).rgb;
-    }
-
-    let p = textureLoad(pos_map, full(c), 0).xyz;
-    let n = normalize(textureLoad(nrm_map, full(c), 0).xyz * 2.0 - 1.0);
-
-    // The mask first: where it hides the layer, the stack below passes
-    // through and the layer's content (noise, images) isn't evaluated.
-    var mask = u.p0.x * layer_mask(c, p, n, uv);
-    // Decal fills show only inside their box, cut out by the image's alpha
-    // (a grayscale image's value).
-    let decal = u.p0.z > 0.5 && u.p0.z < 1.5 && i32(u.var1.z + 0.5) == 7;
-    var dimg = vec4<f32>(1.0);
-    if (decal && mask > 0.0) {
-        let d = decal_both(p, n, texel_size(c, p));
-        mask *= d.a;
-        dimg = vec4<f32>(d.rgb, 1.0);
-    }
-    if (mask <= 0.0) {
-        var keep: AccumOut;
-        keep.color = vec4<f32>(pc, 1.0);
-        keep.rough = vec4<f32>(pr);
-        keep.metal = vec4<f32>(pm);
-        keep.height = vec4<f32>(ph);
-        if (extra) {
-            keep.normal = vec4<f32>(pn.xy * 0.5 + 0.5, 0.0, 1.0);
-            keep.emis = vec4<f32>(pe, 1.0);
-        }
-        return keep;
-    }
-
+fn layer_values(c: vec2<i32>, uv: vec2<f32>, p: vec3<f32>, n: vec3<f32>, decal: bool, dimg: vec4<f32>, extra: bool) -> LayerValues {
     var sc = u.fill_color.rgb;
     var sr = u.fill_rmh.x;
     var sm = u.fill_rmh.y;
@@ -695,6 +676,80 @@ fn layer_pass(in: FsOut, extra: bool) -> AccumOut {
         sc = clamp(sc, vec3<f32>(0.0), vec3<f32>(1.0));
         sr = clamp(sr, 0.0, 1.0);
     }
+
+    return LayerValues(sc, sr, sm, sh, ac, ar, am, ah, sn, se, an, ae);
+}
+
+// Height blend (`u.bmin.w` > 0, the edge softness in height units): the
+// layer shows where its height rises above the stack below; a lower mask
+// sinks it, so masks still steer where it can come through.
+fn height_blended(mask: f32, sh: f32, ph: f32) -> f32 {
+    let w = u.bmin.w;
+    if (w <= 0.0 || mask <= 0.0) {
+        return mask;
+    }
+    let d = sh - ph + (mask - 1.0) * 0.5;
+    return clamp(d / w * 0.5 + 0.5, 0.0, 1.0);
+}
+
+fn layer_pass(in: FsOut, extra: bool) -> AccumOut {
+    let c = vec2<i32>(in.pos.xy);
+    let dims = vec2<f32>(textureDimensions(prev_color));
+    let uv = in.pos.xy / dims;
+
+    let pc = textureLoad(prev_color, c, 0).rgb;
+    let pr = textureLoad(prev_rough, c, 0).r;
+    let pm = textureLoad(prev_metal, c, 0).r;
+    let ph = textureLoad(prev_height, c, 0).r;
+    var pn = vec3<f32>(0.0, 0.0, 1.0);
+    var pe = vec3<f32>(0.0);
+    if (extra) {
+        pn = unpack_normal(textureLoad(prev_normal, c, 0).rg);
+        pe = textureLoad(prev_emis, c, 0).rgb;
+    }
+
+    let p = textureLoad(pos_map, full(c), 0).xyz;
+    let n = normalize(textureLoad(nrm_map, full(c), 0).xyz * 2.0 - 1.0);
+
+    // The mask first: where it hides the layer, the stack below passes
+    // through and the layer's content (noise, images) isn't evaluated.
+    var mask = u.p0.x * layer_mask(c, p, n, uv);
+    // Decal fills show only inside their box, cut out by the image's alpha
+    // (a grayscale image's value).
+    let decal = u.p0.z > 0.5 && u.p0.z < 1.5 && i32(u.var1.z + 0.5) == 7;
+    var dimg = vec4<f32>(1.0);
+    if (decal && mask > 0.0) {
+        let d = decal_both(p, n, texel_size(c, p));
+        mask *= d.a;
+        dimg = vec4<f32>(d.rgb, 1.0);
+    }
+    if (mask <= 0.0) {
+        var keep: AccumOut;
+        keep.color = vec4<f32>(pc, 1.0);
+        keep.rough = vec4<f32>(pr);
+        keep.metal = vec4<f32>(pm);
+        keep.height = vec4<f32>(ph);
+        if (extra) {
+            keep.normal = vec4<f32>(pn.xy * 0.5 + 0.5, 0.0, 1.0);
+            keep.emis = vec4<f32>(pe, 1.0);
+        }
+        return keep;
+    }
+
+    let lv = layer_values(c, uv, p, n, decal, dimg, extra);
+    let sc = lv.sc;
+    let sr = lv.sr;
+    let sm = lv.sm;
+    let sh = lv.sh;
+    let ac = lv.ac;
+    let ar = lv.ar;
+    let am = lv.am;
+    let ah = lv.ah;
+    let sn = lv.sn;
+    let se = lv.se;
+    let an = lv.an;
+    let ae = lv.ae;
+    mask = height_blended(mask, sh, ph);
 
     let mode = i32(u.p0.y);
     var out: AccumOut;

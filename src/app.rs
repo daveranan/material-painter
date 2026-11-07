@@ -4181,6 +4181,32 @@ impl PainterApp {
                     layer.opacity = op / 100.0;
                     dirty = true;
                 }
+                if let Content::Fill(f) = &mut layer.content {
+                    dirty |= labeled(ui, "Height blend", |ui| {
+                        ui.add(egui::Slider::new(&mut f.height_blend, 0.0..=0.5).max_decimals(3))
+                            .on_hover_text("Show this layer only where it rises above the layers below; the edge softness (0: off)")
+                            .changed()
+                    });
+                }
+            }
+            // Which of the texture set's features this layer is (export masks).
+            if self.engine.features.is_on() {
+                let names = self.engine.features.names.clone();
+                let label = |f: Option<u8>| match f {
+                    None => "None".to_string(),
+                    Some(s) => format!("{} ({})", names[s as usize], ["main", "mask 1", "mask 2"][s as usize]),
+                };
+                let layer = &mut self.engine.layers[idx];
+                labeled(ui, "Feature", |ui| {
+                    egui::ComboBox::from_id_salt("feature").selected_text(label(layer.feature)).show_ui(ui, |ui| {
+                        for f in [None, Some(0), Some(1), Some(2)] {
+                            if f.is_some_and(|s| names[s as usize].is_empty()) {
+                                continue;
+                            }
+                            dirty |= ui.selectable_value(&mut layer.feature, f, label(f)).changed();
+                        }
+                    });
+                });
             }
 
             if self.target == StrokeTarget::Mask {

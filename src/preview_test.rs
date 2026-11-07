@@ -199,6 +199,10 @@ fn export_templates() {
     let _ = std::fs::remove_dir_all(&root);
     for (fi, format) in Format::ALL.into_iter().enumerate() {
         for (ti, t) in export::builtin_templates().iter().enumerate() {
+            // Feature templates need tagged layers (see `feature_material_export`).
+            if t.maps.iter().any(|m| m.chans.iter().any(|c| c.src == export::Source::Features)) {
+                continue;
+            }
             // Every template in PNG; the other formats with two templates.
             if format != Format::Png && ti > 1 {
                 continue;
@@ -237,6 +241,178 @@ fn export_templates() {
     let black = base.pixels().filter(|p| p.0 == [0, 0, 0]).count();
     assert!(black < (res * res / 200) as usize, "{black} black texels after padding");
     let _ = Depth::U8;
+}
+
+/// A ground tile made of three features exports the game layout: masks say
+/// where each tagged layer still shows (layers above cover those below,
+/// untagged layers change nothing), and the manifest names the features.
+#[test]
+#[ignore]
+fn feature_material_export() {
+    use crate::engine::{FillParams, MatValues};
+    use crate::export::{self, Format, Padding, Settings};
+    let mesh = Arc::new(crate::mesh::Primitive::Plane.build());
+    let rs = render_state();
+    let gpu_mesh = GpuMesh::new(&rs.device, &mesh);
+    let res = 256;
+    let mut engine = Engine::new(&rs, &gpu_mesh, (mesh.bounds_min, mesh.bounds_max), res);
+    let mut undo = crate::undo::UndoStack::default();
+    while !engine.layers.is_empty() {
+        engine.delete_layer(0, &mut undo);
+    }
+    let fill = |color: [f32; 3], height: f32| FillParams {
+        mat: MatValues { enabled: [true, true, false, true], color, rough: 0.7, metal: 0.0, height },
+        ..FillParams::default()
+    };
+    // (name, color, opacity, feature)
+    let stack = [
+        ("Rock", [0.4, 0.4, 0.42], 1.0, Some(0)),
+        ("Moss", [0.25, 0.4, 0.15], 0.6, Some(1)),
+        ("Pebbles", [0.5, 0.45, 0.4], 0.5, Some(2)),
+        ("Tint", [0.6, 0.5, 0.4], 1.0, None),
+    ];
+    for (name, color, opacity, feature) in stack {
+        let i = engine.add_fill_layer(engine.layers.len(), None, name.into(), fill(color, 0.2), &mut undo);
+        engine.layers[i].opacity = opacity;
+        engine.layers[i].feature = feature;
+    }
+    engine.features = crate::engine::Features { names: ["rock".into(), "moss".into(), "pebbles".into()], tile_m: 2.0, relief_m: 0.05 };
+    engine.mark_dirty();
+    engine.composite();
+    let snap = export::snapshot(&engine, &rs.device, &rs.queue, mesh.clone());
+
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/bake_test/features");
+    let _ = std::fs::remove_dir_all(&root);
+    let template = export::builtin_templates().into_iter().find(|t| t.name == "Game material (features)").expect("built in");
+    let settings = Settings {
+        folder: root.clone(),
+        mesh_name: "Plane".into(),
+        project_name: "Test".into(),
+        set_name: "RockMoss".into(),
+        set_count: 1,
+        format: Format::Png,
+        depth: crate::export::Depth::U8,
+        size: None,
+        padding: Padding::Infinite,
+        normal_strength: 1.0,
+        use_baked_normal: false,
+    };
+    let files = export::export(&snap, &template, &settings).expect("exports");
+    assert_eq!(files.len(), 3, "two maps and the manifest: {files:?}");
+    let b = image::open(root.join("RockMoss_NormalMasks.png")).unwrap().to_rgba8();
+    let p = b.get_pixel(res / 2, res / 2).0;
+    // Pebbles (0.5) cover half of the moss (0.6): moss 0.3, pebbles 0.5; the
+    // untagged tint on top changes nothing.
+    let near = |v: u8, want: f32| (v as f32 / 255.0 - want).abs() < 0.02;
+    assert!(near(p[2], 0.3) && near(p[3], 0.5), "masks at the center: {p:?}");
+    let manifest: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(root.join("RockMoss.material.json")).unwrap()).unwrap();
+    assert_eq!(manifest["features"]["mask2"], "pebbles");
+    assert_eq!(manifest["maps"][1]["channels"][2], "mask1");
+    assert_eq!(manifest["relief_m"], 0.05);
+
+    // Without tags the template refuses rather than writing empty masks.
+    for l in &mut engine.layers {
+        l.feature = None;
+    }
+    engine.mark_dirty();
+    engine.composite();
+    let snap = export::snapshot(&engine, &rs.device, &rs.queue, mesh);
+    assert!(export::export(&snap, &template, &settings).is_err());
+
+    // Smart masks: moss and pebbles in clouds. Where both show, pebbles
+    // cover moss, so the masks never add up past 1.
+    engine.layers[1].feature = Some(1);
+    engine.layers[2].feature = Some(2);
+    for (i, seed) in [(1, 3.0), (2, 11.0)] {
+        engine.layers[i].opacity = 1.0;
+        let mut g = crate::engine::GenKind::Clouds.default_generator();
+        g.seed = seed;
+        engine.add_mask(i, true, Some(g), &mut undo);
+    }
+    engine.mark_dirty();
+    engine.composite();
+    let snap = export::snapshot(&engine, &rs.device, &rs.queue, Arc::new(crate::mesh::Primitive::Plane.build()));
+    // At a smaller size too: resizing must not bleed mask 2 (alpha) into mask 1.
+    let settings = Settings { size: Some(res / 2), ..settings };
+    export::export(&snap, &template, &settings).expect("exports");
+    let b = image::open(root.join("RockMoss_NormalMasks.png")).unwrap().to_rgba8();
+    let (mut m1, mut m2, mut worst) = (0.0, 0.0, 0u32);
+    for p in b.pixels() {
+        m1 += p.0[2] as f32;
+        m2 += p.0[3] as f32;
+        worst = worst.max(p.0[2] as u32 + p.0[3] as u32);
+    }
+    let n = (res * res / 4) as f32 * 255.0;
+    println!("  clouds: mask1 {:.3}, mask2 {:.3}, largest sum {}", m1 / n, m2 / n, worst);
+    assert!(m1 / n > 0.05 && m2 / n > 0.05, "both masks show somewhere");
+    assert!(worst <= 257, "masks overlap: sum {worst}/255");
+}
+
+/// Height blend: a fill shows only where its height rises above the stack
+/// below, and its feature mask follows exactly what composited (checked by
+/// recovering each texel's coverage from the color).
+#[test]
+#[ignore]
+fn height_blend_features() {
+    use crate::engine::{FillParams, MatValues};
+    use crate::export::{self, Format, Padding, Settings};
+    let mesh = Arc::new(crate::mesh::Primitive::Plane.build());
+    let rs = render_state();
+    let gpu_mesh = GpuMesh::new(&rs.device, &mesh);
+    let res = 256;
+    let mut engine = Engine::new(&rs, &gpu_mesh, (mesh.bounds_min, mesh.bounds_max), res);
+    let mut undo = crate::undo::UndoStack::default();
+    while !engine.layers.is_empty() {
+        engine.delete_layer(0, &mut undo);
+    }
+    let base = FillParams { mat: MatValues { enabled: [true, false, false, true], color: [0.0, 0.0, 0.0], height: 0.0, ..MatValues::default() }, ..FillParams::default() };
+    let top = FillParams {
+        mat: MatValues { enabled: [true, false, false, true], color: [1.0, 1.0, 1.0], height: 0.0, ..MatValues::default() },
+        height_var: 0.6,
+        var_scale: 6.0,
+        height_blend: 0.05,
+        ..FillParams::default()
+    };
+    engine.add_fill_layer(0, None, "Soil".into(), base, &mut undo);
+    engine.add_fill_layer(1, None, "Grass".into(), top, &mut undo);
+    engine.layers[0].feature = Some(0);
+    engine.layers[1].feature = Some(1);
+    engine.features = crate::engine::Features { names: ["soil".into(), "grass".into(), String::new()], tile_m: 1.0, relief_m: 0.05 };
+    engine.mark_dirty();
+    engine.composite();
+    let snap = export::snapshot(&engine, &rs.device, &rs.queue, mesh);
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/bake_test/height_blend");
+    let _ = std::fs::remove_dir_all(&root);
+    let template = export::builtin_templates().into_iter().find(|t| t.name == "Game material (features)").expect("built in");
+    let settings = Settings {
+        folder: root.clone(),
+        mesh_name: "Plane".into(),
+        project_name: "Test".into(),
+        set_name: "SoilGrass".into(),
+        set_count: 1,
+        format: Format::Png,
+        depth: crate::export::Depth::U8,
+        size: None,
+        padding: Padding::None,
+        normal_strength: 1.0,
+        use_baked_normal: false,
+    };
+    export::export(&snap, &template, &settings).expect("exports");
+    let a = image::open(root.join("SoilGrass_ColorHeight.png")).unwrap().to_rgba8();
+    let b = image::open(root.join("SoilGrass_NormalMasks.png")).unwrap().to_rgba8();
+    let (mut shown, mut worst) = (0.0f32, 0.0f32);
+    for (pa, pb) in a.pixels().zip(b.pixels()) {
+        // Black below, white above, mixed as stored (sRGB values): the
+        // color is the coverage.
+        let cover = pa.0[0] as f32 / 255.0;
+        let mask1 = pb.0[2] as f32 / 255.0;
+        shown += mask1;
+        worst = worst.max((cover - mask1).abs());
+    }
+    let shown = shown / (res * res) as f32;
+    println!("  grass shows on {:.0}% of the tile, mask vs composite differ by at most {worst:.3}", shown * 100.0);
+    assert!(shown > 0.2 && shown < 0.8, "height blend shows grass only where it rises: {shown}");
+    assert!(worst < 0.03, "the feature mask follows the composite: off by {worst}");
 }
 
 /// A stroke across the rounded cube with each brush projection (and once

@@ -67,6 +67,25 @@ Cavity, Sky exposure, Facing up, Thin areas, Part gradient, World height,
 Part random, Creases, Streaks, Noise, ID match, Overhangs, Wood grain, Cells,
 Scratches.
 
+## Feature materials (game ground: per-feature grading)
+A texture set can name up to three features; layers tagged with one say
+where it is. Export with the "Game material (features)" template.
+```jsonc
+// in a texture set, beside "layers_bottom_to_top":
+"features": {"main": "soil", "mask1": "dirt", "mask2": "grass", "tile_m": 2.0, "relief_m": 0.06},
+// in a layer (a folder's tag covers its contents; untagged layers change nothing):
+"feature": "dirt",            // a name from "features", or 0 / 1 / 2
+// in a fill (any layer that should rise through the one below by height):
+"height_blend": 0.06          // edge softness in height units; 0 = off; the mask still lowers it
+```
+Mask 1 and 2 are where each feature *shows* after layers above cover it
+(they sum to at most 1; main is the rest). Put the crevice feature in mask1:
+the game derives AO from it. `mp export_textures folder=DIR preset="Game
+material (features)" size=1024` writes `<set>_ColorHeight.png` (sRGB color,
+height in A), `<set>_NormalMasks.png` (DirectX normal XY, mask1, mask2) and
+`<set>.material.json` (feature names, tile and relief in metres, and what
+every channel holds).
+
 ## Files
 Blob paths are relative to `name.data/`. Paint textures are PNG (edit them
 with any tool, or replace with a script-made mask of any size: it's

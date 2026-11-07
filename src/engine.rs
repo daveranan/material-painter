@@ -470,6 +470,9 @@ pub struct FillParams {
     /// Paint running down from a text decal: this layer follows that layer's
     /// decal and text (see `Engine::sync_runoffs`).
     pub runoff: Option<crate::decal::Runoff>,
+    /// Height blend: the layer shows only where its height rises above the
+    /// stack below, with an edge this soft (height units); 0 is off.
+    pub height_blend: f32,
 }
 
 /// The order is the shader's projection index (`composite.wgsl`).
@@ -570,6 +573,7 @@ impl Default for FillParams {
             emission_strength: 1.0,
             decal: crate::decal::Decal::default(),
             runoff: None,
+            height_blend: 0.0,
         }
     }
 }
@@ -834,6 +838,40 @@ pub struct Layer {
     pub images: [Option<FillImage>; IMAGE_SLOTS],
     /// egui handle of the color channel, used as the layer thumbnail.
     pub thumb: Option<egui::TextureId>,
+    /// The texture set feature this layer paints (0 main, 1 and 2 the
+    /// masked ones, see [`Features`]); a folder's tag covers its contents.
+    pub feature: Option<u8>,
+}
+
+/// What a texture set is made of, for games that grade materials per feature
+/// (soil, moss, pebbles...): up to three named features, each showing where
+/// the layers tagged with it show (see `Engine::feature_view`), and the
+/// real-world size the textures stand for.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Features {
+    /// Main, mask 1, mask 2; an empty name is an unused slot.
+    pub names: [String; 3],
+    /// Metres one repeat of the texture covers.
+    pub tile_m: f32,
+    /// Metres between the lowest and highest height.
+    pub relief_m: f32,
+}
+
+impl Default for Features {
+    fn default() -> Self {
+        Features { names: Default::default(), tile_m: 2.0, relief_m: 0.1 }
+    }
+}
+
+impl Features {
+    pub fn is_on(&self) -> bool {
+        self.names.iter().any(|n| !n.is_empty())
+    }
+
+    /// The slot a feature name is in.
+    pub fn slot(&self, name: &str) -> Option<u8> {
+        self.names.iter().position(|n| !n.is_empty() && n == name).map(|i| i as u8)
+    }
 }
 
 impl Layer {
@@ -1087,6 +1125,14 @@ pub struct Engine {
     live_final: usize,
     live_layers: [Option<u64>; LIVE_SLOTS],
     live_ubuf: wgpu::Buffer,
+    /// What the texture set is made of (see [`Features`]).
+    pub features: Features,
+    /// Per texel, how much of feature 1 and 2 shows (R, G; the main feature
+    /// is the rest), in `feature_w[feature_final]`, from the layer uniforms
+    /// in `feature_ubuf`. Only made while some layer has a feature tag.
+    feature_w: Option<[Tex; 2]>,
+    feature_final: usize,
+    feature_ubuf: Option<wgpu::Buffer>,
 }
 
 /// Mip levels of the viewport's copies of the final channels (4096 down to
@@ -1248,6 +1294,10 @@ impl Engine {
             live_w: None,
             live_final: 0,
             live_layers: [None; LIVE_SLOTS],
+            features: Features::default(),
+            feature_w: None,
+            feature_final: 0,
+            feature_ubuf: None,
             live_ubuf: device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("live detail"),
                 size: (size_of::<LiveSlot>() * LIVE_SLOTS) as u64,
@@ -2273,6 +2323,7 @@ impl Engine {
             parent,
             images: Default::default(),
             thumb: None,
+            feature: None,
         };
         self.insert_layer(at, layer, undo, "Add folder".into())
     }
@@ -2338,6 +2389,7 @@ impl Engine {
             parent,
             images: Default::default(),
             thumb: None,
+            feature: None,
         };
         self.insert_layer(at, layer, undo, "Add paint layer".into())
     }
@@ -2378,6 +2430,7 @@ impl Engine {
             parent,
             images: Default::default(),
             thumb,
+            feature: None,
         };
         self.insert_layer(at, layer, undo, "Add paint layer".into())
     }
@@ -2403,6 +2456,7 @@ impl Engine {
             parent,
             images: Default::default(),
             thumb: None,
+            feature: None,
         };
         self.insert_layer(at, layer, undo, label)
     }
@@ -2511,7 +2565,7 @@ impl Engine {
         let (name, visible, opacity, blend, parent) = (src.name.clone(), src.visible, src.opacity, src.blend, src.parent);
         let images = src.images.clone();
         self.queue.submit([encoder.finish()]);
-        Layer { id: src.id, name, visible, opacity, blend, content, mask, parent, images, thumb: None }
+        Layer { id: src.id, name, visible, opacity, blend, content, mask, parent, images, thumb: None, feature: src.feature }
     }
 
     /// Moves a layer so it ends up where layer `to` is now (index-based, for
@@ -3365,6 +3419,9 @@ impl Engine {
         let (lo, hi) = self.bounds;
         u.bmin = [lo.x, lo.y, lo.z, 0.0];
         u.bsize = [hi.x - lo.x, hi.y - lo.y, hi.z - lo.z, 0.0];
+        if let Content::Fill(f) = &layer.content {
+            u.bmin[3] = f.height_blend;
+        }
         u.gx[0] = self.edge_max;
         u
     }
@@ -3518,6 +3575,7 @@ impl Engine {
             }
         }
         self.queue.write_buffer(&self.layer_ubuf, 0, &data);
+        let feature_passes = self.write_feature_uniforms(&passes, &data);
         // Textures for the filtered masks; forget layers that lost theirs.
         let filtered_ids: Vec<u64> = source_slot.keys().map(|&li| self.layers[li].id).collect();
         self.mask_out.retain(|id, t| filtered_ids.contains(id) && t[0].width == self.res);
@@ -3635,6 +3693,14 @@ impl Engine {
             None => (0, 0, 0, false),
         };
         let mut finals: Vec<(u64, usize)> = Vec::new();
+        // Weights (live detail, features) follow masks, heights and the layers
+        // above, not strokes on paint layers: patch frames keep the last full
+        // composite's weights.
+        let weights = resume.is_none();
+        if weights {
+            self.begin_weights(&mut encoder, &live, feature_passes);
+        }
+        let (mut live_src, mut feature_src) = (0, 0);
         for (k, pass) in passes.iter().enumerate().skip(start) {
             if record == Some(k) {
                 let input = if k + 1 < passes.len() {
@@ -3739,6 +3805,18 @@ impl Engine {
                     finals.push((layer.id, i));
                 }
             }
+            if weights && matches!(*pass, Pass::Layer(_)) {
+                let m = filtered.or(mask);
+                if !live.is_empty() {
+                    let w = self.live_w.as_ref().expect("made in begin_weights");
+                    live_src = self.encode_weight_step(&mut encoder, k, li, prev, m, &self.layer_ubuf, w, live_src);
+                }
+                if feature_passes && self.feature_of(li).is_some() {
+                    let w = self.feature_w.as_ref().expect("made in begin_weights");
+                    let ubuf = self.feature_ubuf.as_ref().expect("written with the uniforms");
+                    feature_src = self.encode_weight_step(&mut encoder, k, li, prev, m, ubuf, w, feature_src);
+                }
+            }
             let bg = make_bg(filtered.or(mask));
             let out = &self.accum[dst];
             // A patch keeps what is around it.
@@ -3761,12 +3839,9 @@ impl Engine {
             from_cache = false;
         }
         self.final_idx = src;
-        // Live-detail weights follow masks and the layers above, not strokes on
-        // paint layers: patch frames keep the last full composite's weights.
-        if resume.is_none() {
-            let mut now = self.mask_final.clone();
-            now.extend(finals.iter().copied());
-            self.encode_live_weights(&mut encoder, &passes, &live, &now);
+        if weights {
+            self.live_final = live_src;
+            self.feature_final = feature_src;
         }
         self.queue.submit([encoder.finish()]);
         if let Some(p) = resume {
@@ -3781,6 +3856,48 @@ impl Engine {
         self.mask_final.extend(finals);
         self.build_view_mips();
         self.update_thumbs();
+    }
+
+    /// The feature a layer paints: its own tag, else its nearest tagged folder's.
+    pub fn feature_of(&self, idx: usize) -> Option<u8> {
+        std::iter::once(idx).chain(self.ancestors(idx)).find_map(|i| self.layers[i].feature)
+    }
+
+    /// The layer uniforms for the feature weights: the composite's, with each
+    /// layer's feature slot (1, 2) in `gx.w`; layers of the main feature have 0,
+    /// so they only cover what is below them. False when nothing is tagged.
+    fn write_feature_uniforms(&mut self, passes: &[Pass], data: &[u8]) -> bool {
+        if !self.features.is_on() || self.layers.iter().all(|l| l.feature.is_none()) {
+            self.feature_w = None;
+            return false;
+        }
+        let mut fdata = data.to_vec();
+        for (k, pass) in passes.iter().enumerate() {
+            let Pass::Layer(li) = *pass else { continue };
+            let off = k * UNIFORM_STRIDE as usize;
+            let range = off..off + size_of::<LayerUniform>();
+            let mut u: LayerUniform = bytemuck::pod_read_unaligned(&fdata[range.clone()]);
+            u.gx[3] = match self.feature_of(li) {
+                Some(slot @ 1..=2) => slot as f32,
+                _ => 0.0,
+            };
+            fdata[range].copy_from_slice(bytemuck::bytes_of(&u));
+        }
+        if self.feature_ubuf.as_ref().is_none_or(|b| b.size() < fdata.len() as u64) {
+            self.feature_ubuf = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("feature layer uniforms"),
+                size: self.layer_ubuf.size().max(fdata.len() as u64),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+        }
+        self.queue.write_buffer(self.feature_ubuf.as_ref().expect("made above"), 0, &fdata);
+        true
+    }
+
+    /// Where features 1 and 2 show (R, G), when some layer has a feature tag.
+    pub fn feature_view(&self) -> Option<&Tex> {
+        self.feature_w.as_ref().map(|w| &w[self.feature_final])
     }
 
     /// The live-detail layers, bottom first: visible tri-planar fills with a
@@ -3806,7 +3923,11 @@ impl Engine {
     /// result: a layer sets its slot to its coverage, and every normally
     /// blended layer above scales the slots below by what it lets through.
     /// (Multiply and other blends keep the detail; faded folders don't fade it.)
-    fn encode_live_weights(&mut self, encoder: &mut wgpu::CommandEncoder, passes: &[Pass], live: &[usize], finals: &HashMap<u64, usize>) {
+    /// Before a full composite: the live slots' uniform and the weight
+    /// textures, cleared. The weights then build up layer by layer inside the
+    /// composite loop (`encode_weight_step`), where each layer sees the stack
+    /// below it, as height blends need.
+    fn begin_weights(&mut self, encoder: &mut wgpu::CommandEncoder, live: &[usize], features: bool) {
         let mut slots = [LiveSlot::default(); LIVE_SLOTS];
         self.live_layers = [None; LIVE_SLOTS];
         for (s, &li) in live.iter().enumerate() {
@@ -3829,79 +3950,94 @@ impl Engine {
             let t = || Tex::new(&self.device, "live detail weights", self.res, self.res, LIVE_FORMAT, LAYER_USAGE);
             self.live_w = Some([t(), t()]);
         }
-        let w = self.live_w.as_ref().expect("made above");
         let clear = wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT);
+        let w = self.live_w.as_ref().expect("made above");
         drop(gpu::pass(encoder, "live detail clear", &[gpu::color_attachment(&w[0].view, clear)]));
-        let mut src = 0;
-        if !live.is_empty() {
-            let fin = &self.accum[self.final_idx];
-            let dummy = &self.dummy.view;
-            for (k, pass) in passes.iter().enumerate() {
-                let Pass::Layer(li) = *pass else { continue };
-                let layer = &self.layers[li];
-                let chans: [Option<&Tex>; FINAL_CHANNELS] = match &layer.content {
-                    Content::Paint(ch) => std::array::from_fn(|i| ch.get(i).and_then(|t| t.as_ref())),
-                    Content::Folder(_) => continue,
-                    Content::Fill(_) => std::array::from_fn(|i| layer.images[i].as_ref().map(|im| im.tex.as_ref())),
-                };
-                let filtered = if self.has_mask_filters(li) {
-                    finals.get(&layer.id).and_then(|&i| self.mask_out.get(&layer.id).map(|m| &m[i]))
-                } else {
-                    None
-                };
-                let mask = filtered.or(layer.mask.as_ref().and_then(|m| m.paint.as_ref()));
-                fn tv<'a>(t: Option<&'a Tex>, dummy: &'a wgpu::TextureView) -> wgpu::BindingResource<'a> {
-                    wgpu::BindingResource::TextureView(t.map_or(dummy, |t| &t.view))
-                }
-                let v = |t| tv(t, dummy);
-                let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("live detail weights"),
-                    layout: &self.p.composite_bgl,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                                buffer: &self.layer_ubuf,
-                                offset: 0,
-                                size: NonZeroU64::new(size_of::<LayerUniform>() as u64),
-                            }),
-                        },
-                        // The weights so far, in the stack-below color slot.
-                        wgpu::BindGroupEntry { binding: 1, resource: v(Some(&w[src])) },
-                        wgpu::BindGroupEntry { binding: 2, resource: v(Some(&fin[1])) },
-                        wgpu::BindGroupEntry { binding: 3, resource: v(Some(&fin[2])) },
-                        wgpu::BindGroupEntry { binding: 4, resource: v(Some(&fin[3])) },
-                        wgpu::BindGroupEntry { binding: 5, resource: v(chans[0]) },
-                        wgpu::BindGroupEntry { binding: 6, resource: v(chans[1]) },
-                        wgpu::BindGroupEntry { binding: 7, resource: v(chans[2]) },
-                        wgpu::BindGroupEntry { binding: 8, resource: v(chans[3]) },
-                        wgpu::BindGroupEntry { binding: 9, resource: v(mask) },
-                        wgpu::BindGroupEntry { binding: 10, resource: v(Some(&self.pos)) },
-                        wgpu::BindGroupEntry { binding: 11, resource: v(Some(&self.nrm)) },
-                        wgpu::BindGroupEntry { binding: 12, resource: v(Some(self.map_tex(0))) },
-                        wgpu::BindGroupEntry { binding: 13, resource: v(Some(self.map_tex(1))) },
-                        wgpu::BindGroupEntry { binding: 14, resource: v(Some(self.map_tex(2))) },
-                        wgpu::BindGroupEntry { binding: 15, resource: wgpu::BindingResource::TextureView(&self.custom_array.1) },
-                        wgpu::BindGroupEntry { binding: 16, resource: v(Some(self.map_tex(4))) },
-                        wgpu::BindGroupEntry { binding: 17, resource: wgpu::BindingResource::Sampler(&self.sampler) },
-                        wgpu::BindGroupEntry { binding: 18, resource: wgpu::BindingResource::Sampler(&self.repeat_sampler) },
-                        wgpu::BindGroupEntry { binding: 19, resource: v(Some(&fin[NORMAL_CH])) },
-                        wgpu::BindGroupEntry { binding: 20, resource: v(Some(&fin[EMISSION_CH])) },
-                        wgpu::BindGroupEntry { binding: 21, resource: v(chans[NORMAL_CH]) },
-                        wgpu::BindGroupEntry { binding: 22, resource: v(chans[EMISSION_CH]) },
-                        wgpu::BindGroupEntry { binding: 23, resource: v(Some(&self.tan)) },
-                    ],
-                });
-                let dst = 1 - src;
-                let mut pass = gpu::pass(encoder, "live detail weights", &[gpu::color_attachment(&w[dst].view, clear)]);
-                pass.set_pipeline(&self.p.live_weight);
-                pass.set_bind_group(0, &bg, &[(k as u64 * UNIFORM_STRIDE) as u32]);
-                pass.draw(0..3, 0..1);
-                drop(pass);
-                src = dst;
+        self.live_final = 0;
+        if features {
+            if self.feature_w.as_ref().is_none_or(|w| w[0].width != self.res) {
+                let t = || Tex::new(&self.device, "feature weights", self.res, self.res, LIVE_FORMAT, LAYER_USAGE);
+                self.feature_w = Some([t(), t()]);
             }
+            let w = self.feature_w.as_ref().expect("made above");
+            drop(gpu::pass(encoder, "feature weights clear", &[gpu::color_attachment(&w[0].view, clear)]));
+            self.feature_final = 0;
         }
-        self.live_final = src;
+    }
+
+    /// One layer's step of a weights pass (`fs_live_weight`): from `w[src]`
+    /// into the other side of `w`, which it returns. `prev` is the stack
+    /// below the layer, `mask` its filtered or painted mask, `ubuf` the layer
+    /// uniforms (whose `gx.w` is each layer's slot).
+    #[allow(clippy::too_many_arguments)]
+    fn encode_weight_step(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        k: usize,
+        li: usize,
+        prev: &[Tex; FINAL_CHANNELS],
+        mask: Option<&Tex>,
+        ubuf: &wgpu::Buffer,
+        w: &[Tex; 2],
+        src: usize,
+    ) -> usize {
+        let layer = &self.layers[li];
+        let chans: [Option<&Tex>; FINAL_CHANNELS] = match &layer.content {
+            Content::Paint(ch) => std::array::from_fn(|i| ch.get(i).and_then(|t| t.as_ref())),
+            Content::Folder(_) => return src,
+            Content::Fill(_) => std::array::from_fn(|i| layer.images[i].as_ref().map(|im| im.tex.as_ref())),
+        };
+        let dummy = &self.dummy.view;
+        fn tv<'a>(t: Option<&'a Tex>, dummy: &'a wgpu::TextureView) -> wgpu::BindingResource<'a> {
+            wgpu::BindingResource::TextureView(t.map_or(dummy, |t| &t.view))
+        }
+        let v = |t| tv(t, dummy);
+        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("live detail weights"),
+            layout: &self.p.composite_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: ubuf,
+                        offset: 0,
+                        size: NonZeroU64::new(size_of::<LayerUniform>() as u64),
+                    }),
+                },
+                // The weights so far, in the stack-below color slot.
+                wgpu::BindGroupEntry { binding: 1, resource: v(Some(&w[src])) },
+                wgpu::BindGroupEntry { binding: 2, resource: v(Some(&prev[1])) },
+                wgpu::BindGroupEntry { binding: 3, resource: v(Some(&prev[2])) },
+                wgpu::BindGroupEntry { binding: 4, resource: v(Some(&prev[3])) },
+                wgpu::BindGroupEntry { binding: 5, resource: v(chans[0]) },
+                wgpu::BindGroupEntry { binding: 6, resource: v(chans[1]) },
+                wgpu::BindGroupEntry { binding: 7, resource: v(chans[2]) },
+                wgpu::BindGroupEntry { binding: 8, resource: v(chans[3]) },
+                wgpu::BindGroupEntry { binding: 9, resource: v(mask) },
+                wgpu::BindGroupEntry { binding: 10, resource: v(Some(&self.pos)) },
+                wgpu::BindGroupEntry { binding: 11, resource: v(Some(&self.nrm)) },
+                wgpu::BindGroupEntry { binding: 12, resource: v(Some(self.map_tex(0))) },
+                wgpu::BindGroupEntry { binding: 13, resource: v(Some(self.map_tex(1))) },
+                wgpu::BindGroupEntry { binding: 14, resource: v(Some(self.map_tex(2))) },
+                wgpu::BindGroupEntry { binding: 15, resource: wgpu::BindingResource::TextureView(&self.custom_array.1) },
+                wgpu::BindGroupEntry { binding: 16, resource: v(Some(self.map_tex(4))) },
+                wgpu::BindGroupEntry { binding: 17, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                wgpu::BindGroupEntry { binding: 18, resource: wgpu::BindingResource::Sampler(&self.repeat_sampler) },
+                wgpu::BindGroupEntry { binding: 19, resource: v(Some(&prev[NORMAL_CH])) },
+                wgpu::BindGroupEntry { binding: 20, resource: v(Some(&prev[EMISSION_CH])) },
+                wgpu::BindGroupEntry { binding: 21, resource: v(chans[NORMAL_CH]) },
+                wgpu::BindGroupEntry { binding: 22, resource: v(chans[EMISSION_CH]) },
+                wgpu::BindGroupEntry { binding: 23, resource: v(Some(&self.tan)) },
+            ],
+        });
+        let dst = 1 - src;
+        let clear = wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT);
+        let mut pass = gpu::pass(encoder, "layer weights", &[gpu::color_attachment(&w[dst].view, clear)]);
+        pass.set_pipeline(&self.p.live_weight);
+        pass.set_bind_group(0, &bg, &[(k as u64 * UNIFORM_STRIDE) as u32]);
+        pass.draw(0..3, 0..1);
+        drop(pass);
+        dst
     }
 
     /// What the viewport needs for live detail: the weights, each slot's

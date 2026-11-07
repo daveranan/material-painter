@@ -229,6 +229,14 @@ impl PainterApp {
     /// Every texture set's maps, read back now (after compositing), with
     /// the settings that name its files.
     fn export_snapshots(&mut self, settings: &export::Settings) -> Vec<(export::Snapshot, export::Settings)> {
+        // Feature weights only follow full composites (a stroke patches the
+        // stack without them), so a set with features composites in full.
+        if self.engine.features.is_on() {
+            self.engine.mark_dirty();
+        }
+        for p in self.sets.parked.iter_mut().flatten().filter(|p| p.engine.features.is_on()) {
+            p.engine.mark_dirty();
+        }
         if self.engine.dirty {
             self.engine.composite();
         }

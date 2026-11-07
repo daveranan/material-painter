@@ -462,6 +462,7 @@ pub(super) fn fill_json(p: &FillParams) -> Value {
         "part_variation": p.part_var,
         "projection": format!("{:?}", p.projection),
         "tiling": p.tiling,
+        "height_blend": p.height_blend,
         "rotation": p.rotation,
         "offset": p.offset,
         "triplanar_sharpness": p.tri_sharpness,
@@ -531,6 +532,7 @@ pub(super) fn fill_from(v: &Value) -> FillParams {
         part_var: f(v, "part_variation", d.part_var),
         projection: s(v, "projection").and_then(Projection::from_key).unwrap_or(Projection::Uv),
         tiling: f(v, "tiling", d.tiling),
+        height_blend: f(v, "height_blend", d.height_blend).max(0.0),
         rotation: f(v, "rotation", d.rotation),
         offset: arr(v, "offset", d.offset),
         tri_sharpness: f(v, "triplanar_sharpness", d.tri_sharpness),
@@ -598,6 +600,21 @@ pub(super) fn mask_layers_json(layers: &[crate::engine::MaskLayer]) -> Value {
             json!({"source": source, "blend": ml.blend.key(), "opacity": ml.opacity, "enabled": ml.enabled})
         })
         .collect()
+}
+
+/// A texture set's features (see `engine::Features`): names by slot, and size.
+fn features_json(f: &crate::engine::Features) -> Value {
+    json!({"main": f.names[0], "mask1": f.names[1], "mask2": f.names[2], "tile_m": f.tile_m, "relief_m": f.relief_m})
+}
+
+fn features_from(v: &Value) -> crate::engine::Features {
+    let d = crate::engine::Features::default();
+    let name = |k: &str| s(v, k).unwrap_or("").trim().to_string();
+    crate::engine::Features {
+        names: [name("main"), name("mask1"), name("mask2")],
+        tile_m: f(v, "tile_m", d.tile_m).max(1e-3),
+        relief_m: f(v, "relief_m", d.relief_m).max(0.0),
+    }
 }
 
 pub(super) fn mask_layers_from(v: &Value) -> Vec<crate::engine::MaskLayer> {
@@ -763,7 +780,9 @@ impl PainterApp {
                             .map(|(t, c)| t.as_ref().map_or(Value::Null, |t| self.tex_json(w, t, &format!("{lb}_{c}"))))
                             .collect::<Vec<_>>()
                     });
-                    let mask = l.mask.as_ref().map(|t| self.tex_json(w, t, &format!("{lb}_mask")));
+                    // Only layers that still have a paint mask need one per member.
+                    let has_mask = self.engine.layers.iter().any(|x| x.id == id && x.mask.as_ref().is_some_and(|m| m.paint.is_some() && m.graph.is_none()));
+                    let mask = l.mask.as_ref().filter(|_| has_mask).map(|t| self.tex_json(w, t, &format!("{lb}_mask")));
                     layers.push(json!({"id": id, "channels": channels, "mask": mask}));
                 }
                 v["layers"] = json!(layers);
@@ -882,7 +901,7 @@ impl PainterApp {
                     })
                 })
                 .collect();
-            layers.push(json!({
+            let mut lv = json!({
                 "images": images,
                 "id": l.id,
                 "name": l.name,
@@ -892,18 +911,27 @@ impl PainterApp {
                 "parent": l.parent,
                 "content": content,
                 "mask": mask,
-            }));
+            });
+            if let Some(slot) = l.feature {
+                let name = &engine.features.names[slot as usize];
+                lv["feature"] = if name.is_empty() { json!(slot) } else { json!(name) };
+            }
+            layers.push(lv);
         }
         let fixes: Vec<Value> = (0..engine.map_fix.len())
             .filter_map(|i| Some(json!({"map": i, "texture": self.tex_json(w, engine.map_fix[i].as_ref()?, &format!("set{set}/fix{i}"))})))
             .collect();
         let levels: Vec<Value> = engine.map_levels.iter().map(|l| json!([l.black, l.white, l.gamma])).collect();
-        json!({
+        let mut v = json!({
             "resolution": engine.res,
             "layers_bottom_to_top": layers,
             "map_fixes": fixes,
             "map_levels": levels,
-        })
+        });
+        if engine.features.is_on() {
+            v["features"] = features_json(&engine.features);
+        }
+        v
     }
 
     pub(super) fn save_project(&mut self, path: &Path) -> Result<(), String> {
@@ -1051,6 +1079,7 @@ impl PainterApp {
     /// yet in the document.
     fn layers_from(&self, r: &Reader, sv: &Value) -> Result<Vec<Layer>, String> {
         let bad = |what: &str| format!("layer stack: {what}");
+        let features = features_from(&sv["features"]);
         let mut layers = Vec::new();
         for lv in sv["layers_bottom_to_top"].as_array().ok_or_else(|| bad("'layers_bottom_to_top' is missing"))? {
             let name = s(lv, "name").unwrap_or("Layer").to_string();
@@ -1105,6 +1134,14 @@ impl PainterApp {
                 }
             }
             let blend_name = s(lv, "blend").unwrap_or("Normal");
+            let feature = match &lv["feature"] {
+                Value::Null => None,
+                Value::String(f) => Some(features.slot(f).ok_or_else(|| {
+                    bad(&format!("'{name}' has feature '{f}', which isn't one of the set's features {:?}", features.names))
+                })?),
+                Value::Number(n) => Some(n.as_u64().filter(|&n| n < 3).ok_or_else(|| bad(&format!("'{name}' has feature {n}; use 0, 1 or 2")))? as u8),
+                other => return Err(bad(&format!("'{name}' has feature {other}; use a feature name or 0, 1, 2"))),
+            };
             layers.push(Layer {
                 id: lv["id"].as_u64().ok_or_else(|| bad(&format!("'{name}' has no numeric 'id'")))?,
                 name,
@@ -1116,6 +1153,7 @@ impl PainterApp {
                 parent: lv["parent"].as_u64(),
                 images,
                 thumb: None,
+                feature,
             });
         }
         let mut ids = std::collections::HashSet::new();
@@ -1184,6 +1222,7 @@ impl PainterApp {
             self.switch_set(k);
             self.engine.replace_layers(layers, "Reload from disk".into(), &mut self.undo);
             let sv = &manifest["texture_sets"][k];
+            self.engine.features = features_from(&sv["features"]);
             self.map_levels_from(sv, version);
             self.selected = self.selected.min(self.engine.layers.len().saturating_sub(1));
         }
@@ -1302,6 +1341,7 @@ impl PainterApp {
                 }
             }
             self.map_levels_from(sv, manifest["version"].as_u64().unwrap_or(1));
+            self.engine.features = features_from(&sv["features"]);
             self.selected = sv["selected"].as_u64().map_or(0, |x| x as usize).min(self.engine.layers.len().saturating_sub(1));
         }
         self.switch_set(manifest["active_set"].as_u64().map_or(0, |x| x as usize).min(set_count - 1));
