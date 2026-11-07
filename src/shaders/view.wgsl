@@ -8,7 +8,7 @@ struct Globals {
     cam_pos: vec4<f32>,
     light: vec4<f32>,    // env rotation (radians), exposure, env intensity, radiance max lod
     params: vec4<f32>,   // view mode, height strength, texel size, texture resolution
-    view2d: vec4<f32>,   // zoom (px per uv), pan x, pan y, unused
+    view2d: vec4<f32>,   // zoom (px per uv), pan x, pan y (2D view); parallax depth (3D view)
     size: vec4<f32>,     // viewport width, height, baked AO strength, selection highlight strength
     extra: vec4<f32>,    // use baked normal, has bake, custom map shown (view mode 22), wireframe opacity
     bmin: vec4<f32>,
@@ -458,9 +458,70 @@ struct Shade {
     wpos: vec3<f32>,
 };
 
+// Parallax occlusion (`g.view2d.w`: world height of painted height 1): the
+// surface looks displaced without moving the mesh. The view ray steps down
+// through the height field; the first step below the surface gives the UV
+// to shade. UV and world are related through screen derivatives, so no
+// tangent convention is assumed.
+fn parallax_uv(in: MeshOut, front: bool) -> vec2<f32> {
+    let depth = g.view2d.w;
+    if (depth <= 0.0) {
+        return in.uv;
+    }
+    var n = normalize(in.n);
+    if (!front) {
+        n = -n;
+    }
+    // World directions of +u and +v (per UV unit) from the derivatives.
+    let duv_x = dpdx(in.uv);
+    let duv_y = dpdy(in.uv);
+    let dp_x = dpdx(in.wpos);
+    let dp_y = dpdy(in.wpos);
+    let det = duv_x.x * duv_y.y - duv_x.y * duv_y.x;
+    if (abs(det) < 1e-12) {
+        return in.uv;
+    }
+    let tu = (dp_x * duv_y.y - dp_y * duv_x.y) / det;
+    let tv = (dp_y * duv_x.x - dp_x * duv_y.x) / det;
+    let v = normalize(g.cam_pos.xyz - in.wpos);
+    let vn = max(dot(v, n), 0.15);
+    // World step along the surface per unit of height, toward the camera,
+    // turned into UV through the dual of (tu, tv).
+    let w = (v - n * dot(v, n)) / vn;
+    let a = dot(tu, tu);
+    let b = dot(tu, tv);
+    let d = dot(tv, tv);
+    let gdet = max(a * d - b * b, 1e-12);
+    let wu = dot(w, tu);
+    let wv = dot(w, tv);
+    let per_h = vec2<f32>(d * wu - b * wv, a * wv - b * wu) / gdet;
+    // Mip that fits the pixel, so the march doesn't shimmer when far away.
+    let texels = max(length(duv_x), length(duv_y)) * g.params.w;
+    let lod = clamp(log2(max(texels, 1.0)), 0.0, VIEW_MAX_LOD);
+    const STEPS: i32 = 32;
+    var hl = depth;
+    var prev_gap = 0.0;
+    var prev_h = depth;
+    for (var i = 0; i <= STEPS; i++) {
+        hl = depth - 2.0 * depth * f32(i) / f32(STEPS);
+        let uv = in.uv + per_h * hl;
+        let surf = textureSampleLevel(t_height, samp, uv, lod).r * depth;
+        let gap = hl - surf;
+        if (gap <= 0.0) {
+            // Between the last step above and this one below the surface.
+            let t = select(prev_gap / (prev_gap - gap), 0.0, i == 0);
+            return in.uv + per_h * mix(prev_h, hl, t);
+        }
+        prev_gap = gap;
+        prev_h = hl;
+    }
+    return in.uv + per_h * hl;
+}
+
 fn mesh_shade_inputs(in: MeshOut, front: bool) -> Shade {
     var c: Shade;
-    c.s = sample_surface(in.uv);
+    let suv = parallax_uv(in, front);
+    c.s = sample_surface(suv);
     // Live detail. World size of one texture-set texel and of this pixel
     // (with the painted channels' sharpening bias), from screen derivatives.
     let dpx = dpdx(in.wpos);
@@ -495,7 +556,7 @@ fn mesh_shade_inputs(in: MeshOut, front: bool) -> Shade {
     if (g.sun_c.w > 0.5) {
         c.shadow = key_shadow(in.wpos, c.gn);
     }
-    c.uv = in.uv;
+    c.uv = suv;
     c.wpos = in.wpos;
     return c;
 }

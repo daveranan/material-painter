@@ -922,6 +922,9 @@ impl PainterApp {
             }
             "preview_settings" => {
                 let v = &mut self.view;
+                if let Some(d) = f32_arg(args, "displacement") {
+                    v.displacement = d.clamp(0.0, 1.0);
+                }
                 if let Some(f) = f32_arg(args, "fov") {
                     self.cam.fov_y = f.clamp(5.0, 120.0).to_radians();
                 }

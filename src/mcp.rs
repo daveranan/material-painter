@@ -412,6 +412,7 @@ pub fn tool_list() -> Vec<Value> {
                 "bg_intensity": {"type": "number"},
                 "bg_color": {"type": "array", "items": {"type": "number"}, "minItems": 3, "maxItems": 3, "description": "Linear RGB"},
                 "exposure": {"type": "number", "description": "Multiplier (1 = neutral)"},
+                "displacement": {"type": "number", "description": "Parallax displacement in the 3D view: world height of the highest painted height (mesh fits a 2-unit box), 0 = off"},
                 "tonemap": {"type": "string", "description": "ACES, AgX-style, Neutral, Filmic or Linear"},
                 "contrast": {"type": "number"},
                 "saturation": {"type": "number"},

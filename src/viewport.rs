@@ -204,6 +204,9 @@ pub struct ViewSettings {
     /// Linear RGB.
     pub bg_color: [f32; 3],
     pub height_strength: f32,
+    /// Parallax displacement in the 3D view: how far (world units, the mesh
+    /// fits a 2-unit box) the highest painted height rises; 0 is off.
+    pub displacement: f32,
     pub show_wire: bool,
     /// Mesh wireframe over the 3D view.
     pub show_wire_3d: bool,
@@ -261,6 +264,7 @@ impl Default for ViewSettings {
             bg_intensity: 0.55,
             bg_color: [0.05, 0.05, 0.055],
             height_strength: 1.0,
+            displacement: 0.0,
             show_wire: true,
             show_wire_3d: false,
             show_seams_3d: false,
@@ -836,7 +840,7 @@ impl ViewRenderer {
             cam_pos: [0.0; 4],
             light: [s.env_rotation, s.exposure, s.env_intensity, (RADIANCE_MIPS - 1) as f32],
             params: [s.mode.index() as f32, s.height_strength, 1.0 / res, res],
-            view2d: [0.0; 4],
+            view2d: [0.0, 0.0, 0.0, s.displacement],
             size: [size[0] as f32, size[1] as f32, s.ao_strength, engine.highlight],
             extra: [
                 if s.use_baked_normal && engine.has_bake { 1.0 } else { 0.0 },
