@@ -662,6 +662,51 @@ fn color_nodes_on_scan() {
     sheet.save(dir.join("sheet.png")).unwrap();
 }
 
+/// Ground debris from the tile sampler (Stick, Chip, Pebble with aspect,
+/// bend, taper, tilt): every step renders finite and covers part of the
+/// tile; a sheet of the steps lands in target/bake_test/debris.
+#[test]
+#[ignore]
+fn debris_scatter_renders() {
+    use crate::graph::{Library, Runtime};
+    let src = "
+size 512
+flow = noise(perlin, scale=2, octaves=2, seed=301) | auto_levels
+roots = tile_sampler(stick, columns=8, rows=8, size=0.22, size_random=0.4, aspect=6, taper=0.8, bend=0.6, tilt=0.3, position_random=1, rotation_random=0.25, rotation=flow, rotation_map=1, brightness_random=0.3, seed=11)
+twigs = tile_sampler(stick, columns=24, rows=24, size=0.14, size_random=0.5, aspect=9, taper=0.5, bend=0.3, tilt=0.6, position_random=1, rotation_random=1, gaps=0.3, seed=12)
+chips = tile_sampler(chip, columns=40, rows=40, size=0.6, size_random=0.5, aspect=1.6, tilt=0.8, irregular=0.8, position_random=1, rotation_random=1, gaps=0.45, seed=13)
+pebbles = tile_sampler(pebble, columns=48, rows=48, size=0.5, size_random=0.6, aspect=1.3, tilt=0.3, irregular=0.7, position_random=1, rotation_random=1, gaps=0.55, seed=14)
+debris = max(max(roots * 0.85, twigs * 0.6), max(chips * 0.45, pebbles * 0.4))
+output height = debris
+";
+    let lib = Library::load(None);
+    let g = crate::graph::script::compile(src, &lib, None).expect("compiles");
+    let rs = render_state();
+    let mesh = crate::mesh::Primitive::Plane.build();
+    let gpu_mesh = GpuMesh::new(&rs.device, &mesh);
+    let engine = Engine::new(&rs, &gpu_mesh, (mesh.bounds_min, mesh.bounds_max), 64);
+    let maps = |m: usize| engine.mesh_map(m);
+    let mut rt = Runtime::new(&rs.device, &rs.queue);
+    let t = std::time::Instant::now();
+    rt.evaluate(&rs.device, &rs.queue, &g, &lib, &maps, 0);
+    assert!(rt.errors.is_empty(), "{:?}", rt.errors);
+    let half = |b: &[u8]| crate::gpu::f16_to_f32(u16::from_le_bytes([b[0], b[1]]));
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/bake_test/debris");
+    std::fs::create_dir_all(&dir).unwrap();
+    for (name, node) in &g.steps {
+        let tex = rt.output(*node).unwrap_or_else(|| panic!("{name} rendered nothing"));
+        let bytes = read_texture(&rs.device, &rs.queue, tex);
+        let reds: Vec<f32> = bytes.chunks(8).map(|px| half(&px[0..2])).collect();
+        assert!(reds.iter().all(|v| v.is_finite()), "{name}: non-finite");
+        let covered = reds.iter().filter(|v| **v > 0.05).count() as f32 / reds.len() as f32;
+        eprintln!("{name}: {:.0}% covered", covered * 100.0);
+        let w = tex.width;
+        let img = image::GrayImage::from_fn(w, w, |x, y| image::Luma([(reds[(y * w + x) as usize].clamp(0.0, 1.0) * 255.0) as u8]));
+        img.save(dir.join(format!("{name}.png"))).unwrap();
+    }
+    eprintln!("evaluated and read back in {:.1} s", t.elapsed().as_secs_f32());
+}
+
 /// A material script compiles and renders through the graph runtime: every
 /// step and output renders, finite, and the outputs vary across the tile.
 #[test]

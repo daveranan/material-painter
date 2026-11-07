@@ -114,7 +114,7 @@ pub enum Passes {
 }
 
 pub const MAX_INPUTS: usize = 8;
-pub const MAX_PARAMS: usize = 16;
+pub const MAX_PARAMS: usize = 24;
 /// Texture slots for image and mesh map parameters.
 pub const MAX_IMAGES: usize = 4;
 /// Binding of a multi-pass node's previous pass (after inputs and images).
@@ -316,7 +316,7 @@ impl NodeDef {
     pub fn shader(&self) -> String {
         let mut s = String::new();
         s.push_str(
-            "struct NodeU {\n    p: array<vec4<f32>, 16>,\n    defaults: array<vec4<f32>, 8>,\n    // res, connected input bits, mesh map component bits (2 per slot), unused\n    info: vec4<f32>,\n};\n",
+            "struct NodeU {\n    p: array<vec4<f32>, 24>,\n    defaults: array<vec4<f32>, 8>,\n    // res, connected input bits, mesh map component bits (2 per slot), unused\n    info: vec4<f32>,\n};\n",
         );
         s.push_str("@group(0) @binding(0) var<uniform> nu: NodeU;\n@group(0) @binding(1) var samp: sampler;\n");
         for (i, inp) in self.inputs.iter().enumerate() {
