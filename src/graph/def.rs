@@ -90,6 +90,9 @@ pub struct NodeDef {
     pub source: String,
     /// A step of a preview shader rather than a texture node (`@shading`).
     pub shading: bool,
+    /// Reads its inputs' whole-image averages through `mean_<input>()`
+    /// (`@mean`); the runtime hands it mip-mapped copies of its inputs.
+    pub mean: bool,
 }
 
 pub const MAX_INPUTS: usize = 8;
@@ -210,6 +213,7 @@ pub fn parse(id: &str, source: &str) -> Result<NodeDef, String> {
         body: String::new(),
         source: source.to_string(),
         shading: false,
+        mean: false,
     };
     let mut body_start = 0;
     for (n, line) in source.lines().enumerate() {
@@ -234,6 +238,7 @@ pub fn parse(id: &str, source: &str) -> Result<NodeDef, String> {
             "input" => def.inputs.push(input(value).map_err(at)?),
             "param" => def.params.push(param(value).map_err(at)?),
             "shading" => def.shading = true,
+            "mean" => def.mean = true,
             k => return Err(at(format!("unknown tag '@{k}'"))),
         }
     }
@@ -312,6 +317,19 @@ impl NodeDef {
                 n = inp.name,
                 bit = 1u32 << i
             ));
+            if self.mean {
+                s.push_str(&format!(
+                    "fn mean_{n}() -> {ty} {{
+    if ((u32(nu.info.y) & {bit}u) != 0u) {{
+        return textureSampleLevel(t_{n}, samp, vec2<f32>(0.5), f32(textureNumLevels(t_{n}) - 1u)){pick};
+    }}
+    return nu.defaults[{i}]{pick};
+}}
+",
+                    n = inp.name,
+                    bit = 1u32 << i
+                ));
+            }
         }
         for (pi, p) in self.params.iter().enumerate() {
             let Some(slot) = self.image_slot(pi) else { continue };

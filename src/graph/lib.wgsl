@@ -110,3 +110,54 @@ fn cells(uv: vec2<f32>, scale: f32, jitter: f32, seed: f32) -> vec3<f32> {
     }
     return vec3<f32>(d1, d2, id);
 }
+
+// OKLab / OKLCH (Björn Ottosson): a perceptual space where turning hue keeps
+// lightness, which HSV doesn't. Node colors are sRGB-encoded values.
+fn srgb_to_lin(c: vec3<f32>) -> vec3<f32> {
+    let c0 = max(c, vec3<f32>(0.0));
+    return select(pow((c0 + 0.055) / 1.055, vec3<f32>(2.4)), c0 / 12.92, c0 <= vec3<f32>(0.04045));
+}
+
+fn lin_to_srgb(c: vec3<f32>) -> vec3<f32> {
+    let c0 = max(c, vec3<f32>(0.0));
+    return select(1.055 * pow(c0, vec3<f32>(1.0 / 2.4)) - 0.055, c0 * 12.92, c0 <= vec3<f32>(0.0031308));
+}
+
+fn rgb_to_oklab(srgb: vec3<f32>) -> vec3<f32> {
+    let c = srgb_to_lin(srgb);
+    let l = 0.4122214708 * c.r + 0.5363325363 * c.g + 0.0514459929 * c.b;
+    let m = 0.2119034982 * c.r + 0.6806995451 * c.g + 0.1073969566 * c.b;
+    let s = 0.0883024619 * c.r + 0.2817188376 * c.g + 0.6299787005 * c.b;
+    let r = pow(max(vec3<f32>(l, m, s), vec3<f32>(0.0)), vec3<f32>(1.0 / 3.0));
+    return vec3<f32>(
+        0.2104542553 * r.x + 0.7936177850 * r.y - 0.0040720468 * r.z,
+        1.9779984951 * r.x - 2.4285922050 * r.y + 0.4505937099 * r.z,
+        0.0259040371 * r.x + 0.7827717662 * r.y - 0.8086757660 * r.z,
+    );
+}
+
+fn oklab_to_rgb(lab: vec3<f32>) -> vec3<f32> {
+    let l = lab.x + 0.3963377774 * lab.y + 0.2158037573 * lab.z;
+    let m = lab.x - 0.1055613458 * lab.y - 0.0638541728 * lab.z;
+    let s = lab.x - 0.0894841775 * lab.y - 1.2914855480 * lab.z;
+    let l3 = l * l * l;
+    let m3 = m * m * m;
+    let s3 = s * s * s;
+    let c = vec3<f32>(
+        4.0767416621 * l3 - 3.3077115913 * m3 + 0.2309699292 * s3,
+        -1.2684380046 * l3 + 2.6097574011 * m3 - 0.3413193965 * s3,
+        -0.0041960863 * l3 - 0.7034186147 * m3 + 1.7076147010 * s3,
+    );
+    return clamp(lin_to_srgb(c), vec3<f32>(0.0), vec3<f32>(1.0));
+}
+
+// Lightness, chroma, hue in turns (0..1).
+fn rgb_to_oklch(srgb: vec3<f32>) -> vec3<f32> {
+    let lab = rgb_to_oklab(srgb);
+    return vec3<f32>(lab.x, length(lab.yz), fract(atan2(lab.z, lab.y) / 6.2831853 + 1.0));
+}
+
+fn oklch_to_rgb(lch: vec3<f32>) -> vec3<f32> {
+    let a = lch.z * 6.2831853;
+    return oklab_to_rgb(vec3<f32>(lch.x, lch.y * cos(a), lch.y * sin(a)));
+}

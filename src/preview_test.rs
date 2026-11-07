@@ -287,8 +287,8 @@ fn feature_material_export() {
     let settings = Settings {
         folder: root.clone(),
         mesh_name: "Plane".into(),
-        project_name: "Test".into(),
-        set_name: "RockMoss".into(),
+        project_name: "RockMoss".into(),
+        set_name: "Plane".into(),
         set_count: 1,
         format: Format::Png,
         depth: crate::export::Depth::U8,
@@ -387,8 +387,8 @@ fn height_blend_features() {
     let settings = Settings {
         folder: root.clone(),
         mesh_name: "Plane".into(),
-        project_name: "Test".into(),
-        set_name: "SoilGrass".into(),
+        project_name: "SoilGrass".into(),
+        set_name: "Plane".into(),
         set_count: 1,
         format: Format::Png,
         depth: crate::export::Depth::U8,
@@ -413,6 +413,140 @@ fn height_blend_features() {
     println!("  grass shows on {:.0}% of the tile, mask vs composite differ by at most {worst:.3}", shown * 100.0);
     assert!(shown > 0.2 && shown < 0.8, "height blend shows grass only where it rises: {shown}");
     assert!(worst < 0.03, "the feature mask follows the composite: off by {worst}");
+}
+
+/// The color nodes from the feature-grading workflow, on a real pre-blended
+/// scan (grass and rubble, from `MP_WORKSPACE/library/_incoming`; skipped
+/// when it isn't there): Color to Mask finds the grass, HCL Adjust turns hue
+/// without changing lightness, and the mean tools land on their targets.
+#[test]
+#[ignore]
+fn color_nodes_on_scan() {
+    use crate::graph::{Graph, Library, Runtime, Value};
+    let workspace = std::env::var("MP_WORKSPACE").map(std::path::PathBuf::from).unwrap_or_else(|_| Path::new(env!("CARGO_MANIFEST_DIR")).join(".."));
+    let scan = workspace.join("library/_incoming/grass_and_rubble_pjwey0_4k/Grass_And_Rubble_pjwey0_4K_BaseColor.jpg");
+    let soil = workspace.join("library/_incoming/soil_dirt_pkbpp20_4k/Soil_Dirt_pkbpp20_4K_BaseColor.jpg");
+    if !scan.exists() || !soil.exists() {
+        println!("  scans not found under {}: skipped", workspace.display());
+        return;
+    }
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/bake_test/color_nodes");
+    std::fs::create_dir_all(&dir).unwrap();
+    // Small copies: the nodes see 256 texels either way.
+    let small = |from: &Path, name: &str| {
+        let p = dir.join(name);
+        image::open(from).unwrap().resize_exact(256, 256, image::imageops::FilterType::Triangle).to_rgb8().save(&p).unwrap();
+        p
+    };
+    let (scan, soil) = (small(&scan, "grass_rubble.png"), small(&soil, "soil.png"));
+
+    let rs = render_state();
+    let mesh = crate::mesh::Primitive::Plane.build();
+    let gpu_mesh = GpuMesh::new(&rs.device, &mesh);
+    let engine = Engine::new(&rs, &gpu_mesh, (mesh.bounds_min, mesh.bounds_max), 64);
+    let maps = |m: usize| engine.mesh_map(m);
+    let lib = Library::load(None);
+    let mut rt = Runtime::new(&rs.device, &rs.queue);
+    let half = |b: &[u8]| {
+        let h = u16::from_le_bytes([b[0], b[1]]);
+        let (s, e, m) = ((h >> 15) as u32, ((h >> 10) & 31) as i32, (h & 1023) as f32);
+        let v = if e == 0 { m / 1024.0 * 2f32.powi(-14) } else { (1.0 + m / 1024.0) * 2f32.powi(e - 15) };
+        if s == 1 { -v } else { v }
+    };
+    let mut g = Graph::new("Color nodes");
+    g.res = 256;
+    let bitmap = |g: &mut Graph, path: &Path| {
+        let n = g.add("bitmap", [0.0; 2]);
+        g.node_mut(n).unwrap().params.insert("image".into(), Value::Image(Some(path.to_path_buf())));
+        n
+    };
+    let src = bitmap(&mut g, &scan);
+    let reference = bitmap(&mut g, &soil);
+    let mask = g.add("color_to_mask", [0.0; 2]);
+    g.connect(src, mask, "input");
+    // The scan's grass color (its greenest tenth, averaged); everything
+    // here is low-chroma olive, so the tolerance is tight.
+    g.node_mut(mask).unwrap().params.insert("color".into(), Value::Color([0.31, 0.357, 0.177]));
+    g.node_mut(mask).unwrap().params.insert("tolerance".into(), Value::Float(0.012));
+    g.node_mut(mask).unwrap().params.insert("softness".into(), Value::Float(0.01));
+    g.node_mut(mask).unwrap().params.insert("lightness_weight".into(), Value::Float(0.1));
+    let turned = g.add("hcl_adjust", [0.0; 2]);
+    g.connect(src, turned, "input");
+    g.node_mut(turned).unwrap().params.insert("hue".into(), Value::Float(0.3));
+    let flat = g.add("hcl_flatten", [0.0; 2]);
+    g.connect(src, flat, "input");
+    g.node_mut(flat).unwrap().params.insert("chroma".into(), Value::Float(1.0));
+    let matched = g.add("match_mean", [0.0; 2]);
+    g.connect(src, matched, "input");
+    g.connect(reference, matched, "reference");
+    let gray = g.add("grayscale", [0.0; 2]);
+    g.connect(src, gray, "input");
+    let level = g.add("auto_level", [0.0; 2]);
+    g.connect(gray, level, "input");
+    rt.evaluate(&rs.device, &rs.queue, &g, &lib, &maps, 0);
+    assert!(rt.errors.is_empty(), "{:?}", rt.errors);
+    let read = |n: u64| -> Vec<[f32; 3]> {
+        let bytes = read_texture(&rs.device, &rs.queue, rt.output(n).unwrap());
+        bytes.chunks(8).map(|px| [0, 1, 2].map(|j| half(&px[j * 2..]))).collect()
+    };
+    let lin = |c: f32| if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) };
+    // OKLab lightness and chroma of an sRGB color (as the nodes compute them).
+    let lab = |c: [f32; 3]| {
+        let [r, g, b] = c.map(lin);
+        let l = (0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b).max(0.0).cbrt();
+        let m = (0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b).max(0.0).cbrt();
+        let s = (0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b).max(0.0).cbrt();
+        let a = 1.9779984951 * l - 2.4285922050 * m + 0.4505937099 * s;
+        let bb = 0.0259040371 * l + 0.7827717662 * m - 0.8086757660 * s;
+        [0.2104542553 * l + 0.7936177850 * m - 0.0040720468 * s, a, bb]
+    };
+    let mean = |v: &[[f32; 3]]| v.iter().fold([0.0f32; 3], |a, c| [a[0] + c[0], a[1] + c[1], a[2] + c[2]]).map(|x| x / v.len() as f32);
+    let input = read(src);
+    let n = input.len() as f32;
+
+    let m = read(mask);
+    let covered = m.iter().map(|c| c[0]).sum::<f32>() / n;
+    let green = |c: &[f32; 3]| c[1] - (c[0] + c[2]) * 0.5;
+    let (mut g_in, mut w_in, mut g_out, mut w_out) = (0.0, 0.0, 0.0, 0.0);
+    for (c, k) in input.iter().zip(&m) {
+        g_in += green(c) * k[0];
+        w_in += k[0];
+        g_out += green(c) * (1.0 - k[0]);
+        w_out += 1.0 - k[0];
+    }
+    println!("  color to mask: {:.0}% grass; greenness inside {:.3}, outside {:.3}", covered * 100.0, g_in / w_in, g_out / w_out);
+    assert!(covered > 0.05 && covered < 0.7, "grass coverage {covered}");
+    assert!(g_in / w_in > g_out / w_out + 0.03, "the mask picks greener texels");
+
+    let t = read(turned);
+    let dl = input.iter().zip(&t).map(|(a, b)| (lab(*a)[0] - lab(*b)[0]).abs()).sum::<f32>() / n;
+    println!("  hcl adjust: hue turned 0.3, mean lightness change {dl:.4}");
+    assert!(dl < 0.02, "turning hue keeps lightness: {dl}");
+
+    let chroma = |v: &[[f32; 3]]| {
+        let cs: Vec<f32> = v.iter().map(|c| { let l = lab(*c); (l[1] * l[1] + l[2] * l[2]).sqrt() }).collect();
+        let mu = cs.iter().sum::<f32>() / cs.len() as f32;
+        (cs.iter().map(|c| (c - mu) * (c - mu)).sum::<f32>() / cs.len() as f32).sqrt()
+    };
+    let (c_in, c_flat) = (chroma(&input), chroma(&read(flat)));
+    println!("  hcl flatten: chroma spread {c_in:.4} -> {c_flat:.4}");
+    assert!(c_flat < c_in * 0.25, "chroma flattened");
+
+    let (want, got) = (lab(mean(&read(reference))), lab(mean(&read(matched))));
+    println!("  match mean: reference L {:.3} a {:.3} b {:.3}, matched L {:.3} a {:.3} b {:.3}", want[0], want[1], want[2], got[0], got[1], got[2]);
+    assert!((want[0] - got[0]).abs() < 0.03 && (want[1] - got[1]).abs() < 0.015 && (want[2] - got[2]).abs() < 0.015, "means match");
+
+    let lv = mean(&read(level))[0];
+    println!("  auto level: mean {lv:.3}");
+    assert!((lv - 0.5).abs() < 0.03, "balanced around mid grey: {lv}");
+
+    let mut sheet = image::RgbImage::new(256 * 3, 256);
+    for (k, v) in [input, m, t].iter().enumerate() {
+        for (i, c) in v.iter().enumerate() {
+            sheet.put_pixel(k as u32 * 256 + (i % 256) as u32, (i / 256) as u32, image::Rgb(c.map(|x| (x.clamp(0.0, 1.0) * 255.0) as u8)));
+        }
+    }
+    sheet.save(dir.join("sheet.png")).unwrap();
 }
 
 /// A stroke across the rounded cube with each brush projection (and once

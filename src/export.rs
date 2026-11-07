@@ -296,12 +296,12 @@ pub fn builtin_templates() -> Vec<Template> {
         ),
         // Feature-graded game materials (one grading per feature, as in
         // Helldivers 2's terrain): color and height, then the DirectX normal
-        // and two feature masks; `$set.material.json` names the features.
+        // and two feature masks; `$project.material.json` names the features.
         t(
             "Game material (features)",
             vec![
-                OutputMap::packed("$set_ColorHeight", Layout::Rgba, [Chan::of(BaseColor, 0), Chan::of(BaseColor, 1), Chan::of(BaseColor, 2), Chan::of(Height, 0)]),
-                OutputMap::packed("$set_NormalMasks", Layout::Rgba, [Chan::of(NormalDx, 0), Chan::of(NormalDx, 1), Chan::of(Features, 0), Chan::of(Features, 1)]),
+                OutputMap::packed("$project_ColorHeight", Layout::Rgba, [Chan::of(BaseColor, 0), Chan::of(BaseColor, 1), Chan::of(BaseColor, 2), Chan::of(Height, 0)]),
+                OutputMap::packed("$project_NormalMasks", Layout::Rgba, [Chan::of(NormalDx, 0), Chan::of(NormalDx, 1), Chan::of(Features, 0), Chan::of(Features, 1)]),
             ],
         ),
         t(
@@ -955,6 +955,13 @@ pub fn export(s: &Snapshot, template: &Template, settings: &Settings) -> Result<
     Ok(files)
 }
 
+/// The material's name: the project's, with the texture set's when the
+/// document has several (as the maps' file names get it).
+fn manifest_stem(settings: &Settings) -> String {
+    let name = if settings.set_count > 1 { format!("{}_{}", settings.project_name, settings.set_name) } else { settings.project_name.clone() };
+    name.chars().map(|c| if r#"\/:*?"<>|"#.contains(c) { '_' } else { c }).collect()
+}
+
 /// Resizes every channel on its own. `imageops::resize` weights color by
 /// alpha, which bleeds packed data (a mask, smoothness) in the alpha channel
 /// into the color channels.
@@ -973,7 +980,7 @@ fn resize_straight(img: &ImageBuffer<Rgba<f32>, Vec<f32>>, size: u32, filter: im
     })
 }
 
-/// `$set.material.json` beside a feature export: the features by slot, the
+/// `$project.material.json` (`$project_$set` with several texture sets) beside a feature export: the features by slot, the
 /// size the textures stand for, and what each file's channels hold, so a game
 /// can set the material up from the files alone.
 fn write_manifest(template: &Template, settings: &Settings, f: &Features, size: u32) -> Result<PathBuf, String> {
@@ -999,7 +1006,7 @@ fn write_manifest(template: &Template, settings: &Settings, f: &Features, size: 
     let v = json!({
         "format": "material-painter/feature-material",
         "version": 1,
-        "name": settings.set_name,
+        "name": manifest_stem(settings),
         "features": {"main": f.names[0], "mask1": f.names[1], "mask2": f.names[2]},
         // Rounded so the file reads as typed (f32 noise otherwise).
         "tile_m": (f.tile_m as f64 * 1e4).round() / 1e4,
@@ -1007,8 +1014,7 @@ fn write_manifest(template: &Template, settings: &Settings, f: &Features, size: 
         "size": size,
         "maps": maps,
     });
-    let stem: String = settings.set_name.chars().map(|c| if r#"\/:*?"<>|"#.contains(c) { '_' } else { c }).collect();
-    let path = settings.folder.join(format!("{stem}.material.json"));
+    let path = settings.folder.join(format!("{}.material.json", manifest_stem(settings)));
     let text = serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?;
     std::fs::write(&path, text).map_err(|e| format!("Failed to write {}: {e}", path.display()))?;
     Ok(path)

@@ -262,8 +262,22 @@ with color, roughness, height, normal), let upper scans rise through by
 height (`height_blend`), name the features and tag the layers in the project
 JSON (see `references/project-json.md`, "Feature materials"), then export
 with the "Game material (features)" template. The game loads the folder from
-`<set>.material.json`. Pre-blended scans (grass and rubble in one) can't be
-split yet: pick simple scans.
+`<project>.material.json`. Preview relief with `preview_settings displacement=0.05`
+(parallax only; the textures don't change).
+
+Color tools in Material Designer (the talk's workflow for scans):
+- **Color to Mask**: pulls a feature out of a pre-blended scan by color
+  (OKLab distance). Scans are low-chroma: features often differ by only
+  0.02-0.04, so start with tolerance ~0.015 and lightness weight ~0.1, and key
+  on the feature's measured average color, not a guess. Use the graph's Mask
+  output as the layer mask of a fill tagged with that feature.
+- **HCL Adjust / HCL Split / HCL Merge**: OKLCH; turning hue keeps lightness.
+- **HCL Flatten**: pull lightness, chroma and hue toward the image average
+  (make a scan bland enough to grade).
+- **Match Mean**: move a scan's average color onto a reference's, keeping its
+  variation (two scans of one feature, one color).
+- **Auto Level Balance**: average a grey map to mid grey (noise, roughness;
+  never height).
 
 ## Gaps, and what to do instead
 - **No emissive**: lights and engines are bright low-roughness color; say so.

@@ -81,9 +81,9 @@ where it is. Export with the "Game material (features)" template.
 Mask 1 and 2 are where each feature *shows* after layers above cover it
 (they sum to at most 1; main is the rest). Put the crevice feature in mask1:
 the game derives AO from it. `mp export_textures folder=DIR preset="Game
-material (features)" size=1024` writes `<set>_ColorHeight.png` (sRGB color,
-height in A), `<set>_NormalMasks.png` (DirectX normal XY, mask1, mask2) and
-`<set>.material.json` (feature names, tile and relief in metres, and what
+material (features)" size=1024` writes `<project>_ColorHeight.png` (sRGB color,
+height in A), `<project>_NormalMasks.png` (DirectX normal XY, mask1, mask2) and
+`<project>.material.json` (feature names, tile and relief in metres, and what
 every channel holds).
 
 ## Files

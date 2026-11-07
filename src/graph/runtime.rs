@@ -46,10 +46,17 @@ const BLIT: &str = "
 fn fs_blit(in: FsOut) -> @location(0) vec4<f32> {
     return vec4<f32>(clamp(textureSampleLevel(src, smp, in.uv, 0.0).rgb, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
 }
+// One mip level from the one above: bilinear at the center of each 2x2 block.
+@fragment
+fn fs_down(in: FsOut) -> @location(0) vec4<f32> {
+    return textureSampleLevel(src, smp, in.uv, 0.0);
+}
 ";
 
 pub struct Runtime {
     blit: wgpu::RenderPipeline,
+    /// Downsamples one level of a mip chain into the next (`@mean` inputs).
+    down: wgpu::RenderPipeline,
     blit_bgl: wgpu::BindGroupLayout,
     bgl: wgpu::BindGroupLayout,
     layout: wgpu::PipelineLayout,
@@ -104,10 +111,12 @@ impl Runtime {
             &gpu::layout(device, &blit_bgl),
             &[gpu::target(wgpu::TextureFormat::Rgba8Unorm)],
         );
+        let down = gpu::fullscreen_pipeline(device, "graph mip", &blit_module, "fs_down", &gpu::layout(device, &blit_bgl), &[gpu::target(FORMAT)]);
         let dummy = Tex::new(device, "graph dummy", 1, 1, FORMAT, LAYER_USAGE);
         queue.write_texture(dummy.copy_info(), bytemuck::cast_slice(&[0u16; 4]), Default::default(), dummy.extent());
         Runtime {
             blit,
+            down,
             blit_bgl,
             bgl,
             layout,
@@ -245,6 +254,31 @@ impl Runtime {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// A copy of `src` with a full mip chain, down to 1x1: its last level is
+    /// the whole image's average (`mean_<input>()` in `@mean` nodes).
+    fn mipped(&self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder, src: &Tex) -> Tex {
+        let mips = 32 - src.width.max(src.height).leading_zeros();
+        let t = Tex::new_mipped(device, "graph mean", src.width, src.height, FORMAT, LAYER_USAGE, mips);
+        encoder.copy_texture_to_texture(src.copy_info(), t.copy_info(), src.extent());
+        for level in 1..mips {
+            let from = t.mip_view(level - 1, false);
+            let to = t.mip_view(level, false);
+            let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("graph mip"),
+                layout: &self.blit_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&from) },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                ],
+            });
+            let mut pass = gpu::pass(encoder, "graph mip", &[gpu::color_attachment(&to, wgpu::LoadOp::Clear(wgpu::Color::BLACK))]);
+            pass.set_pipeline(&self.down);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        t
+    }
+
     fn render(
         &mut self,
         device: &wgpu::Device,
@@ -295,7 +329,13 @@ impl Runtime {
                 usage: wgpu::BufferUsages::UNIFORM,
             })
         };
-        let input_tex: Vec<Option<Arc<Tex>>> = inputs.iter().map(|i| i.and_then(|f| self.rendered.get(&f).map(|r| r.tex.clone()))).collect();
+        let mut input_tex: Vec<Option<Arc<Tex>>> = inputs.iter().map(|i| i.and_then(|f| self.rendered.get(&f).map(|r| r.tex.clone()))).collect();
+        // Nodes that read whole-image averages get their inputs with mips.
+        if def.mean {
+            for t in input_tex.iter_mut().flatten() {
+                *t = Arc::new(self.mipped(device, encoder, t));
+            }
+        }
         // A fresh texture each time: layers may still hold the previous one.
         let out = Arc::new(Tex::new(device, &def.id, res, res, FORMAT, LAYER_USAGE));
         {
