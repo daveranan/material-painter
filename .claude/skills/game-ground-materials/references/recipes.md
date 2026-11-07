@@ -1,5 +1,8 @@
 # Recipes: Substance techniques in Material Painter
 
+Write these as material scripts (`material-painter-agent/references/
+material-script.md`): every MP node below is a call, `name = ...` per step.
+
 Material Designer graphs live in the project JSON under `"graphs"`
 (`{"id": 1, "graph": {"name", "res", "nodes": [{"id", "def", "params",
 "links": {"input": node_id}}]}}`); a fill uses one with `"graph": 1` and a

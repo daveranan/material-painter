@@ -538,6 +538,14 @@ pub fn tool_list() -> Vec<Value> {
                 "padding": {"type": "string", "description": "none, infinite, transparent or dilate:<pixels> (default infinite)"}
             }), &["folder"]),
         ),
+        tool(
+            "script_step",
+            "Render one named step of a material script graph as a PNG (the step's own output, at the graph's size), to review a script line by line. Without 'step', lists the script graphs and their steps.",
+            schema(json!({
+                "graph": {"type": "integer", "description": "Graph id (the project's 'graphs' entry); default: the only script graph"},
+                "step": {"type": "string", "description": "A name assigned in the script, e.g. 'stones'"}
+            }), &[]),
+        ),
     ]
 }
 

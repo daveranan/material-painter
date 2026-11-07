@@ -473,6 +473,37 @@ impl PainterApp {
         }
     }
 
+    /// Script graphs and their named steps.
+    pub(super) fn script_graphs(&self) -> Vec<(u64, Vec<String>)> {
+        self.graphs.docs.iter().filter(|d| d.graph.script.is_some()).map(|d| (d.id, d.graph.steps.iter().map(|(n, _)| n.clone()).collect())).collect()
+    }
+
+    /// One named step of a script graph, rendered now, as RGBA8 (values as
+    /// stored: colors sRGB-encoded, greys as is, clamped to 0..1).
+    pub(super) fn graph_step_rgba(&mut self, id: u64, step: &str) -> Result<(Vec<u8>, u32), String> {
+        let maps_version = self.engine.maps_version;
+        let d = self.graphs.docs.iter_mut().find(|d| d.id == id).ok_or(format!("no graph {id}"))?;
+        let node = d.graph.steps.iter().find(|(n, _)| n == step).map(|(_, node)| *node).ok_or_else(|| {
+            let names: Vec<&str> = d.graph.steps.iter().map(|(n, _)| n.as_str()).collect();
+            format!("graph {id} has no step '{step}' (steps: {})", names.join(", "))
+        })?;
+        {
+            let engine = &self.engine;
+            let maps = |m: usize| engine.mesh_map(m);
+            d.rt.evaluate(&self.rs.device, &self.rs.queue, &d.graph, &self.graphs.lib, &maps, maps_version);
+        }
+        if let Some(e) = d.rt.errors.get(&node) {
+            return Err(format!("step '{step}' failed: {e}"));
+        }
+        let tex = d.rt.output(node).ok_or(format!("step '{step}' rendered nothing"))?;
+        let raw = crate::gpu::read_texture(&self.rs.device, &self.rs.queue, tex);
+        let rgba = raw.chunks_exact(8).flat_map(|px| {
+            let c = [0, 1, 2, 3].map(|k| half_to_f32([px[k * 2], px[k * 2 + 1]]));
+            [c[0], c[1], c[2], 1.0].map(|v| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8)
+        });
+        Ok((rgba.collect(), tex.width))
+    }
+
     /// Texture sets not being edited keep the graph outputs they had; one
     /// that has none yet (an opened project) gets them rendered on its own
     /// mesh maps.

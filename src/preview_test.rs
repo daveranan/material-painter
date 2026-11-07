@@ -549,6 +549,49 @@ fn color_nodes_on_scan() {
     sheet.save(dir.join("sheet.png")).unwrap();
 }
 
+/// A material script compiles and renders through the graph runtime: every
+/// step and output renders, finite, and the outputs vary across the tile.
+#[test]
+#[ignore]
+fn material_script_renders() {
+    use crate::graph::{Library, Runtime};
+    let src = "
+size 256
+sand = noise(perlin, scale=3, seed=1) * 0.7 + noise(turbulence, scale=48, seed=3) * 0.1
+fn pebbles(count, seed) {
+  return tile_sampler(disc, columns=count, rows=count, size_random=0.5, gaps=0.3, seed=seed) | blur(1.5)
+}
+stones = max(pebbles(10, 7) * 0.5, pebbles(24, 9) * 0.3)
+height = max(sand, stones + blur(sand, radius=8) * 0.8)
+mask = height - sand | histogram_scan(position=0.02, contrast=0.95)
+color = mix(gradient_map(sand), #8b867c, mask)
+output base_color = color
+output height = height
+output mask = mask
+";
+    let lib = Library::load(None);
+    let g = crate::graph::script::compile(src, &lib, None).expect("compiles");
+    let rs = render_state();
+    let mesh = crate::mesh::Primitive::Plane.build();
+    let gpu_mesh = GpuMesh::new(&rs.device, &mesh);
+    let engine = Engine::new(&rs, &gpu_mesh, (mesh.bounds_min, mesh.bounds_max), 64);
+    let maps = |m: usize| engine.mesh_map(m);
+    let mut rt = Runtime::new(&rs.device, &rs.queue);
+    rt.evaluate(&rs.device, &rs.queue, &g, &lib, &maps, 0);
+    assert!(rt.errors.is_empty(), "{:?}", rt.errors);
+    let half = |b: &[u8]| crate::gpu::f16_to_f32(u16::from_le_bytes([b[0], b[1]]));
+    for (name, node) in &g.steps {
+        let bytes = read_texture(&rs.device, &rs.queue, rt.output(*node).unwrap_or_else(|| panic!("{name} rendered nothing")));
+        let reds: Vec<f32> = bytes.chunks(8).map(|px| half(&px[0..2])).collect();
+        assert!(reds.iter().all(|v| v.is_finite()), "{name}: non-finite");
+        let (lo, hi) = reds.iter().fold((f32::MAX, f32::MIN), |(l, h), v| (l.min(*v), h.max(*v)));
+        println!("  {name:<8} {lo:.3}..{hi:.3}");
+        assert!(hi - lo > 0.05, "{name} is flat");
+    }
+    let outs = g.outputs(&lib);
+    assert!(outs[0].is_some() && outs[3].is_some() && outs[4].is_some(), "base color, height and mask outputs");
+}
+
 /// A stroke across the rounded cube with each brush projection (and once
 /// with grain), then every fill projection: each must put paint on the mesh
 /// and comparable amounts of it. Frames go to `target/bake_test/paint/`.

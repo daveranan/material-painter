@@ -84,6 +84,9 @@ forms read at the brief's camera distances. In MP: a Plane, Displacement
   material that only looks right at 1x has a seam or a stand-out feature
   the eye will find repeating in game.
 
+Write each element's height, masks and color as a **material script**
+(`material-painter-agent/references/material-script.md`) and review it with
+`mp script_step step=<name>` after every change: height steps first.
 In MP the stack is: one fill per element on a Plane, `height_blend` 0.02-0.1
 on each element that should rise through, masks from Designer graphs or
 smart masks, each layer tagged with its feature. Within a Designer graph,
@@ -174,11 +177,8 @@ that unlocks the most:
    stone layer around the last (AO/shadow of the previous layer as mask).
 7. **Normal to Height, Shadows, Facing Normal**, world-unit normal and AO.
 
-And the authoring format (planned): a **material script**, plain text
-with one named step per line (`stones = tile_sampler(...) | blur(2)`), as
-the source of truth instead of node JSON. It compiles onto the same GPU
-ops, the Designer canvas becomes a view of it, and any named step can be
-rendered on its own for review.
+Each new node becomes callable from material scripts as soon as it exists
+(the script language calls any node by its id).
 
 ## Gaps in MP today and what to do instead
 

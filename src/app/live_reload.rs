@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
 /// Manifest keys whose string values are data-folder paths.
-const FILE_KEYS: [&str; 6] = ["blob", "data", "vertices", "indices", "tri_object", "tri_color"];
+const FILE_KEYS: [&str; 7] = ["blob", "data", "vertices", "indices", "tri_object", "tri_color", "script_file"];
 
 #[derive(Default)]
 pub(super) struct LiveProject {

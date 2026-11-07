@@ -6,6 +6,7 @@ pub mod builtin;
 pub mod def;
 pub mod presets;
 pub(crate) mod runtime;
+pub mod script;
 pub mod shading;
 
 pub use def::{Kind, NodeDef, ParamKind, Value};
@@ -40,11 +41,27 @@ pub struct Graph {
     pub next_id: u64,
     /// Parameters shown in the layer properties: (node, parameter name).
     pub exposed: Vec<(u64, String)>,
+    /// The material script this graph was compiled from (see [`script`]),
+    /// saved instead of the nodes while the nodes still match it.
+    pub script: Option<String>,
+    /// Where the script lives, relative to a text project's data folder.
+    pub script_file: Option<String>,
+    /// The script's named steps and the node each ended at.
+    pub steps: Vec<(String, u64)>,
 }
 
 impl Graph {
     pub fn new(name: &str) -> Graph {
-        Graph { name: name.to_string(), res: 1024, nodes: Vec::new(), next_id: 1, exposed: Vec::new() }
+        Graph {
+            name: name.to_string(),
+            res: 1024,
+            nodes: Vec::new(),
+            next_id: 1,
+            exposed: Vec::new(),
+            script: None,
+            script_file: None,
+            steps: Vec::new(),
+        }
     }
 
     /// A starter graph: noise through a gradient map into base color, and
@@ -163,6 +180,16 @@ impl Graph {
     }
 
     pub fn to_json(&self, lib: &Library) -> Json {
+        // A script graph saves its script while the nodes still match it
+        // (positions aside); edited on the canvas, it saves its nodes.
+        if let Some(src) = &self.script {
+            if script::compile(src, lib, None).is_ok_and(|g| g.res == self.res && same_nodes(&g, self)) {
+                return match &self.script_file {
+                    Some(f) => json!({"name": self.name, "script_file": f}),
+                    None => json!({"name": self.name, "script": src}),
+                };
+            }
+        }
         let nodes: Vec<Json> = self
             .nodes
             .iter()
@@ -187,6 +214,21 @@ impl Graph {
     /// Reads a graph; parameters are typed by the definitions in `lib`
     /// (values of unknown nodes or parameters are dropped).
     pub fn from_json(v: &Json, lib: &Library) -> Result<Graph, String> {
+        Self::from_json_in(v, lib, None)
+    }
+
+    /// Reads a graph; a script graph (`"script"`) compiles, with relative
+    /// image paths found in `base`.
+    pub fn from_json_in(v: &Json, lib: &Library, base: Option<&Path>) -> Result<Graph, String> {
+        if let Some(src) = v["script"].as_str() {
+            let mut g = script::compile(src, lib, base)?;
+            if let Some(name) = v["name"].as_str() {
+                g.name = name.to_string();
+            }
+            g.script = Some(src.to_string());
+            g.script_file = v["script_file"].as_str().map(str::to_string);
+            return Ok(g);
+        }
         let mut g = Graph::new(v["name"].as_str().unwrap_or("Graph"));
         g.res = v["res"].as_u64().map_or(1024, |r| (r as u32).clamp(64, 4096));
         for n in v["nodes"].as_array().ok_or("graph has no nodes list")? {
@@ -267,6 +309,12 @@ pub struct Library {
     /// User node file → parse error.
     pub errors: Vec<(PathBuf, String)>,
     pub user_dir: Option<PathBuf>,
+}
+
+/// The same nodes, links and parameters (positions aside).
+fn same_nodes(a: &Graph, b: &Graph) -> bool {
+    a.nodes.len() == b.nodes.len()
+        && a.nodes.iter().zip(&b.nodes).all(|(x, y)| x.id == y.id && x.def == y.def && x.params == y.params && x.links == y.links)
 }
 
 impl Library {

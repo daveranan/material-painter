@@ -162,6 +162,19 @@ impl Writer {
     }
 }
 
+/// A project's graph entry: node graphs as saved, script graphs compiled,
+/// with a `script_file` read from the data folder (where relative image
+/// paths in the script are found too).
+fn graph_from(r: &Reader, gv: &Value, lib: &crate::graph::Library) -> Result<crate::graph::Graph, String> {
+    let mut g = gv["graph"].clone();
+    if let Some(rel) = g["script_file"].as_str() {
+        let bytes = r.blob(&json!(rel))?;
+        let text = String::from_utf8(bytes).map_err(|_| format!("{rel} isn't text"))?;
+        g["script"] = json!(text);
+    }
+    crate::graph::Graph::from_json_in(&g, lib, r.dir.as_deref())
+}
+
 struct Reader {
     blobs: Vec<Vec<u8>>,
     /// Text projects: where blob paths point.
@@ -1208,7 +1221,7 @@ impl PainterApp {
             let mut graphs = Vec::new();
             for gv in manifest["graphs"].as_array().into_iter().flatten() {
                 let id = gv["id"].as_u64().ok_or("graphs: entry without an 'id'")?;
-                graphs.push((id, crate::graph::Graph::from_json(&gv["graph"], &self.graphs.lib).map_err(|e| format!("graph {id}: {e}"))?));
+                graphs.push((id, graph_from(&r, gv, &self.graphs.lib).map_err(|e| format!("graph {id}: {e}"))?));
             }
             self.graphs.clear(&self.rs);
             for (id, g) in graphs {
@@ -1315,7 +1328,7 @@ impl PainterApp {
         self.graphs.clear(&self.rs);
         for gv in manifest["graphs"].as_array().into_iter().flatten() {
             let Some(id) = gv["id"].as_u64() else { continue };
-            match crate::graph::Graph::from_json(&gv["graph"], &self.graphs.lib) {
+            match graph_from(&r, gv, &self.graphs.lib) {
                 Ok(g) => {
                     self.graphs.insert(&self.rs, g, Some(id));
                 }

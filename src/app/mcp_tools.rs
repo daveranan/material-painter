@@ -1061,6 +1061,20 @@ impl PainterApp {
                 }))
             }
             "screenshot_app" => Reply::AfterScreenshot,
+            "script_step" => {
+                let scripts: Vec<(u64, Vec<String>)> = self.script_graphs();
+                let id = match args.get("graph").and_then(Value::as_u64) {
+                    Some(id) => id,
+                    None if scripts.len() == 1 => scripts[0].0,
+                    None => return Ok(json_text(json!({"script_graphs": scripts.iter().map(|(id, s)| json!({"graph": id, "steps": s})).collect::<Vec<_>>()}))),
+                };
+                let Some(step) = str_arg(args, "step") else {
+                    let steps = scripts.iter().find(|(g, _)| *g == id).map(|(_, s)| s.clone()).ok_or(format!("graph {id} isn't a script graph"))?;
+                    return Ok(json_text(json!({"graph": id, "steps": steps})));
+                };
+                let (rgba, size) = self.graph_step_rgba(id, step)?;
+                Reply::Now(png(&rgba, size, size).map(|p| vec![Out::Png(p)]))
+            }
             "export_textures" => {
                 let folder = str_arg(args, "folder").ok_or("missing 'folder'")?;
                 let template = match str_arg(args, "preset") {
