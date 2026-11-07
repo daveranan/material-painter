@@ -2,7 +2,7 @@
 //! texture per node. A node only re-renders when its definition, its
 //! parameters or anything upstream changed (tracked by a hash).
 
-use super::def::{self, MAX_IMAGES, MAX_INPUTS, NodeDef, ParamKind, Value};
+use super::def::{self, MAX_IMAGES, MAX_INPUTS, NodeDef, PREV_BINDING, ParamKind, Passes, Value};
 use super::{Graph, Library};
 use crate::gpu::{self, LAYER_USAGE, Tex};
 use eframe::wgpu;
@@ -51,12 +51,31 @@ fn fs_blit(in: FsOut) -> @location(0) vec4<f32> {
 fn fs_down(in: FsOut) -> @location(0) vec4<f32> {
     return textureSampleLevel(src, smp, in.uv, 0.0);
 }
+// Stats of a grey image down a mip chain: min in r, max in g, average in b
+// (level 0 holds the grey in all three).
+@fragment
+fn fs_down_stats(in: FsOut) -> @location(0) vec4<f32> {
+    let n = vec2<i32>(textureDimensions(src));
+    let o = vec2<i32>(in.pos.xy) * 2;
+    var lo = 1e30;
+    var hi = -1e30;
+    var sum = 0.0;
+    for (var k = 0; k < 4; k++) {
+        let t = textureLoad(src, min(o + vec2<i32>(k % 2, k / 2), n - 1), 0);
+        lo = min(lo, t.r);
+        hi = max(hi, t.g);
+        sum += t.b;
+    }
+    return vec4<f32>(lo, hi, sum * 0.25, 1.0);
+}
 ";
 
 pub struct Runtime {
     blit: wgpu::RenderPipeline,
     /// Downsamples one level of a mip chain into the next (`@mean` inputs).
     down: wgpu::RenderPipeline,
+    /// The same, keeping min, max and average (`@minmax` inputs).
+    down_stats: wgpu::RenderPipeline,
     blit_bgl: wgpu::BindGroupLayout,
     bgl: wgpu::BindGroupLayout,
     layout: wgpu::PipelineLayout,
@@ -96,6 +115,7 @@ impl Runtime {
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> Runtime {
         let mut entries = vec![gpu::uniform_entry(0, false), gpu::sampler_entry(1)];
         entries.extend((0..(MAX_INPUTS + MAX_IMAGES) as u32).map(|i| gpu::tex_entry(2 + i, true)));
+        entries.push(gpu::tex_entry(PREV_BINDING as u32, true));
         let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("graph node"), entries: &entries });
         let layout = gpu::layout(device, &bgl);
         let blit_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -112,11 +132,14 @@ impl Runtime {
             &[gpu::target(wgpu::TextureFormat::Rgba8Unorm)],
         );
         let down = gpu::fullscreen_pipeline(device, "graph mip", &blit_module, "fs_down", &gpu::layout(device, &blit_bgl), &[gpu::target(FORMAT)]);
+        let down_stats =
+            gpu::fullscreen_pipeline(device, "graph stats", &blit_module, "fs_down_stats", &gpu::layout(device, &blit_bgl), &[gpu::target(FORMAT)]);
         let dummy = Tex::new(device, "graph dummy", 1, 1, FORMAT, LAYER_USAGE);
         queue.write_texture(dummy.copy_info(), bytemuck::cast_slice(&[0u16; 4]), Default::default(), dummy.extent());
         Runtime {
             blit,
             down,
+            down_stats,
             blit_bgl,
             bgl,
             layout,
@@ -256,7 +279,7 @@ impl Runtime {
     #[allow(clippy::too_many_arguments)]
     /// A copy of `src` with a full mip chain, down to 1x1: its last level is
     /// the whole image's average (`mean_<input>()` in `@mean` nodes).
-    fn mipped(&self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder, src: &Tex) -> Tex {
+    fn mipped(&self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder, src: &Tex, stats: bool) -> Tex {
         let mips = 32 - src.width.max(src.height).leading_zeros();
         let t = Tex::new_mipped(device, "graph mean", src.width, src.height, FORMAT, LAYER_USAGE, mips);
         encoder.copy_texture_to_texture(src.copy_info(), t.copy_info(), src.extent());
@@ -272,7 +295,7 @@ impl Runtime {
                 ],
             });
             let mut pass = gpu::pass(encoder, "graph mip", &[gpu::color_attachment(&to, wgpu::LoadOp::Clear(wgpu::Color::BLACK))]);
-            pass.set_pipeline(&self.down);
+            pass.set_pipeline(if stats { &self.down_stats } else { &self.down });
             pass.set_bind_group(0, &bg, &[]);
             pass.draw(0..3, 0..1);
         }
@@ -331,14 +354,41 @@ impl Runtime {
         };
         let mut input_tex: Vec<Option<Arc<Tex>>> = inputs.iter().map(|i| i.and_then(|f| self.rendered.get(&f).map(|r| r.tex.clone()))).collect();
         // Nodes that read whole-image averages get their inputs with mips.
-        if def.mean {
+        if def.mean || def.minmax {
             for t in input_tex.iter_mut().flatten() {
-                *t = Arc::new(self.mipped(device, encoder, t));
+                *t = Arc::new(self.mipped(device, encoder, t, def.minmax));
             }
         }
-        // A fresh texture each time: layers may still hold the previous one.
-        let out = Arc::new(Tex::new(device, &def.id, res, res, FORMAT, LAYER_USAGE));
-        {
+        let passes = match &def.passes {
+            Passes::One => 1,
+            Passes::Log2 => 32 - res.max(2).leading_zeros() + 1,
+            Passes::Fixed(n) => *n,
+            Passes::Param(name) => {
+                let i = def.params.iter().position(|p| &p.name == name).ok_or(format!("@passes names no parameter '{name}'"))?;
+                match values[i] {
+                    Value::Int(n) => n.clamp(1, 1024) as u32,
+                    _ => return Err(format!("@passes parameter '{name}' must be an int")),
+                }
+            }
+        };
+        let mut prev: Option<Arc<Tex>> = None;
+        for pass_i in 0..passes {
+            // A fresh texture each pass: layers may still hold the previous one.
+            let tex = Arc::new(Tex::new(device, &def.id, res, res, FORMAT, LAYER_USAGE));
+            let pass_buf;
+            let ubuf = if passes == 1 {
+                &ubuf
+            } else {
+                let mut pu = u;
+                pu.info[3] = (pass_i + passes * 4096) as f32;
+                use wgpu::util::DeviceExt;
+                pass_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("graph node pass"),
+                    contents: bytemuck::bytes_of(&pu),
+                    usage: wgpu::BufferUsages::UNIFORM,
+                });
+                &pass_buf
+            };
             let mut entries = vec![
                 wgpu::BindGroupEntry { binding: 0, resource: ubuf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
@@ -358,12 +408,18 @@ impl Runtime {
                     resource: wgpu::BindingResource::TextureView(view),
                 });
             }
+            entries.push(wgpu::BindGroupEntry {
+                binding: PREV_BINDING as u32,
+                resource: wgpu::BindingResource::TextureView(prev.as_ref().map_or(&self.dummy.view, |t| &t.view)),
+            });
             let bg = device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("graph node"), layout: &self.bgl, entries: &entries });
-            let mut pass = gpu::pass(encoder, "graph node", &[gpu::color_attachment(&out.view, wgpu::LoadOp::Clear(wgpu::Color::BLACK))]);
+            let mut pass = gpu::pass(encoder, "graph node", &[gpu::color_attachment(&tex.view, wgpu::LoadOp::Clear(wgpu::Color::BLACK))]);
             pass.set_pipeline(&pipeline);
             pass.set_bind_group(0, &bg, &[]);
             pass.draw(0..3, 0..1);
+            drop(pass);
+            prev = Some(tex);
         }
-        Ok(out)
+        prev.ok_or_else(|| "no passes".to_string())
     }
 }

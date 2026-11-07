@@ -592,6 +592,63 @@ output mask = mask
     assert!(outs[0].is_some() && outs[3].is_some() && outs[4].is_some(), "base color, height and mask outputs");
 }
 
+/// The multi-pass nodes on inputs with known answers: Distance from dots on
+/// a 4×4 grid (0 at a dot, a quarter cell's diagonal between), Flood Fill
+/// giving every disc one value and neighbours different ones, Auto Levels
+/// stretching to the full range.
+#[test]
+#[ignore]
+fn multipass_nodes_measure() {
+    use crate::graph::{Library, Runtime};
+    let lib = Library::load(None);
+    let src = "
+size 256
+dots = tile_sampler(square, columns=4, rows=4, size=0.04, size_random=0, position_random=0, rotation_random=0, brightness_random=0)
+dist = distance(dots, mode=distance, max_distance=0.5)
+discs = tile_sampler(disc, columns=4, rows=4, size=0.6, size_random=0, position_random=0, brightness_random=0)
+ids = flood_fill(discs, iterations=64) | flood_fill_to(random)
+leveled = auto_levels(dots * 0.3 + 0.2)
+";
+    let g = crate::graph::script::compile(src, &lib, None).expect("compiles");
+    let rs = render_state();
+    let mesh = crate::mesh::Primitive::Plane.build();
+    let gpu_mesh = GpuMesh::new(&rs.device, &mesh);
+    let engine = Engine::new(&rs, &gpu_mesh, (mesh.bounds_min, mesh.bounds_max), 64);
+    let maps = |m: usize| engine.mesh_map(m);
+    let mut rt = Runtime::new(&rs.device, &rs.queue);
+    rt.evaluate(&rs.device, &rs.queue, &g, &lib, &maps, 0);
+    assert!(rt.errors.is_empty(), "{:?}", rt.errors);
+    let half = |b: &[u8]| crate::gpu::f16_to_f32(u16::from_le_bytes([b[0], b[1]]));
+    let read = |step: &str| -> Vec<f32> {
+        let node = g.steps.iter().find(|(n, _)| n == step).unwrap().1;
+        read_texture(&rs.device, &rs.queue, rt.output(node).unwrap()).chunks(8).map(|px| half(&px[0..2])).collect()
+    };
+    let at = |v: &[f32], u: f32, w: f32| v[(w * 256.0) as usize * 256 + (u * 256.0) as usize];
+
+    // Dots sit at cell centres (0.125 + k/4); the midpoint between four dots
+    // is 0.125·√2 ≈ 0.177 uv from each, 0.354 of max_distance 0.5.
+    let dist = read("dist");
+    let (on_dot, between, edge) = (at(&dist, 0.125, 0.125), at(&dist, 0.25, 0.25), at(&dist, 0.25, 0.125));
+    println!("  distance: on a dot {on_dot:.3}, between four {between:.3}, between two {edge:.3}");
+    assert!(on_dot < 0.03, "zero at a dot: {on_dot}");
+    assert!((between - 0.354).abs() < 0.03, "diagonal midpoint: {between}");
+    assert!((edge - 0.25).abs() < 0.03, "edge midpoint: {edge}");
+
+    let ids = read("ids");
+    let centres: Vec<f32> = (0..4).map(|k| at(&ids, 0.125 + k as f32 * 0.25, 0.125)).collect();
+    let spread = (0..9).map(|k| at(&ids, 0.125 + (k % 3) as f32 * 0.02 - 0.02, 0.125 + (k / 3) as f32 * 0.02 - 0.02)).fold((f32::MAX, f32::MIN), |(l, h), v| (l.min(v), h.max(v)));
+    println!("  flood fill: disc values {centres:?}, inside one disc {:.3}..{:.3}", spread.0, spread.1);
+    assert!(spread.1 - spread.0 < 0.002, "one value per disc");
+    assert!(centres.iter().all(|v| *v > 0.0), "every disc filled");
+    assert!(centres.windows(2).all(|w| (w[0] - w[1]).abs() > 0.01), "neighbouring discs differ: {centres:?}");
+    assert!(at(&ids, 0.0, 0.0) == 0.0, "black between discs");
+
+    let lv = read("leveled");
+    let (lo, hi) = lv.iter().fold((f32::MAX, f32::MIN), |(l, h), v| (l.min(*v), h.max(*v)));
+    println!("  auto levels: {lo:.3}..{hi:.3}");
+    assert!(lo.abs() < 0.01 && (hi - 1.0).abs() < 0.01, "stretched to 0..1");
+}
+
 /// A stroke across the rounded cube with each brush projection (and once
 /// with grain), then every fill projection: each must put paint on the mesh
 /// and comparable amounts of it. Frames go to `target/bake_test/paint/`.

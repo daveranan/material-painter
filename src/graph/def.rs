@@ -93,12 +93,32 @@ pub struct NodeDef {
     /// Reads its inputs' whole-image averages through `mean_<input>()`
     /// (`@mean`); the runtime hands it mip-mapped copies of its inputs.
     pub mean: bool,
+    /// Reads its grey inputs' whole-image minimum, maximum and average
+    /// through `min_<input>()`, `max_<input>()`, `mean_<input>()` (`@minmax`).
+    pub minmax: bool,
+    /// How many times it renders, each pass reading the last (`@passes`).
+    pub passes: Passes,
+}
+
+/// A node's render passes (`@passes`): every pass sees `pass_index()` and
+/// reads the previous pass with `prev_at(texel)`; the last pass is the output.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Passes {
+    One,
+    /// `@passes log2`: log2 of the size plus two (jump flooding: an
+    /// initial pass, one per halving step, a final pass).
+    Log2,
+    Fixed(u32),
+    /// `@passes <param>`: the value of an int parameter.
+    Param(String),
 }
 
 pub const MAX_INPUTS: usize = 8;
 pub const MAX_PARAMS: usize = 16;
 /// Texture slots for image and mesh map parameters.
 pub const MAX_IMAGES: usize = 4;
+/// Binding of a multi-pass node's previous pass (after inputs and images).
+pub const PREV_BINDING: usize = 2 + MAX_INPUTS + MAX_IMAGES;
 
 fn ident(s: &str) -> Result<String, String> {
     let s = s.trim();
@@ -214,18 +234,21 @@ pub fn parse(id: &str, source: &str) -> Result<NodeDef, String> {
         source: source.to_string(),
         shading: false,
         mean: false,
+        minmax: false,
+        passes: Passes::One,
     };
     let mut body_start = 0;
-    for (n, line) in source.lines().enumerate() {
+    // Whole lines, endings included, so CRLF files find the body too.
+    for (n, line) in source.split_inclusive('\n').enumerate() {
         let t = line.trim();
         let Some(rest) = t.strip_prefix("//") else {
             if t.is_empty() {
-                body_start += line.len() + 1;
+                body_start += line.len();
                 continue;
             }
             break;
         };
-        body_start += line.len() + 1;
+        body_start += line.len();
         let Some(tag) = rest.trim().strip_prefix('@') else { continue };
         let (key, value) = tag.split_once(char::is_whitespace).unwrap_or((tag, ""));
         let value = value.trim();
@@ -239,6 +262,16 @@ pub fn parse(id: &str, source: &str) -> Result<NodeDef, String> {
             "param" => def.params.push(param(value).map_err(at)?),
             "shading" => def.shading = true,
             "mean" => def.mean = true,
+            "minmax" => def.minmax = true,
+            "passes" => {
+                def.passes = match value {
+                    "log2" => Passes::Log2,
+                    v => match v.parse::<u32>() {
+                        Ok(n) => Passes::Fixed(n.clamp(1, 1024)),
+                        Err(_) => Passes::Param(v.to_string()),
+                    },
+                }
+            }
             k => return Err(at(format!("unknown tag '@{k}'"))),
         }
     }
@@ -292,6 +325,12 @@ impl NodeDef {
         for i in 0..MAX_IMAGES {
             s.push_str(&format!("@group(0) @binding({}) var t_img{i}: texture_2d<f32>;\n", 2 + MAX_INPUTS + i));
         }
+        if self.passes != Passes::One {
+            s.push_str(&format!("@group(0) @binding({PREV_BINDING}) var t_prev: texture_2d<f32>;\n"));
+            s.push_str(
+                "fn pass_index() -> i32 {\n    return i32(nu.info.w) % 4096;\n}\nfn pass_count() -> i32 {\n    return i32(nu.info.w) / 4096;\n}\n// The previous pass at a texel, wrapping (tileable).\nfn prev_at(t: vec2<i32>) -> vec4<f32> {\n    let n = vec2<i32>(textureDimensions(t_prev));\n    return textureLoad(t_prev, ((t % n) + n) % n, 0);\n}\n",
+            );
+        }
         s.push_str("\nfn res() -> f32 {\n    return nu.info.x;\n}\n\n");
         s.push_str(include_str!("lib.wgsl"));
         // Parameters.
@@ -317,18 +356,23 @@ impl NodeDef {
                 n = inp.name,
                 bit = 1u32 << i
             ));
-            if self.mean {
-                s.push_str(&format!(
-                    "fn mean_{n}() -> {ty} {{
-    if ((u32(nu.info.y) & {bit}u) != 0u) {{
-        return textureSampleLevel(t_{n}, samp, vec2<f32>(0.5), f32(textureNumLevels(t_{n}) - 1u)){pick};
-    }}
-    return nu.defaults[{i}]{pick};
-}}
-",
-                    n = inp.name,
-                    bit = 1u32 << i
-                ));
+            if self.mean || self.minmax {
+                // The last mip level: the average, or (`@minmax`, grey
+                // inputs) min, max and average in r, g, b.
+                let stat = |f: &str, last: &str| {
+                    format!(
+                        "fn {f}_{n}() -> {ty} {{\n    if ((u32(nu.info.y) & {bit}u) != 0u) {{\n        return textureSampleLevel(t_{n}, samp, vec2<f32>(0.5), f32(textureNumLevels(t_{n}) - 1u)){last};\n    }}\n    return nu.defaults[{i}]{pick};\n}}\n",
+                        n = inp.name,
+                        bit = 1u32 << i,
+                    )
+                };
+                if self.minmax {
+                    s.push_str(&stat("min", ".r"));
+                    s.push_str(&stat("max", ".g"));
+                    s.push_str(&stat("mean", ".b"));
+                } else {
+                    s.push_str(&stat("mean", pick));
+                }
             }
         }
         for (pi, p) in self.params.iter().enumerate() {
@@ -359,6 +403,11 @@ impl NodeDef {
             s.push_str(&format!("    params.{} = {v};\n", p.name));
         }
         s.push_str("    let v = node(in.pos.xy / nu.info.x);\n");
+        // A multi-pass node's passes before the last carry its own data in
+        // every channel.
+        if self.passes != Passes::One {
+            s.push_str("    if (pass_index() < pass_count() - 1) {\n        return v;\n    }\n");
+        }
         match self.output {
             Kind::Color => s.push_str("    return v;\n}\n"),
             Kind::Gray => s.push_str("    return vec4<f32>(v.rrr, 1.0);\n}\n"),

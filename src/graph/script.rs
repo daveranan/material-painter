@@ -29,8 +29,8 @@ use std::collections::HashMap;
 use std::path::Path;
 
 /// Functions every script can call, written in the script language itself.
+/// (A function here hides a node of the same name: keep them distinct.)
 const PRELUDE: &str = "
-fn highpass(x, radius=8) { return x - blur(x, radius=radius) + 0.5 }
 fn mix(a, b, mask) { return blend(foreground=b, background=a, mask=mask) }
 fn clamp01(x) { return min(max(x, 0), 1) }
 ";
@@ -858,7 +858,7 @@ output mask = dirt
         let scan = g.nodes.iter().find(|n| n.def == "histogram_scan").unwrap();
         assert_eq!(scan.params.get("position"), Some(&Value::Float(0.4)));
         assert_eq!(scan.params.get("invert"), Some(&Value::Bool(true)));
-        assert!(g.nodes.iter().any(|n| n.def == "blur" && n.params.get("radius") == Some(&Value::Float(12.0))));
+        assert!(g.nodes.iter().any(|n| n.def == "highpass" && n.params.get("radius") == Some(&Value::Float(12.0))));
         // Numbers and colors given to mix become flat color inputs.
         let g = compile("m = noise()
 c = mix(0.85, #7d6a50, m)

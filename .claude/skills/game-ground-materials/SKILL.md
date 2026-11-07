@@ -160,24 +160,21 @@ view. Compare to the brief's reference and the previous screenshot; fix
 the biggest problem first (scale and tiling, then height read, then color
 range, then detail).
 
-## Roadmap: what production graphs need that MP lacks
+## Roadmap: what production graphs need
 
-From the Meere and Habibi graphs (`references/recipes.md`), in the order
-that unlocks the most:
-1. **Tile Sampler upgrade**: up to six pattern inputs with random pick, a
-   mask map (threshold, bounding-box sampling), scale and rotation maps,
-   luminance random as per-instance height, a per-instance ID output.
-2. **Distance** (nearest-source propagation: cracks, Voronoi chunks).
-3. **Flood Fill** and its outputs: random grey, gradient (per-shape tilt),
-   bounding box. Every stone layer in both graphs uses it.
-4. **Highpass, Non-Uniform Blur, Non-Uniform and Multi-Directional Warp**.
-5. **Auto Levels** as min/max stretch (needs a min/max reduction like the
-   `@mean` one; today's `auto_level` only centres).
-6. **Height blend as a graph op**, and layered scattering that settles each
-   stone layer around the last (AO/shadow of the previous layer as mask).
-7. **Normal to Height, Shadows, Facing Normal**, world-unit normal and AO.
+Done: Tile Sampler with four pattern inputs, mask (tile-centre sampling),
+scale and rotation maps, Bell/Paraboloid/Gaussian/Pyramid/Capsule shapes and
+per-instance outputs (random ID, mask, pattern index); `distance` (spread a
+value or distance, jump flooding); `flood_fill` + `flood_fill_to` (random,
+gradient tilt, size, position per shape); `highpass`; `nonuniform_blur`;
+`multi_warp`; `auto_levels` (min/max); `height_blend` (height or mask);
+`shadows`; `facing`.
 
-Each new node becomes callable from material scripts as soon as it exists
+Still missing: layered scattering that settles each stone layer around the
+last automatically (do it by hand: mask the next tile sampler with the
+`shadows` or `ambient_occlusion` of the layers so far), Normal to Height,
+a non-uniform directional warp, world-unit normal and AO, a graph normal
+output. Each new node becomes callable from material scripts as soon as it exists
 (the script language calls any node by its id).
 
 ## Gaps in MP today and what to do instead

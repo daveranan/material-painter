@@ -16,16 +16,21 @@ the running app reloads it. Custom nodes are WGSL files in
 
 | Substance | MP | Notes |
 |---|---|---|
-| Height Blend | layer stack `height_blend` on a fill | Not a graph node yet. In a graph, approximate with `math` Max (the taller wins) or `blend` Lighten with a mask. |
-| Tile Sampler | `tile_sampler` | Grid scatter, random position/size/rotation/brightness, gaps (density), Max/Add. Grey only, one pattern, no mask or scale/vector map inputs. Run it twice with the same seed: once for height, once with brightness random for per-instance values. |
+| Height Blend | `height_blend` (output=height or mask); layer stack `height_blend` on fills | |
+| Tile Sampler | `tile_sampler` | Four pattern inputs (random pick), mask (centre sampling), scale and rotation maps, output height / instance random / instance mask / pattern index. Same seed in two calls gives matching height and IDs. |
 | Atlas Scatter, Shape Splatter | none | Cut atlas pieces into separate images and stack fills; or scatter grey shapes and color by gradient map. |
+| Distance | `distance` (spread source / distance) | Cracks: `distance` of sparse dots → `edge_detect`. |
 | Distance + Edge Detect (cell layout) | `cells` (Distance, Edges) | Edges mode is the cell-boundary mask. |
-| Flood Fill to Random Grayscale | `cells` Random | Per cell, not per arbitrary shape. |
-| Flood Fill to Gradient (per-stone slope) | `cells` Distance + `gradient` + `math` | Approximate: cells Random as angle source is not available; use two `gradient`s at different angles masked by `cells` Random through `histogram_scan`, combined with Darken. |
-| Highpass Grayscale | `math` Subtract (input, `blur` of input) + 0.5 | Use for peak/valley masks and evening a height. |
+| Flood Fill (+ to Random/Gradient/BBox) | `flood_fill` → `flood_fill_to(random|gradient|size|position_x|position_y)` | Shapes must be separated by black; raise `iterations` above the widest shape in texels. |
+| Flood Fill to Gradient (per-stone slope) | `flood_fill_to(gradient, angle_random=1)` | Two at different seeds, `min`, for the Habibi tilt. |
+| Highpass Grayscale | `highpass(radius, contrast)` | |
 | Slope Blur | `slope_blur` | Small intensities (0.02-0.08); it softens hard edges fast. |
 | Directional Warp / Warp | `directional_warp` / `warp` | |
-| Non-Uniform Blur | `blur` blended by a mask | Approximation. |
+| Non-Uniform Blur | `nonuniform_blur(input, map, radius)` | |
+| Multi-Directional Warp | `multi_warp(input, warp, intensity, directions)` | |
+| Auto Levels | `auto_levels` | Min/max stretch. |
+| Shadows | `shadows(height, angle, elevation, depth)` | |
+| Facing Normal | `facing(height, angle)` | |
 | Clouds, Perlin, Fractal Sum | `noise` (Perlin, Value, Turbulence, Ridged) | Scale = cells across the tile. |
 | BnW Spots, Grunge maps | `noise` Turbulence/Ridged through `histogram_scan`; `scratches` | |
 | Gradient Map | `gradient_map` (3 colors) | Chain two with a mask for more keys. |
