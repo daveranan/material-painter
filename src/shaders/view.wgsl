@@ -14,7 +14,7 @@ struct Globals {
     bmin: vec4<f32>,
     bsize: vec4<f32>,
     bg: vec4<f32>,       // background color (linear), background intensity
-    bg2: vec4<f32>,      // background blur, background mode (0 environment, 1 color, 2 transparent)
+    bg2: vec4<f32>,      // background blur, background mode (0 environment, 1 color, 2 transparent), tessellated displacement, segments per edge
     light_vp: mat4x4<f32>, // key light shadow projection
     sun: vec4<f32>,      // direction toward the key light, intensity
     sun_c: vec4<f32>,    // key light color (linear), on (1) / off (0)
@@ -432,6 +432,10 @@ struct MeshOut {
 
 @vertex
 fn vs_mesh(v: VIn) -> MeshOut {
+    return mesh_out(v);
+}
+
+fn mesh_out(v: VIn) -> MeshOut {
     var out: MeshOut;
     out.clip = g.view_proj * vec4<f32>(v.pos, 1.0);
     out.wpos = v.pos;
@@ -439,6 +443,94 @@ fn vs_mesh(v: VIn) -> MeshOut {
     out.uv = v.uv;
     out.t = v.tangent;
     return out;
+}
+
+// ------------------------------------------------------------------ tessellation
+
+// Tessellated displacement: every mesh triangle (the instance) is cut into
+// segments x segments smaller ones, worked out from the vertex index alone,
+// and each new vertex moves along the normal by the painted height times
+// `g.bg2.z`. Nothing is stored per new vertex. Points on a shared edge come
+// from the same two corners with the same weights, so neighbours meet
+// exactly; a UV seam or hard edge (split vertices) can open, as it would in
+// a game engine.
+@group(1) @binding(0) var<storage, read> tess_verts: array<f32>;  // mesh::Vertex, 12 floats each
+@group(1) @binding(1) var<storage, read> tess_index: array<u32>;
+@group(1) @binding(2) var tess_height: texture_2d<f32>;
+@group(1) @binding(3) var tess_samp: sampler;
+
+fn tess_corner(i: u32) -> VIn {
+    let o = i * 12u;
+    var v: VIn;
+    v.pos = vec3<f32>(tess_verts[o], tess_verts[o + 1u], tess_verts[o + 2u]);
+    v.normal = vec3<f32>(tess_verts[o + 3u], tess_verts[o + 4u], tess_verts[o + 5u]);
+    v.uv = vec2<f32>(tess_verts[o + 6u], tess_verts[o + 7u]);
+    v.tangent = vec4<f32>(tess_verts[o + 8u], tess_verts[o + 9u], tess_verts[o + 10u], tess_verts[o + 11u]);
+    return v;
+}
+
+// Grid point (row, col) of a triangle cut into n rows, as integer weights
+// of corners a, b, c (they sum to n).
+fn tess_weights(row: u32, col: u32, n: u32) -> vec3<f32> {
+    return vec3<f32>(f32(n - row), f32(row - col), f32(col)) / f32(n);
+}
+
+// Vertex `vi` of the small triangles of mesh triangle `tri`. Row r holds
+// 2r + 1 of them, alternately pointing up and down, wound like the mesh.
+fn tess_vertex(vi: u32, tri: u32) -> VIn {
+    let n = max(u32(g.bg2.w), 1u);
+    let k = vi / 3u;
+    let corner = vi % 3u;
+    var r = u32(sqrt(f32(k)));
+    if (r * r > k) {
+        r -= 1u;
+    }
+    if ((r + 1u) * (r + 1u) <= k) {
+        r += 1u;
+    }
+    let m = k - r * r;
+    let u = m / 2u;
+    var row = r;
+    var col = u;
+    if (m % 2u == 0u) {
+        row = select(r, r + 1u, corner != 0u);
+        col = select(u, u + 1u, corner == 2u);
+    } else {
+        row = select(r, r + 1u, corner == 1u);
+        col = select(u, u + 1u, corner != 0u);
+    }
+    let w = tess_weights(row, col, n);
+    let a = tess_corner(tess_index[tri * 3u]);
+    let b = tess_corner(tess_index[tri * 3u + 1u]);
+    let c = tess_corner(tess_index[tri * 3u + 2u]);
+    var v: VIn;
+    v.pos = a.pos * w.x + b.pos * w.y + c.pos * w.z;
+    v.normal = normalize(a.normal * w.x + b.normal * w.y + c.normal * w.z);
+    v.uv = a.uv * w.x + b.uv * w.y + c.uv * w.z;
+    let t = a.tangent.xyz * w.x + b.tangent.xyz * w.y + c.tangent.xyz * w.z;
+    v.tangent = vec4<f32>(select(t, normalize(t), dot(t, t) > 1e-12), a.tangent.w);
+    let amount = g.bg2.z;
+    if (amount > 0.0) {
+        // The mip whose texels match one segment, so a coarse grid follows
+        // the height's average instead of aliasing between texels.
+        let span = max(max(distance(a.uv, b.uv), distance(b.uv, c.uv)), distance(c.uv, a.uv));
+        let texels = span * g.params.w / f32(n);
+        let lod = clamp(log2(max(texels, 1.0)), 0.0, VIEW_MAX_LOD);
+        let h = textureSampleLevel(tess_height, tess_samp, v.uv, lod).r;
+        v.pos += v.normal * h * amount;
+    }
+    return v;
+}
+
+@vertex
+fn vs_mesh_tess(@builtin(vertex_index) vi: u32, @builtin(instance_index) tri: u32) -> MeshOut {
+    return mesh_out(tess_vertex(vi, tri));
+}
+
+@vertex
+fn vs_shadow_tess(@builtin(vertex_index) vi: u32, @builtin(instance_index) tri: u32) -> @builtin(position) vec4<f32> {
+    let v = tess_vertex(vi, tri);
+    return g.light_vp * vec4<f32>(v.pos, 1.0);
 }
 
 // Everything a shader sees at one point of the mesh; custom preview shaders

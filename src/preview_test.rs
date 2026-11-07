@@ -1348,6 +1348,73 @@ fn preview_shaders_compile_and_render() {
     }
 }
 
+/// Tessellated displacement: the mesh itself moves by the height, so the
+/// silhouette grows (parallax leaves it as it is), at every level and with
+/// a preview shader too. Images in `target/bake_test/tessellation/`.
+#[test]
+#[ignore]
+fn tessellated_displacement_moves_the_mesh() {
+    use crate::engine::FillParams;
+    use crate::viewport::{Background, Tessellation};
+    let rs = render_state();
+    let mesh = crate::mesh::Primitive::MaterialBall.build();
+    let gpu_mesh = GpuMesh::new(&rs.device, &mesh);
+    let res = 1024;
+    let mut engine = Engine::new(&rs, &gpu_mesh, (mesh.bounds_min, mesh.bounds_max), res);
+    let (maps, report, _) = run_bake(&rs.device, &rs.queue, &mesh, &gpu_mesh, &BakeSettings::default(), res);
+    engine.set_maps(maps, report);
+    // Cobblestones as height, tri-planar, as the shelf's texture layers add them.
+    let mut undo = crate::undo::UndoStack::default();
+    let mut fill = FillParams { projection: crate::engine::Projection::Triplanar, tiling: 2.0, ..FillParams::default() };
+    fill.mat.enabled = [false, false, false, true];
+    fill.mat.height = 0.5;
+    let idx = engine.add_fill_layer(0, None, "Stones".into(), fill, &mut undo);
+    let stones = crate::textures::TEXTURES.iter().find(|t| t.name == "Cobblestone").unwrap();
+    let mut png = Vec::new();
+    image::ImageEncoder::write_image(image::codecs::png::PngEncoder::new(&mut png), &stones.render(1024), 1024, 1024, image::ExtendedColorType::L8).unwrap();
+    let img = engine.decode_fill_image("stones.png".into(), Arc::new(png)).unwrap();
+    engine.set_fill_image(idx, 3, Some(img), &mut undo);
+    engine.composite();
+    let env = crate::environment::EnvBaker::new(&rs.device)
+        .upload(&rs, &crate::environment::decode(&crate::environment::EnvSource::Builtin(0)).unwrap());
+    let mut views = ViewRenderer::new(&rs);
+    let cam = OrbitCam { dist: 3.2, yaw: 0.5, pitch: 0.3, ..Default::default() };
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/bake_test/tessellation");
+    std::fs::create_dir_all(&dir).unwrap();
+    let render = |views: &mut ViewRenderer, name: &str, displacement: f32, tessellation: Tessellation| -> usize {
+        let settings = ViewSettings { displacement, tessellation, background: Background::Transparent, ..Default::default() };
+        views.render_3d(&rs, [640, 640], &[&engine], &env, &gpu_mesh, &cam, &settings, None);
+        let img = views.view3d.image();
+        let bytes = read_texture(&rs.device, &rs.queue, img);
+        image::save_buffer(dir.join(format!("{name}.png")), &bytes, img.width, img.height, image::ExtendedColorType::Rgba8).unwrap();
+        let covered = bytes.chunks_exact(4).filter(|p| p[3] > 127).count();
+        println!("  {name}: {covered} pixels covered");
+        covered
+    };
+    let flat = render(&mut views, "flat", 0.0, Tessellation::Off);
+    let parallax = render(&mut views, "parallax", 0.08, Tessellation::Off);
+    let mut covered = Vec::new();
+    for t in [Tessellation::Low, Tessellation::Medium, Tessellation::High] {
+        covered.push(render(&mut views, &format!("tessellated_{}", t.name().to_lowercase()), 0.08, t));
+    }
+    // Tessellation without displacement draws the same mesh.
+    let still = render(&mut views, "tessellated_no_displacement", 0.0, Tessellation::High);
+    let near = |a: usize, b: usize| (a as f32 - b as f32).abs() < b as f32 * 0.005;
+    assert!(near(parallax, flat), "parallax keeps the silhouette: {parallax} vs {flat}");
+    assert!(near(still, flat), "no displacement, no change: {still} vs {flat}");
+    // Stones rise out of the silhouette, more of them as the grid gets finer.
+    assert!(covered.iter().all(|c| *c > flat), "the displaced mesh covers more of the view: {covered:?} vs {flat}");
+    assert!(covered[2] as f32 > flat as f32 * 1.005 && covered[2] > covered[0], "{covered:?} vs {flat}");
+    // A preview shader (shading graph) draws tessellated too.
+    let lib = crate::graph::Library::load(None);
+    let toon = crate::graph::shading::presets().into_iter().next().expect("a shading preset");
+    let compiled = crate::graph::shading::compile(&toon, &lib).unwrap();
+    views.set_custom_shader(&rs.device, Some(&compiled.code)).unwrap();
+    views.set_custom_params(&rs.queue, &crate::graph::shading::param_values(&compiled, &toon, &lib));
+    let custom = render(&mut views, "tessellated_preview_shader", 0.08, Tessellation::Medium);
+    assert!(custom > flat, "{custom} vs {flat}");
+}
+
 /// Reads a project's mesh (`MP_PROJECT=path.mpp`), reports what's wrong with
 /// it (degenerate and flipped UV triangles, overlapping UVs, ...), bakes it
 /// with the project's bake settings and writes every map to

@@ -169,6 +169,59 @@ impl Default for Cam2d {
     }
 }
 
+/// Tessellated displacement in the 3D view: the mesh is cut into smaller
+/// triangles on the GPU and moved by the painted height, so silhouettes,
+/// self-shadowing and seams show what a game engine's tessellation would.
+/// Each level is a triangle budget for the whole mesh.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Tessellation {
+    /// Parallax only (the displacement slider fakes depth per pixel).
+    #[default]
+    Off,
+    Low,
+    Medium,
+    High,
+}
+
+/// Most segments a triangle edge is cut into (a single-triangle plane at High).
+pub const MAX_TESS_SEGMENTS: u32 = 512;
+
+impl Tessellation {
+    pub const ALL: [Tessellation; 4] = [Tessellation::Off, Tessellation::Low, Tessellation::Medium, Tessellation::High];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Tessellation::Off => "Off",
+            Tessellation::Low => "Low",
+            Tessellation::Medium => "Medium",
+            Tessellation::High => "High",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Tessellation> {
+        Self::ALL.into_iter().find(|t| t.name().eq_ignore_ascii_case(name))
+    }
+
+    fn budget(self) -> u64 {
+        match self {
+            Tessellation::Off => 0,
+            Tessellation::Low => 300_000,
+            Tessellation::Medium => 1_500_000,
+            Tessellation::High => 5_000_000,
+        }
+    }
+
+    /// Segments each edge of a mesh of `tris` triangles is cut into, so the
+    /// whole mesh stays near the level's budget (0 when off). Dense meshes
+    /// still get 1: their own vertices move.
+    pub fn segments(self, tris: u32) -> u32 {
+        if self == Tessellation::Off {
+            return 0;
+        }
+        ((self.budget() / u64::from(tris.max(1))) as f64).sqrt().floor().clamp(1.0, MAX_TESS_SEGMENTS as f64) as u32
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Background {
     /// The environment HDRI, optionally blurred.
@@ -204,9 +257,11 @@ pub struct ViewSettings {
     /// Linear RGB.
     pub bg_color: [f32; 3],
     pub height_strength: f32,
-    /// Parallax displacement in the 3D view: how far (world units, the mesh
-    /// fits a 2-unit box) the highest painted height rises; 0 is off.
+    /// Displacement in the 3D view: how far (world units, the mesh fits a
+    /// 2-unit box) the highest painted height rises; 0 is off. Parallax,
+    /// or real geometry with `tessellation` on.
     pub displacement: f32,
+    pub tessellation: Tessellation,
     pub show_wire: bool,
     /// Mesh wireframe over the 3D view.
     pub show_wire_3d: bool,
@@ -265,6 +320,7 @@ impl Default for ViewSettings {
             bg_color: [0.05, 0.05, 0.055],
             height_strength: 1.0,
             displacement: 0.0,
+            tessellation: Tessellation::Off,
             show_wire: true,
             show_wire_3d: false,
             show_seams_3d: false,
@@ -438,13 +494,20 @@ pub const CUSTOM_PARAMS: usize = 128;
 
 pub struct ViewRenderer {
     layout: wgpu::PipelineLayout,
-    /// The mesh drawn with a custom preview shader (a compiled shading graph).
-    custom_mesh: Option<wgpu::RenderPipeline>,
+    /// The mesh drawn with a custom preview shader (a compiled shading
+    /// graph), plain and tessellated.
+    custom_mesh: Option<[wgpu::RenderPipeline; 2]>,
     custom_params: wgpu::Buffer,
     post: PostFx,
     env_sampler: wgpu::Sampler,
     sky: wgpu::RenderPipeline,
     mesh: wgpu::RenderPipeline,
+    /// Tessellated mesh and shadow (see `Tessellation`), reading the mesh
+    /// and its height through `tess_bgl` (group 1).
+    mesh_tess: wgpu::RenderPipeline,
+    shadow_tess: wgpu::RenderPipeline,
+    tess_bgl: wgpu::BindGroupLayout,
+    tess_layout: wgpu::PipelineLayout,
     quad: wgpu::RenderPipeline,
     wire: wgpu::RenderPipeline,
     wire3d: wgpu::RenderPipeline,
@@ -642,6 +705,55 @@ impl ViewRenderer {
             multiview_mask: None,
             cache: None,
         });
+        // Tessellation: group 1 holds the mesh (read per vertex) and the
+        // height that moves it.
+        let vertex_storage = |binding| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::VERTEX,
+            ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None },
+            count: None,
+        };
+        let tess_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("tessellation"),
+            entries: &[
+                vertex_storage(0),
+                vertex_storage(1),
+                gpu::tex_entry(2, true),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let tess_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("view tessellated"),
+            bind_group_layouts: &[Some(&bgl), Some(&tess_bgl)],
+            immediate_size: 0,
+        });
+        let mesh_tess = Self::mesh_pipeline(device, &tess_layout, &module, "vs_mesh_tess", "fs_mesh", "mesh tessellated");
+        let shadow_tess = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("key shadow tessellated"),
+            layout: Some(&device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("key shadow tessellated"),
+                bind_group_layouts: &[Some(&shadow_bgl), Some(&tess_bgl)],
+                immediate_size: 0,
+            })),
+            vertex: wgpu::VertexState { module: &module, entry_point: Some("vs_shadow_tess"), compilation_options: Default::default(), buffers: &[] },
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Less),
+                stencil: Default::default(),
+                bias: wgpu::DepthBiasState { constant: 2, slope_scale: 2.0, clamp: 0.0 },
+            }),
+            multisample: Default::default(),
+            fragment: None,
+            multiview_mask: None,
+            cache: None,
+        });
         let shadow_map = Tex::new(
             device,
             "key shadow map",
@@ -673,6 +785,10 @@ impl ViewRenderer {
             env_sampler: env_sampler(device),
             sky,
             mesh,
+            mesh_tess,
+            shadow_tess,
+            tess_bgl,
+            tess_layout,
             quad,
             wire,
             wire3d,
@@ -726,41 +842,65 @@ impl ViewRenderer {
             "{}\n{code}\n@fragment\nfn fs_mesh_custom(in: MeshOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {{\n    let c = mesh_shade_inputs(in, front);\n    return vec4<f32>(max(custom_shade(c), vec3<f32>(0.0)), 1.0);\n}}\n",
             include_str!("shaders/view.wgsl")
         );
-        let (pipeline, err) = crate::graph::runtime::validation_scope(device, || {
+        let (pipelines, err) = crate::graph::runtime::validation_scope(device, || {
             let module = gpu::shader(device, "preview shader", &src);
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("mesh (preview shader)"),
-                layout: Some(&self.layout),
-                vertex: wgpu::VertexState {
-                    module: &module,
-                    entry_point: Some("vs_mesh"),
-                    compilation_options: Default::default(),
-                    buffers: &[Some(gpu::vertex_layout())],
-                },
-                primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, ..Default::default() },
-                depth_stencil: Some(wgpu::DepthStencilState {
-                    format: DEPTH_FORMAT,
-                    depth_write_enabled: Some(true),
-                    depth_compare: Some(wgpu::CompareFunction::Less),
-                    stencil: Default::default(),
-                    bias: Default::default(),
-                }),
-                multisample: wgpu::MultisampleState { count: MSAA, ..Default::default() },
-                fragment: Some(wgpu::FragmentState {
-                    module: &module,
-                    entry_point: Some("fs_mesh_custom"),
-                    compilation_options: Default::default(),
-                    targets: &[Some(wgpu::ColorTargetState { format: HDR_FORMAT, blend: None, write_mask: wgpu::ColorWrites::ALL })],
-                }),
-                multiview_mask: None,
-                cache: None,
-            })
+            [
+                Self::mesh_pipeline(device, &self.layout, &module, "vs_mesh", "fs_mesh_custom", "mesh (preview shader)"),
+                Self::mesh_pipeline(device, &self.tess_layout, &module, "vs_mesh_tess", "fs_mesh_custom", "mesh tessellated (preview shader)"),
+            ]
         });
         if let Some(e) = err {
             return Err(e);
         }
-        self.custom_mesh = Some(pipeline);
+        self.custom_mesh = Some(pipelines);
         Ok(())
+    }
+
+    /// The 3D view's mesh pass: HDR, MSAA, depth tested. A tessellated
+    /// vertex stage (`vs_*_tess`) reads the mesh from storage, not buffers.
+    fn mesh_pipeline(device: &wgpu::Device, layout: &wgpu::PipelineLayout, module: &wgpu::ShaderModule, vs: &str, fs: &str, label: &str) -> wgpu::RenderPipeline {
+        let buffers = [Some(gpu::vertex_layout())];
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some(label),
+            layout: Some(layout),
+            vertex: wgpu::VertexState {
+                module,
+                entry_point: Some(vs),
+                compilation_options: Default::default(),
+                buffers: if vs.ends_with("_tess") { &[] } else { &buffers },
+            },
+            primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, ..Default::default() },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Less),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: wgpu::MultisampleState { count: MSAA, ..Default::default() },
+            fragment: Some(wgpu::FragmentState {
+                module,
+                entry_point: Some(fs),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState { format: HDR_FORMAT, blend: None, write_mask: wgpu::ColorWrites::ALL })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        })
+    }
+
+    /// Group 1 of a tessellated draw: the mesh and `engine`'s height.
+    fn tess_bind_group(&self, device: &wgpu::Device, mesh: &GpuMesh, engine: &Engine) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("tessellation"),
+            layout: &self.tess_bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: mesh.vertices.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: mesh.indices.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&engine.view_tex(3).view) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+            ],
+        })
     }
 
     /// The custom preview shader's parameter values (see `CUSTOM_PARAMS`).
@@ -901,6 +1041,10 @@ impl ViewRenderer {
         while self.globals.len() < engines.len() + 1 {
             self.globals.push(Self::globals_buffer(&rs.device));
         }
+        let segments = settings.tessellation.segments(mesh.index_count / 3);
+        let tess_bgs: Vec<wgpu::BindGroup> =
+            if segments > 0 { engines.iter().map(|e| self.tess_bind_group(&rs.device, mesh, e)).collect() } else { Vec::new() };
+        let tess_verts = 3 * segments * segments;
         let bgs: Vec<wgpu::BindGroup> = engines
             .iter()
             .enumerate()
@@ -909,6 +1053,12 @@ impl ViewRenderer {
                 g.view_proj = vp.to_cols_array_2d();
                 g.inv_view_proj = vp.inverse().to_cols_array_2d();
                 g.cam_pos = cam.eye().extend(1.0).to_array();
+                if segments > 0 {
+                    // Real displacement replaces the parallax.
+                    g.view2d[3] = 0.0;
+                    g.bg2[2] = settings.displacement;
+                    g.bg2[3] = segments as f32;
+                }
                 rs.queue.write_buffer(&self.globals[k + 1], 0, bytemuck::bytes_of(&g));
                 self.bind_group(&rs.device, engine, env, &self.globals[k + 1])
             })
@@ -937,12 +1087,23 @@ impl ViewRenderer {
                 multiview_mask: None,
             });
             pass.set_bind_group(0, &shadow_bg, &[]);
-            pass.set_pipeline(&self.shadow);
-            pass.set_vertex_buffer(0, mesh.vertices.slice(..));
-            pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
+            if segments > 0 {
+                pass.set_pipeline(&self.shadow_tess);
+            } else {
+                pass.set_pipeline(&self.shadow);
+                pass.set_vertex_buffer(0, mesh.vertices.slice(..));
+                pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
+            }
             // Hidden texture sets cast no shadow either.
-            for (set, engine) in mesh.sets.iter().zip(engines) {
-                if !engine.hidden {
+            for (k, (set, engine)) in mesh.sets.iter().zip(engines).enumerate() {
+                if engine.hidden {
+                    continue;
+                }
+                if segments > 0 {
+                    // One instance per mesh triangle (see `tess_vertex` in view.wgsl).
+                    pass.set_bind_group(1, &tess_bgs[k], &[]);
+                    pass.draw(0..tess_verts, set.tris.clone());
+                } else {
                     pass.draw_indexed(set.index_range(), 0, 0..1);
                 }
             }
@@ -973,15 +1134,22 @@ impl ViewRenderer {
                 pass.set_pipeline(&self.sky);
                 pass.draw(0..3, 0..1);
             }
-            pass.set_pipeline(self.custom_mesh.as_ref().filter(|_| settings.mode == ViewMode::Material).unwrap_or(&self.mesh));
+            let tess = usize::from(segments > 0);
+            let custom = self.custom_mesh.as_ref().filter(|_| settings.mode == ViewMode::Material).map(|p| &p[tess]);
+            pass.set_pipeline(custom.unwrap_or(if segments > 0 { &self.mesh_tess } else { &self.mesh }));
             pass.set_vertex_buffer(0, mesh.vertices.slice(..));
             pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
-            for ((set, bg), engine) in mesh.sets.iter().zip(&bgs).zip(engines) {
+            for (k, ((set, bg), engine)) in mesh.sets.iter().zip(&bgs).zip(engines).enumerate() {
                 if engine.hidden {
                     continue;
                 }
                 pass.set_bind_group(0, bg, &[]);
-                pass.draw_indexed(set.index_range(), 0, 0..1);
+                if segments > 0 {
+                    pass.set_bind_group(1, &tess_bgs[k], &[]);
+                    pass.draw(0..tess_verts, set.tris.clone());
+                } else {
+                    pass.draw_indexed(set.index_range(), 0, 0..1);
+                }
             }
             pass.set_bind_group(0, bg, &[]);
             if settings.show_wire_3d {
@@ -1061,5 +1229,27 @@ impl ViewRenderer {
             }
         }
         rs.queue.submit([encoder.finish()]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tessellation_keeps_to_its_triangle_budget() {
+        assert_eq!(Tessellation::Off.segments(12), 0);
+        // A cube's 12 triangles get many segments, capped; a dense mesh keeps its own vertices.
+        assert_eq!(Tessellation::High.segments(12), 645.min(MAX_TESS_SEGMENTS));
+        assert_eq!(Tessellation::Low.segments(1_000_000), 1);
+        for t in [Tessellation::Low, Tessellation::Medium, Tessellation::High] {
+            for tris in [1u32, 12, 5_000, 80_000, 400_000] {
+                let n = t.segments(tris) as u64;
+                assert!((1..=MAX_TESS_SEGMENTS as u64).contains(&n));
+                assert!(n == 1 || n * n * u64::from(tris) <= t.budget(), "{t:?} {tris}: {n}");
+            }
+            assert_eq!(Tessellation::from_name(&t.name().to_uppercase()), Some(t));
+        }
+        assert!(Tessellation::Low.segments(5_000) < Tessellation::High.segments(5_000));
     }
 }

@@ -936,6 +936,9 @@ impl PainterApp {
                 if let Some(d) = f32_arg(args, "displacement") {
                     v.displacement = d.clamp(0.0, 1.0);
                 }
+                if let Some(t) = str_arg(args, "tessellation") {
+                    v.tessellation = crate::viewport::Tessellation::from_name(t).ok_or("tessellation: off, low, medium or high")?;
+                }
                 if let Some(f) = f32_arg(args, "fov") {
                     self.cam.fov_y = f.clamp(5.0, 120.0).to_radians();
                 }
@@ -1234,6 +1237,8 @@ impl PainterApp {
             "hdri": self.env.source.name(),
             "available_hdris": self.env_builtins.iter().map(|&i| environment::BUILTIN[i].0).collect::<Vec<_>>(),
             "fov": self.cam.fov_y.to_degrees(),
+            "displacement": v.displacement,
+            "tessellation": v.tessellation.name().to_lowercase(),
             "env_rotation": v.env_rotation.to_degrees(),
             "env_intensity": v.env_intensity,
             "key_light": v.key.on,

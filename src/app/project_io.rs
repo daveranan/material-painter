@@ -1034,6 +1034,7 @@ impl PainterApp {
             "exposure": v.exposure, "env_rotation": v.env_rotation, "env_intensity": v.env_intensity,
             "background": format!("{:?}", v.background), "bg_blur": v.bg_blur, "bg_intensity": v.bg_intensity,
             "bg_color": v.bg_color, "height_strength": v.height_strength, "displacement": v.displacement,
+            "tessellation": v.tessellation.name(),
             "show_wire": v.show_wire, "use_baked_normal": v.use_baked_normal, "ao_strength": v.ao_strength,
             "key_light": {"on": v.key.on, "azimuth": v.key.azimuth, "elevation": v.key.elevation,
                 "intensity": v.key.intensity, "color": v.key.color},
@@ -1398,6 +1399,7 @@ impl PainterApp {
         vs.bg_color = arr(v, "bg_color", d.bg_color);
         vs.height_strength = f(v, "height_strength", d.height_strength);
         vs.displacement = f(v, "displacement", d.displacement).clamp(0.0, 1.0);
+        vs.tessellation = s(v, "tessellation").and_then(crate::viewport::Tessellation::from_name).unwrap_or(d.tessellation);
         vs.show_wire = b(v, "show_wire", d.show_wire);
         vs.use_baked_normal = b(v, "use_baked_normal", d.use_baked_normal);
         self.preview.graph = v["preview_shader"].as_u64().filter(|id| self.graphs.doc(*id).is_some_and(|d| d.shading));
