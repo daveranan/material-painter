@@ -17,6 +17,9 @@ use std::sync::{Arc, mpsc};
 pub(super) struct GraphDoc {
     pub id: u64,
     pub graph: Graph,
+    /// `graph` as of the last undo step: edits since then become the next
+    /// step once the interaction making them ends.
+    committed: Graph,
     rt: Runtime,
     /// Edited since the last evaluation.
     pub(super) dirty: bool,
@@ -35,6 +38,25 @@ struct AddMenu {
     link_from: Option<u64>,
     /// Focus the search field on the first frame.
     focus: bool,
+}
+
+/// Pushes `graph`'s change since `committed` as one undo step and makes it
+/// the new committed state. Returns whether there was a change.
+fn record_graph_edit(id: u64, graph: &Graph, committed: &mut Graph, undo: &mut crate::undo::UndoStack) -> bool {
+    if graph == committed {
+        return false;
+    }
+    let label = committed.change_label(graph);
+    let before = std::mem::replace(committed, graph.clone());
+    undo.push(label, crate::undo::Edit::Graph { id, graph: Box::new(before) });
+    true
+}
+
+/// Undoes or redoes a graph step: the step's stored graph and the live one
+/// trade places, and the result counts as committed (not a new edit).
+fn swap_graph(stored: &mut Graph, graph: &mut Graph, committed: &mut Graph) {
+    std::mem::swap(stored, graph);
+    *committed = graph.clone();
 }
 
 /// A saved graph on the shelf.
@@ -64,12 +86,7 @@ pub(super) struct GraphEditor {
     /// Where the add menu opened, in canvas units.
     add_at: Pos2,
     search: String,
-    /// Graph snapshots for undo inside the editor (of `history_doc`).
-    history: Vec<Graph>,
-    future: Vec<Graph>,
-    last: Option<Graph>,
-    history_doc: Option<u64>,
-    /// The pointer is over the editor: Ctrl+Z / Ctrl+Y act on the graph.
+    /// The pointer is over the editor: copy, paste and delete act on nodes.
     pub hovered: bool,
     /// Show the start page instead of the open graph.
     start_page: bool,
@@ -138,10 +155,6 @@ impl GraphStore {
                 link_from: None,
                 add_at: Pos2::ZERO,
                 search: String::new(),
-                history: Vec::new(),
-                future: Vec::new(),
-                last: None,
-                history_doc: None,
                 hovered: false,
                 start_page: false,
                 frame_next: true,
@@ -191,7 +204,8 @@ impl GraphStore {
         self.next_id = self.next_id.max(id + 1);
         let rt = Runtime::new(&rs.device, &rs.queue);
         let shading = graph::shading::is_shading(&graph, &self.lib);
-        self.docs.push(GraphDoc { id, graph, rt, dirty: true, push: true, maps_seen: u64::MAX, shading });
+        let committed = graph.clone();
+        self.docs.push(GraphDoc { id, graph, committed, rt, dirty: true, push: true, maps_seen: u64::MAX, shading });
         id
     }
 
@@ -700,7 +714,6 @@ impl PainterApp {
         egui::CentralPanel::default().frame(egui::Frame::new().fill(theme::BG).inner_margin(egui::Margin::same(4))).show(ui, |ui| {
             self.dock_ui(ui, super::Workspace::Designer);
         });
-        self.snapshot_graph(ui.ctx());
     }
 
     /// The open graph (or none: the start page).
@@ -870,44 +883,64 @@ impl PainterApp {
         });
     }
 
-    /// Records undo snapshots of the open graph once an interaction ends.
-    fn snapshot_graph(&mut self, ctx: &egui::Context) {
-        let e = &mut self.graphs.editor;
-        let Some(id) = e.doc else { return };
-        if e.history_doc != Some(id) {
-            e.history.clear();
-            e.future.clear();
-            e.last = None;
-            e.history_doc = Some(id);
-        }
-        if ctx.input(|i| i.pointer.any_down()) || ctx.memory(|m| m.focused().is_some()) {
-            return;
-        }
-        let Some(d) = self.graphs.docs.iter().find(|d| d.id == id) else { return };
-        match &e.last {
-            Some(last) if *last == d.graph => {}
-            Some(last) => {
-                e.history.push(last.clone());
-                if e.history.len() > 100 {
-                    e.history.remove(0);
-                }
-                e.future.clear();
-                e.last = Some(d.graph.clone());
-            }
-            None => e.last = Some(d.graph.clone()),
+    /// Records each graph's edits since the last step as one undo step,
+    /// once the interaction making them ends (the pointer is released, a
+    /// text field loses focus), so a drag or a typed value is one step.
+    pub(super) fn commit_graph_edits(&mut self, ctx: &egui::Context) {
+        if !ctx.input(|i| i.pointer.any_down()) && ctx.memory(|m| m.focused().is_none()) {
+            self.record_graph_edits();
         }
     }
 
-    pub(super) fn graph_undo(&mut self, redo: bool) {
-        let e = &mut self.graphs.editor;
-        let Some(id) = e.doc else { return };
-        let (from, to) = if redo { (&mut e.future, &mut e.history) } else { (&mut e.history, &mut e.future) };
-        let Some(g) = from.pop() else { return };
-        if let Some(d) = self.graphs.docs.iter_mut().find(|d| d.id == id) {
-            to.push(std::mem::replace(&mut d.graph, g.clone()));
-            d.dirty = true;
-            e.last = Some(g);
+    /// Records pending graph edits now, mid-interaction or not (before
+    /// undo, redo and saving).
+    pub(super) fn record_graph_edits(&mut self) {
+        for d in &mut self.graphs.docs {
+            record_graph_edit(d.id, &d.graph, &mut d.committed, &mut self.undo);
         }
+    }
+
+    /// Applies the graph edits of the step just undone (`undoing`) or
+    /// redone; the graphs render again and push their outputs to their
+    /// layers as after any edit. In the Designer, shows the graph changed.
+    pub(super) fn graph_history_step(&mut self, undoing: bool) {
+        let entry = if undoing { self.undo.redo.last_mut() } else { self.undo.undo.last_mut() };
+        let Some(entry) = entry else { return };
+        let mut shown = None;
+        entry.edit.for_each_graph(undoing, &mut |id, stored| {
+            if let Some(d) = self.graphs.docs.iter_mut().find(|d| d.id == id) {
+                swap_graph(stored, &mut d.graph, &mut d.committed);
+                d.dirty = true;
+                shown = Some(id);
+            }
+        });
+        let e = &mut self.graphs.editor;
+        if let Some(id) = shown.filter(|id| self.workspace == super::Workspace::Designer && e.doc != Some(*id)) {
+            e.doc = Some(id);
+            e.start_page = false;
+            e.selected = None;
+            e.multi.clear();
+            e.frame_next = true;
+        }
+    }
+
+    /// The open graph's id and nodes, the undo and redo labels, and the
+    /// base color output's pixels (offscreen UI tests).
+    #[cfg(test)]
+    pub(crate) fn test_graph_state(&self) -> (u64, Graph, Vec<String>, Vec<String>, Option<Vec<u8>>) {
+        let d = self.graphs.editor.doc.and_then(|id| self.graphs.doc(id)).expect("a graph is open");
+        let labels = |v: &Vec<crate::undo::Entry>| v.iter().map(|e| e.label.clone()).collect();
+        let base = d.graph.outputs(&self.graphs.lib)[0].and_then(|n| d.rt.output(n));
+        let pixels = base.map(|t| crate::gpu::read_texture(&self.rs.device, &self.rs.queue, t));
+        (d.id, d.graph.clone(), labels(&self.undo.undo), labels(&self.undo.redo), pixels)
+    }
+
+    /// Edits a graph as the editor's widgets do (offscreen UI tests).
+    #[cfg(test)]
+    pub(crate) fn test_edit_graph(&mut self, id: u64, f: impl FnOnce(&mut Graph)) {
+        let d = self.graphs.doc_mut(id).expect("graph exists");
+        f(&mut d.graph);
+        d.dirty = true;
     }
 
     // ------------------------------------------------------------------ canvas
@@ -1492,6 +1525,7 @@ impl PainterApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::undo::UndoStack;
 
     #[test]
     fn pasting_remaps_links_among_the_copies() {
@@ -1512,5 +1546,129 @@ mod tests {
         assert_eq!(b2.params["gamma"], Value::Float(2.0));
         assert_eq!(b2.pos, [110.0, 20.0]);
         assert_eq!(unique_stem(&Library::load(None), "noise"), "noise");
+    }
+
+    /// One graph document as the app keeps it, with the app's undo flow.
+    struct Doc {
+        graph: Graph,
+        committed: Graph,
+    }
+
+    const ID: u64 = 7;
+
+    impl Doc {
+        fn new(graph: Graph) -> Doc {
+            Doc { committed: graph.clone(), graph }
+        }
+
+        /// The end of an interaction (`commit_graph_edits`).
+        fn commit(&mut self, undo: &mut UndoStack) -> bool {
+            record_graph_edit(ID, &self.graph, &mut self.committed, undo)
+        }
+
+        /// `Action::Undo` / `Action::Redo` for a graph step.
+        fn step(&mut self, undo: &mut UndoStack, undoing: bool) {
+            self.commit(undo);
+            let (from, to) = if undoing { (&mut undo.undo, &mut undo.redo) } else { (&mut undo.redo, &mut undo.undo) };
+            let mut e = from.pop().expect("a step to apply");
+            e.edit.for_each_graph(undoing, &mut |id, stored| {
+                assert_eq!(id, ID);
+                swap_graph(stored, &mut self.graph, &mut self.committed);
+            });
+            to.push(e);
+        }
+    }
+
+    /// Each kind of graph edit is one step that undoes to the graph before
+    /// it and redoes to the graph after it, with a fitting label.
+    #[test]
+    fn every_graph_edit_undoes_and_redoes() {
+        type EditFn = Box<dyn Fn(&mut Graph)>;
+        let edits: Vec<(&str, EditFn)> = vec![
+            ("Add node", Box::new(|g| _ = g.add("invert", [300.0, 0.0]))),
+            ("Delete node", Box::new(|g| g.remove(2))),
+            ("Add nodes (2)", Box::new(|g| {
+                // Duplicate (and paste): copies of the selection.
+                let sel: Vec<graph::Node> = g.nodes.iter().filter(|n| n.id <= 2).cloned().collect();
+                paste_nodes(g, &sel, vec2(40.0, 40.0));
+            })),
+            ("Connect", Box::new(|g| _ = g.connect(1, 6, "mask"))),
+            ("Disconnect", Box::new(|g| _ = g.node_mut(2).unwrap().links.remove("input"))),
+            ("Reconnect", Box::new(|g| _ = g.connect(4, 2, "input"))),
+            ("Change gamma", Box::new(|g| _ = g.node_mut(4).unwrap().params.insert("gamma".into(), Value::Float(1.7)))),
+            ("Move nodes", Box::new(|g| g.nodes.iter_mut().for_each(|n| n.pos[0] += 25.0))),
+            ("Rename graph", Box::new(|g| g.name = "Rust".into())),
+            ("Expose parameter", Box::new(|g| g.exposed.push((1, "scale".into())))),
+            ("Change graph size", Box::new(|g| g.res = 512)),
+            ("Replace node", Box::new(|g| g.node_mut(3).unwrap().def = "user/my_invert".into())),
+        ];
+        for (label, edit) in edits {
+            let mut g = Graph::starter("Starter");
+            g.add("blend", [600.0, 0.0]);
+            g.exposed.push((1, "scale".into()));
+            if label == "Expose parameter" {
+                g.exposed.clear();
+            }
+            let mut doc = Doc::new(g.clone());
+            let mut undo = UndoStack::default();
+            edit(&mut doc.graph);
+            let after = doc.graph.clone();
+            assert_ne!(after, g, "{label}: the edit changes the graph");
+            assert!(doc.commit(&mut undo));
+            assert_eq!(undo.undo.len(), 1, "{label}");
+            assert_eq!(undo.undo[0].label, label);
+            assert!(!doc.commit(&mut undo), "{label}: nothing more to record");
+            doc.step(&mut undo, true);
+            assert_eq!(doc.graph, g, "{label}: undo");
+            assert!(!doc.commit(&mut undo), "{label}: undo is not a new edit");
+            doc.step(&mut undo, false);
+            assert_eq!(doc.graph, after, "{label}: redo");
+            assert_eq!(undo.undo.len(), 1);
+            assert!(undo.redo.is_empty());
+        }
+    }
+
+    /// A drag changes the graph every frame but records one step when it
+    /// ends; undo steps back through edits in order, and a new edit drops
+    /// the redo steps.
+    #[test]
+    fn a_drag_is_one_step_and_history_is_linear() {
+        let start = Graph::starter("Starter");
+        let mut doc = Doc::new(start.clone());
+        let mut undo = UndoStack::default();
+        // Dragging a slider: a new value each frame, recorded on release.
+        for f in 1..=30 {
+            doc.graph.node_mut(4).unwrap().params.insert("out_low".into(), Value::Float(f as f32 / 100.0));
+        }
+        doc.commit(&mut undo);
+        let dragged = doc.graph.clone();
+        // Dragging nodes about.
+        for _ in 0..30 {
+            doc.graph.node_mut(1).unwrap().pos[1] += 3.0;
+        }
+        doc.commit(&mut undo);
+        let moved = doc.graph.clone();
+        assert_eq!(undo.undo.iter().map(|e| e.label.as_str()).collect::<Vec<_>>(), ["Change out low", "Move nodes"]);
+
+        doc.step(&mut undo, true);
+        assert_eq!(doc.graph, dragged);
+        doc.step(&mut undo, true);
+        assert_eq!(doc.graph, start);
+        doc.step(&mut undo, false);
+        doc.step(&mut undo, false);
+        assert_eq!(doc.graph, moved);
+
+        // Undo with an edit still in progress records it first, then undoes it.
+        doc.graph.name = "Mid-edit".into();
+        doc.step(&mut undo, true);
+        assert_eq!(doc.graph, moved);
+        assert_eq!(undo.redo.last().unwrap().label, "Rename graph");
+
+        // A new edit after undoing drops the redo steps.
+        doc.step(&mut undo, true);
+        doc.graph.res = 2048;
+        doc.commit(&mut undo);
+        assert!(undo.redo.is_empty());
+        assert_eq!(undo.undo.len(), 2);
     }
 }

@@ -2843,6 +2843,8 @@ impl Engine {
                 *props = current;
             }
             Edit::Fix { map, tex } => std::mem::swap(&mut self.map_fix[*map], tex),
+            // The app swaps graphs (see `PainterApp::graph_history_step`).
+            Edit::Graph { .. } => {}
             Edit::Group(edits) => {
                 if undoing {
                     edits.iter_mut().rev().for_each(|e| self.apply_edit(e, true));

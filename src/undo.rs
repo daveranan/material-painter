@@ -220,6 +220,10 @@ pub enum Edit {
     Props(DocProps),
     /// Painted correction texture of a baked map.
     Fix { map: usize, tex: Option<Tex> },
+    /// A material graph's previous state (graph document `id`). Graphs
+    /// live in the app, not the engine, so the app applies these (see
+    /// [`Edit::for_each_graph`]); the engine skips them.
+    Graph { id: u64, graph: Box<crate::graph::Graph> },
     /// Several edits as one step: applied in order to redo, reversed to undo.
     Group(Vec<Edit>),
 }
@@ -230,6 +234,26 @@ impl Edit {
             Edit::Stroke(e) => f(e),
             Edit::Group(edits) => edits.iter_mut().for_each(|e| e.for_each_stroke(f)),
             _ => {}
+        }
+    }
+
+    /// Calls `f` with every graph edit in the order an undo (`undoing`)
+    /// or a redo applies them.
+    pub fn for_each_graph(&mut self, undoing: bool, f: &mut impl FnMut(u64, &mut crate::graph::Graph)) {
+        match self {
+            Edit::Graph { id, graph } => f(*id, graph),
+            Edit::Group(edits) if undoing => edits.iter_mut().rev().for_each(|e| e.for_each_graph(undoing, f)),
+            Edit::Group(edits) => edits.iter_mut().for_each(|e| e.for_each_graph(undoing, f)),
+            _ => {}
+        }
+    }
+
+    /// Only graph edits: the texture sets are untouched.
+    pub fn graphs_only(&self) -> bool {
+        match self {
+            Edit::Graph { .. } => true,
+            Edit::Group(edits) => edits.iter().all(Edit::graphs_only),
+            _ => false,
         }
     }
 
@@ -332,5 +356,41 @@ impl UndoStack {
 
     pub fn ram_bytes(&self) -> usize {
         self.undo.iter().chain(self.redo.iter()).map(|e| e.edit.bytes()).sum()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::graph::Graph;
+
+    fn graph_edit(id: u64, name: &str) -> Edit {
+        Edit::Graph { id, graph: Box::new(Graph::new(name)) }
+    }
+
+    #[test]
+    fn graph_edits_in_a_group_apply_in_step_order() {
+        let mut group = Edit::Group(vec![graph_edit(1, "a"), Edit::Order(vec![]), graph_edit(2, "b")]);
+        let mut seen = Vec::new();
+        group.for_each_graph(true, &mut |id, g| seen.push((id, g.name.clone())));
+        assert_eq!(seen, [(2, "b".to_string()), (1, "a".to_string())]);
+        seen.clear();
+        group.for_each_graph(false, &mut |id, g| seen.push((id, g.name.clone())));
+        assert_eq!(seen, [(1, "a".to_string()), (2, "b".to_string())]);
+        assert!(!group.graphs_only());
+        assert!(Edit::Group(vec![graph_edit(1, "a"), graph_edit(2, "b")]).graphs_only());
+        assert!(graph_edit(1, "a").graphs_only());
+    }
+
+    #[test]
+    fn graph_steps_join_the_one_history() {
+        let mut stack = UndoStack { max_entries: 3, ..UndoStack::default() };
+        for i in 0..5 {
+            stack.push(format!("step {i}"), graph_edit(1, "g"));
+        }
+        // Graph steps count toward the same limit and serials as the rest.
+        assert_eq!(stack.undo.len(), 3);
+        assert_eq!(stack.undo[0].label, "step 2");
+        assert_eq!(stack.state_serial(), 5);
     }
 }

@@ -183,6 +183,61 @@ impl Graph {
         out
     }
 
+    /// Names the change from `self` to `after`, for the undo history.
+    pub fn change_label(&self, after: &Graph) -> String {
+        let ids = |g: &Graph| g.nodes.iter().map(|n| n.id).collect::<Vec<_>>();
+        let (old, new) = (ids(self), ids(after));
+        let added = new.iter().filter(|id| !old.contains(id)).count();
+        let removed = old.iter().filter(|id| !new.contains(id)).count();
+        let plural = |n: usize, one: &str, many: &str| if n == 1 { one.to_string() } else { format!("{many} ({n})") };
+        if added > 0 && removed == 0 {
+            return plural(added, "Add node", "Add nodes");
+        }
+        if removed > 0 && added == 0 {
+            return plural(removed, "Delete node", "Delete nodes");
+        }
+        if added > 0 {
+            return "Edit nodes".into();
+        }
+        let pairs = || self.nodes.iter().filter_map(|a| Some((a, after.node(a.id)?)));
+        let links = |pick: fn(usize, usize) -> bool| pairs().any(|(a, b)| a.links != b.links && pick(a.links.len(), b.links.len()));
+        if pairs().any(|(a, b)| a.links != b.links) {
+            return if links(|a, b| b > a) {
+                "Connect".into()
+            } else if links(|a, b| b < a) {
+                "Disconnect".into()
+            } else {
+                "Reconnect".into()
+            };
+        }
+        let changed: Vec<&str> = pairs()
+            .flat_map(|(a, b)| {
+                let mut keys: Vec<&str> = a.params.keys().chain(b.params.keys()).map(String::as_str).collect();
+                keys.retain(|k| a.params.get(*k) != b.params.get(*k));
+                keys
+            })
+            .collect();
+        if let [one, rest @ ..] = changed.as_slice() {
+            return if rest.iter().all(|k| k == one) { format!("Change {}", one.replace('_', " ")) } else { "Change parameters".into() };
+        }
+        if pairs().any(|(a, b)| a.def != b.def) {
+            return "Replace node".into();
+        }
+        if self.exposed != after.exposed {
+            return if after.exposed.len() > self.exposed.len() { "Expose parameter".into() } else { "Hide parameter".into() };
+        }
+        if pairs().any(|(a, b)| a.pos != b.pos) {
+            return "Move nodes".into();
+        }
+        if self.name != after.name {
+            return "Rename graph".into();
+        }
+        if self.res != after.res {
+            return "Change graph size".into();
+        }
+        "Edit graph".into()
+    }
+
     pub fn to_json(&self, lib: &Library) -> Json {
         // A script graph saves its script while the nodes still match it
         // (positions aside); edited on the canvas, it saves its nodes.

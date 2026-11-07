@@ -587,13 +587,10 @@ impl PainterApp {
                 let steps = args.get("steps").and_then(Value::as_u64).unwrap_or(1).max(1);
                 let mut done = Vec::new();
                 for _ in 0..steps {
+                    self.record_graph_edits();
                     let stack = if tool == "undo" { &self.undo.undo } else { &self.undo.redo };
                     let Some(label) = stack.last().map(|e| e.label.clone()) else { break };
-                    if tool == "undo" {
-                        self.engine.undo(&mut self.undo);
-                    } else {
-                        self.engine.redo(&mut self.undo);
-                    }
+                    self.history_step(tool == "redo");
                     done.push(label);
                 }
                 self.after_history_step();

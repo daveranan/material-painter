@@ -84,7 +84,8 @@ impl PainterApp {
     /// edited one so the step applies to its layers.
     pub(super) fn switch_for_history(&mut self, redo: bool) {
         let stack = if redo { &self.undo.redo } else { &self.undo.undo };
-        if let Some(set) = stack.last().map(|e| e.set) {
+        // Graphs are shared by every set: their steps stay on the edited one.
+        if let Some(set) = stack.last().filter(|e| !e.edit.graphs_only()).map(|e| e.set) {
             self.switch_set(set);
         }
     }
