@@ -46,6 +46,12 @@ pub enum Source {
     /// Where the texture set's features show (see `engine::Features`):
     /// feature 1, feature 2 and the main feature, summing to 1.
     Features,
+    /// Both feature masks in one channel: 0.5 where only the main feature
+    /// shows, falling to 0 as mask 1 rises, climbing to 1 as mask 2 rises
+    /// (0.5 + (mask2 - mask1) / 2). Where both show, the stronger wins by
+    /// their difference, so a texel never reads as three features and the
+    /// value passes smoothly through 0.5 under filtering.
+    Feature,
     /// The soft displacement map a game moves its vertex grid with: the
     /// displacement layers (or, without any, the height), low-passed so
     /// it rounds on a 5 cm grid, 0.5 at the soil, 0..1 spanning the
@@ -74,7 +80,7 @@ impl Source {
             Source::Emissive,
         ];
         v.extend((0..MAPS.len()).map(Source::Mesh));
-        v.extend([Source::WorldNormal, Source::Position, Source::Features, Source::Occlusion, Source::Displacement, Source::Zero, Source::One]);
+        v.extend([Source::WorldNormal, Source::Position, Source::Features, Source::Feature, Source::Occlusion, Source::Displacement, Source::Zero, Source::One]);
         v
     }
 
@@ -94,6 +100,7 @@ impl Source {
             Source::WorldNormal => "World space normal".into(),
             Source::Position => "Position".into(),
             Source::Features => "Feature masks (1, 2, main)".into(),
+            Source::Feature => "Feature (one channel: mask 1 below 0.5, mask 2 above)".into(),
             Source::Occlusion => "Ambient occlusion (from height)".into(),
             Source::Displacement => "Displacement (soft, game grid)".into(),
             Source::Zero => "Black (0)".into(),
@@ -306,14 +313,15 @@ pub fn builtin_templates() -> Vec<Template> {
             ],
         ),
         // Feature-graded game materials (one grading per feature, as in
-        // Helldivers 2's terrain): color and height, then the DirectX normal
-        // and two feature masks; `$project.material.json` names the features.
+        // Helldivers 2's terrain), contract v3: color and blend height; the
+        // DirectX normal with AO and both feature masks in one channel (one
+        // texture read for the ground); the soft displacement.
+        // `$project.material.json` names the features.
         t(
             "Game material (features)",
             vec![
                 OutputMap::packed("$project_ColorHeight", Layout::Rgba, [Chan::of(BaseColor, 0), Chan::of(BaseColor, 1), Chan::of(BaseColor, 2), Chan::of(Height, 0)]),
-                OutputMap::packed("$project_NormalMasks", Layout::Rgba, [Chan::of(NormalDx, 0), Chan::of(NormalDx, 1), Chan::of(Features, 0), Chan::of(Features, 1)]),
-                OutputMap::gray("$project_AO", Chan::of(Occlusion, 0)),
+                OutputMap::packed("$project_NormalAOFeature", Layout::Rgba, [Chan::of(NormalDx, 0), Chan::of(NormalDx, 1), Chan::of(Occlusion, 0), Chan::of(Feature, 0)]),
                 OutputMap { force_16: true, ..OutputMap::gray("$project_Displacement", Chan::of(Displacement, 0)) },
             ],
         ),
@@ -889,6 +897,10 @@ impl Sources<'_> {
                     .collect(),
                 None => vec![[0.0, 0.0, 1.0]; n],
             },
+            Source::Feature => match &s.features {
+                Some((p, _)) => (0..n).map(|i| [(0.5 + 0.5 * (p.data[i][1] - p.data[i][0])).clamp(0.0, 1.0); 3]).collect(),
+                None => vec![[0.5; 3]; n],
+            },
             Source::Displacement => {
                 let disp_m = s.features.as_ref().map_or(0.2, |(_, f)| f.displacement_m);
                 displacement_metres(s).into_iter().map(|d| [(0.5 + d / disp_m).clamp(0.0, 1.0); 3]).collect()
@@ -1065,7 +1077,7 @@ pub fn export(s: &Snapshot, template: &Template, settings: &Settings) -> Result<
             Ok(path)
         })
         .collect::<Result<_, String>>()?;
-    let uses_features = template.maps.iter().any(|m| m.chans[..m.layout.channels()].iter().any(|c| c.src == Source::Features));
+    let uses_features = template.maps.iter().any(|m| m.chans[..m.layout.channels()].iter().any(|c| matches!(c.src, Source::Features | Source::Feature)));
     if let Some((_, features)) = s.features.as_ref().filter(|_| uses_features) {
         files.push(write_manifest(template, settings, features, settings.size.unwrap_or(s.res), rest_height(s))?);
     }
@@ -1129,7 +1141,7 @@ pub fn build_maps(s: &Snapshot, template: &Template, settings: &Settings) -> Res
     }
     let cache = sources.cache;
     let out_size = settings.size.unwrap_or(res);
-    let uses_features = template.maps.iter().any(|m| m.chans[..m.layout.channels()].iter().any(|c| c.src == Source::Features));
+    let uses_features = template.maps.iter().any(|m| m.chans[..m.layout.channels()].iter().any(|c| matches!(c.src, Source::Features | Source::Feature)));
     if uses_features && s.features.is_none() {
         return Err("This template exports feature masks: name the texture set's features and tag layers with them first.".into());
     }
@@ -1220,6 +1232,7 @@ fn write_manifest(template: &Template, settings: &Settings, f: &Features, size: 
             Source::NormalDx => ["normal_dx.x", "normal_dx.y", "normal_dx.z"][c.comp.min(2) as usize].to_string(),
             Source::NormalGl => ["normal_gl.x", "normal_gl.y", "normal_gl.z"][c.comp.min(2) as usize].to_string(),
             Source::Features => ["mask1", "mask2", "main"][c.comp.min(2) as usize].to_string(),
+            Source::Feature => "feature".into(),
             Source::Height => "height".into(),
             Source::Occlusion => "ao".into(),
             Source::Displacement => "displacement".into(),
@@ -1236,9 +1249,10 @@ fn write_manifest(template: &Template, settings: &Settings, f: &Features, size: 
         })
         .collect();
     let has_disp = template.maps.iter().any(|m| m.chans[..m.layout.channels()].iter().any(|c| c.src == Source::Displacement));
+    let has_feature = template.maps.iter().any(|m| m.chans[..m.layout.channels()].iter().any(|c| c.src == Source::Feature));
     let mut v = json!({
         "format": "material-painter/feature-material",
-        "version": if has_disp { 2 } else { 1 },
+        "version": if has_feature { 3 } else if has_disp { 2 } else { 1 },
         "name": manifest_stem(settings),
         "features": {"main": f.names[0], "mask1": f.names[1], "mask2": f.names[2]},
         // Rounded so the file reads as typed (f32 noise otherwise).

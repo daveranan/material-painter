@@ -5,7 +5,8 @@ times relief. Reports the lift over each feature and across the tile, in cm.
 
     python tools/game_sim.py <export folder> <material> [<material> ...]
 
-Reads `<material>.material.json`, `_ColorHeight.png` and `_NormalMasks.png`
+Reads `<material>.material.json`, `_ColorHeight.png` and `_NormalAOFeature.png`
+(contract v3; `_NormalMasks.png` for older exports)
 from the "Game material (features)" export. Mirrors terrain.wgsl
 (terrainRelief) and the 1024 load in view/src/splat.rs of the game; keep the
 grid step (0.05 m) and load size in step with them."""
@@ -20,7 +21,14 @@ for name in sys.argv[2:]:
     m = json.load(open(f'{exp}/{name}.material.json'))
     tile, relief, rest = m['tile_m'], m['relief_m'], m.get('rest_height', 0.5)
     h = Image.open(f'{exp}/{name}_ColorHeight.png').convert('RGBA').split()[3].resize((1024, 1024), Image.LANCZOS)
-    nm = np.asarray(Image.open(f'{exp}/{name}_NormalMasks.png').convert('RGBA').resize((1024, 1024)), dtype=np.float32) / 255
+    try:
+        f = np.asarray(Image.open(f'{exp}/{name}_NormalAOFeature.png').convert('RGBA').resize((1024, 1024)), dtype=np.float32)[..., 3] / 255
+        # One channel: 0.5 - mask1 / 2, or 0.5 + mask2 / 2.
+        nm = np.zeros((1024, 1024, 4), dtype=np.float32)
+        nm[..., 2] = np.clip(1 - 2 * f, 0, 1)
+        nm[..., 3] = np.clip(2 * f - 1, 0, 1)
+    except FileNotFoundError:
+        nm = np.asarray(Image.open(f'{exp}/{name}_NormalMasks.png').convert('RGBA').resize((1024, 1024)), dtype=np.float32) / 255
     lod = math.log2(0.05 * 1.5 / (tile / 1024))
     lo, hi = int(lod), int(lod) + 1
     def mip(l):

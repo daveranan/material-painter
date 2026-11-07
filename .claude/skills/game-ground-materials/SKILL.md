@@ -132,10 +132,18 @@ rise there. Helldivers 2's ground sets solve this, and so do ours now:
   if the height builds a root only where a value passes 0.5, the mask must
   cut at the same 0.5. Soft grey masks make the colour, the masks and the
   displacement disagree (roots in the mask where the height has none).
-- **A separate AO map.** The game template writes `$project_AO`, ambient
-  occlusion from the final height at the material's real tile and relief
-  (white open). Don't bake strong contact AO into colour as well; keep
-  colour contrast moderate.
+- **AO packed with the normal (contract v3).** The game template writes
+  `$project_NormalAOFeature`: normal X, normal Y, ambient occlusion from the
+  final height at the material's real tile and relief (white open), and
+  both feature masks in one channel (`feature`: 0.5 main only, down to 0 as
+  mask 1 rises, up to 1 as mask 2 rises). One texture read for the ground.
+  Don't bake strong contact AO into colour as well; keep colour contrast
+  moderate.
+- **Masks must not overlap.** With one feature channel a texel is main +
+  mask 1 or main + mask 2, never all three (where both show, the export
+  keeps their difference). So mask 1 and mask 2 should rarely meet: moss
+  on rocks in a rock bed means the rocks are the *main* feature there, not
+  a mask. Make the feature that covers most of the tile `main`.
 - **A separate displacement map (contract v2).** The game displaces its
   grid with `$project_Displacement.png` when the manifest lists it, not
   with the blend height. Make it with a **Displacement layer** (a fill with

@@ -88,15 +88,16 @@ Mask 1 and 2 are where each feature *shows* after layers above cover it
 height soft (one bottom layer) and put every other layer's height in the
 normal map with `height_detail` (see `game-ground-materials` §2b). `mp export_textures folder=DIR preset="Game
 material (features)" size=1024` writes `<project>_ColorHeight.png` (sRGB color,
-height in A), `<project>_NormalMasks.png` (DirectX normal XY, mask1, mask2),
-`<project>_AO.png` (ambient occlusion from the final height at the real tile
-and relief; white open), `<project>_Displacement.png` (16-bit grey, the
+height in A), `<project>_NormalAOFeature.png` (DirectX normal XY, ambient
+occlusion from the final height at the real tile and relief, white open, and
+`feature`: both masks in one channel, 0.5 + (mask2 - mask1) / 2, so keep the
+masks from overlapping), `<project>_Displacement.png` (16-bit grey, the
 displacement layers, or the height without any, rounded by a ~1.8 cm blur,
-the soil's median at 0.5, 0..1 spanning `features.displacement_m`, default 0.2; manifest
-`version` 2 and `displacement_m`) and `<project>.material.json` (feature names, tile
+the soil's median at 0.5, 0..1 spanning `features.displacement_m`, default 0.2), manifest
+`version` 3 with `displacement_m` and `<project>.material.json` (feature names, tile
 and relief in metres, `rest_height`: the main feature's median height 0..1,
-which displacement should lift from, and what every channel holds). The AO
-is also a custom-template source: "Ambient occlusion (from height)".
+which displacement should lift from, and what every channel holds). AO, the
+one-channel feature and the separate masks are also custom-template sources.
 
 ## Files
 Blob paths are relative to `name.data/`. Paint textures are PNG (edit them

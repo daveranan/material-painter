@@ -200,7 +200,7 @@ fn export_templates() {
     for (fi, format) in Format::ALL.into_iter().enumerate() {
         for (ti, t) in export::builtin_templates().iter().enumerate() {
             // Feature templates need tagged layers (see `feature_material_export`).
-            if t.maps.iter().any(|m| m.chans.iter().any(|c| c.src == export::Source::Features)) {
+            if t.maps.iter().any(|m| m.chans.iter().any(|c| matches!(c.src, export::Source::Features | export::Source::Feature))) {
                 continue;
             }
             // Every template in PNG; the other formats with two templates.
@@ -396,32 +396,33 @@ fn feature_material_export() {
         use_baked_normal: false,
     };
     let files = export::export(&snap, &template, &settings).expect("exports");
-    assert_eq!(files.len(), 5, "four maps and the manifest: {files:?}");
+    assert_eq!(files.len(), 4, "three maps and the manifest: {files:?}");
     // Flat: the displacement sits at level ground (0.5), 16 bits.
     let disp = image::open(root.join("RockMoss_Displacement.png")).unwrap();
     assert!(matches!(disp, image::DynamicImage::ImageLuma16(_)), "16-bit grey displacement");
     let d = disp.to_luma16().get_pixel(res / 2, res / 2).0[0] as f32 / 65535.0;
     assert!((d - 0.5).abs() < 0.01, "flat displacement at 0.5: {d}");
-    // A flat tile is open everywhere: its AO is white.
-    let ao = image::open(root.join("RockMoss_AO.png")).unwrap().to_luma8();
-    assert!(ao.get_pixel(res / 2, res / 2).0[0] > 250, "flat AO is open");
-    let b = image::open(root.join("RockMoss_NormalMasks.png")).unwrap().to_rgba8();
+    let b = image::open(root.join("RockMoss_NormalAOFeature.png")).unwrap().to_rgba8();
     let p = b.get_pixel(res / 2, res / 2).0;
-    // Pebbles (0.5) cover half of the moss (0.6): moss 0.3, pebbles 0.5; the
-    // untagged tint on top changes nothing.
+    // A flat tile is open everywhere: its AO (B) is white.
+    assert!(p[2] > 250, "flat AO is open: {p:?}");
+    // Pebbles (0.5) cover half of the moss (0.6): moss 0.3, pebbles 0.5, so
+    // the one feature channel reads 0.5 + (0.5 - 0.3) / 2; the untagged
+    // tint on top changes nothing.
     let near = |v: u8, want: f32| (v as f32 / 255.0 - want).abs() < 0.02;
-    assert!(near(p[2], 0.3) && near(p[3], 0.5), "masks at the center: {p:?}");
+    assert!(near(p[3], 0.6), "feature at the center: {p:?}");
     let manifest: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(root.join("RockMoss.material.json")).unwrap()).unwrap();
     assert_eq!(manifest["features"]["mask2"], "pebbles");
-    assert_eq!(manifest["maps"][1]["channels"][2], "mask1");
+    assert_eq!(manifest["maps"][1]["channels"][2], "ao");
+    assert_eq!(manifest["maps"][1]["channels"][3], "feature");
     assert_eq!(manifest["relief_m"], 0.05);
     // The rest height: the main feature's median height, as stored (0..1).
     let rest = manifest["rest_height"].as_f64().expect("rest_height");
     assert!((0.0..=1.0).contains(&rest), "rest height in 0..1: {rest}");
-    assert_eq!(manifest["version"], 2);
+    assert_eq!(manifest["version"], 3);
     assert_eq!(manifest["displacement_m"], 0.2);
-    assert_eq!(manifest["maps"][3]["channels"][0], "displacement");
-    assert_eq!(manifest["maps"][3]["srgb"], false);
+    assert_eq!(manifest["maps"][2]["channels"][0], "displacement");
+    assert_eq!(manifest["maps"][2]["srgb"], false);
 
     // Without tags the template refuses rather than writing empty masks.
     for l in &mut engine.layers {
@@ -432,8 +433,8 @@ fn feature_material_export() {
     let snap = export::snapshot(&engine, &rs.device, &rs.queue, mesh);
     assert!(export::export(&snap, &template, &settings).is_err());
 
-    // Smart masks: moss and pebbles in clouds. Where both show, pebbles
-    // cover moss, so the masks never add up past 1.
+    // Smart masks: moss and pebbles in clouds: both sides of the feature
+    // channel show (mask 1 below 0.5, mask 2 above).
     engine.layers[1].feature = Some(1);
     engine.layers[2].feature = Some(2);
     for (i, seed) in [(1, 3.0), (2, 11.0)] {
@@ -445,20 +446,18 @@ fn feature_material_export() {
     engine.mark_dirty();
     engine.composite();
     let snap = export::snapshot(&engine, &rs.device, &rs.queue, Arc::new(crate::mesh::Primitive::Plane.build()));
-    // At a smaller size too: resizing must not bleed mask 2 (alpha) into mask 1.
+    // At a smaller size too: resizing must not bleed the feature (alpha)
+    // into the AO.
     let settings = Settings { size: Some(res / 2), ..settings };
     export::export(&snap, &template, &settings).expect("exports");
-    let b = image::open(root.join("RockMoss_NormalMasks.png")).unwrap().to_rgba8();
-    let (mut m1, mut m2, mut worst) = (0.0, 0.0, 0u32);
-    for p in b.pixels() {
-        m1 += p.0[2] as f32;
-        m2 += p.0[3] as f32;
-        worst = worst.max(p.0[2] as u32 + p.0[3] as u32);
-    }
-    let n = (res * res / 4) as f32 * 255.0;
-    println!("  clouds: mask1 {:.3}, mask2 {:.3}, largest sum {}", m1 / n, m2 / n, worst);
-    assert!(m1 / n > 0.05 && m2 / n > 0.05, "both masks show somewhere");
-    assert!(worst <= 257, "masks overlap: sum {worst}/255");
+    let b = image::open(root.join("RockMoss_NormalAOFeature.png")).unwrap().to_rgba8();
+    let n = (res * res / 4) as f32;
+    let m1 = b.pixels().filter(|p| p.0[3] < 115).count() as f32 / n;
+    let m2 = b.pixels().filter(|p| p.0[3] > 140).count() as f32 / n;
+    let ao_min = b.pixels().map(|p| p.0[2]).min().unwrap_or(0);
+    println!("  clouds: mask1 side {m1:.3}, mask2 side {m2:.3}, lowest AO {ao_min}");
+    assert!(m1 > 0.05 && m2 > 0.05, "both masks show somewhere");
+    assert!(ao_min > 240, "flat tile, AO stays open: {ao_min}");
 }
 
 /// Height blend: a fill shows only where its height rises above the stack
@@ -512,20 +511,22 @@ fn height_blend_features() {
     };
     export::export(&snap, &template, &settings).expect("exports");
     let a = image::open(root.join("SoilGrass_ColorHeight.png")).unwrap().to_rgba8();
-    let b = image::open(root.join("SoilGrass_NormalMasks.png")).unwrap().to_rgba8();
+    let b = image::open(root.join("SoilGrass_NormalAOFeature.png")).unwrap().to_rgba8();
     let (mut shown, mut worst) = (0.0f32, 0.0f32);
     for (pa, pb) in a.pixels().zip(b.pixels()) {
         // Black below, white above, mixed as stored (sRGB values): the
         // color is the coverage.
         let cover = pa.0[0] as f32 / 255.0;
-        let mask1 = pb.0[2] as f32 / 255.0;
+        // Only mask 1 here: the feature channel is 0.5 - mask1 / 2.
+        let mask1 = 1.0 - 2.0 * pb.0[3] as f32 / 255.0;
         shown += mask1;
         worst = worst.max((cover - mask1).abs());
     }
     let shown = shown / (res * res) as f32;
     println!("  grass shows on {:.0}% of the tile, mask vs composite differ by at most {worst:.3}", shown * 100.0);
     assert!(shown > 0.2 && shown < 0.8, "height blend shows grass only where it rises: {shown}");
-    assert!(worst < 0.03, "the feature mask follows the composite: off by {worst}");
+    // 8 bits over half the range: one step is 2/255 of the mask.
+    assert!(worst < 0.04, "the feature mask follows the composite: off by {worst}");
 }
 
 /// The color nodes from the feature-grading workflow, on a real pre-blended
