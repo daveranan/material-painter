@@ -238,6 +238,29 @@ In MP (fast loop):
   the brief's ratios).
 - Self-review with `pbr-texturing-craft` §review.
 
+**Terrain export (the game's contract v3).** Always the same settings, so
+every ground material loads the same way:
+
+```
+mp export_textures folder=<biome>/export "preset=Game material (features)" size=2048
+```
+
+PNG, 8-bit (Displacement is written 16-bit by itself), infinite padding.
+It writes, per material:
+
+| File | Channels |
+|---|---|
+| `<name>_ColorHeight.png` (sRGB) | base colour RGB, blend height A |
+| `<name>_NormalAOFeature.png` | normal_dx.x, normal_dx.y, ao, feature (0.5 main, ->0 mask 1, ->1 mask 2) |
+| `<name>_Displacement.png` (16-bit grey) | displacement, 0.5 = soil, 0..1 = `displacement_m` |
+| `<name>.material.json` | version 3: features, tile_m, relief_m, displacement_m, rest_height, maps |
+
+Before handing it over, check: graph_errors empty; `tools/game_sim.py`
+and the per-feature displacement lift (roots p50 6-8 cm, stones 5-10 cm,
+soil 0, nothing clipped); feature masks barely overlap (the dominant
+feature is main). The game reads only what the manifest lists; change the
+contract only together with the game's loader.
+
 In the game (the real judge): export with the "Game material (features)"
 template, then render the game's fixed cameras (see `references/brief.md`,
 "What comes back") with palette off, each biome palette, and the features
