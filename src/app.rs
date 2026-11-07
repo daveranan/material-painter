@@ -3480,8 +3480,21 @@ impl PainterApp {
             slider(ui, "Height scale", &mut self.view.height_strength, 0.0..=8.0);
             labeled(ui, "Displacement", |ui| {
                 ui.add(egui::Slider::new(&mut self.view.displacement, 0.0..=0.2).max_decimals(3))
-                    .on_hover_text("Parallax in the 3D view: how high the highest painted height rises (the mesh fits a 2-unit box). The textures don't change")
+                    .on_hover_text("How high the highest painted height rises in the 3D view (the mesh fits a 2-unit box): parallax, or the mesh itself with tessellation. The textures don't change")
             });
+            labeled(ui, "Tessellation", |ui| {
+                let t = &mut self.view.tessellation;
+                egui::ComboBox::from_id_salt("tessellation").selected_text(t.name()).show_ui(ui, |ui| {
+                    for v in crate::viewport::Tessellation::ALL {
+                        ui.selectable_value(t, v, v.name());
+                    }
+                })
+                .response
+                .on_hover_text("Subdivide the mesh in the 3D view and move it by the height: true silhouettes, self-shadowing and seams, as a game engine with tessellation shows them. Higher levels use more triangles. Display only")
+            });
+            if self.view.tessellation != crate::viewport::Tessellation::Off && self.view.displacement <= 0.0 {
+                ui.label(egui::RichText::new("Set a displacement to see the height move the mesh.").small().color(theme::TEXT_DIM));
+            }
             let mut on = self.auto_smooth.is_some();
             let mut angle = self.auto_smooth.unwrap_or(self.auto_smooth_angle);
             let mut changed = false;
