@@ -68,9 +68,11 @@ the recipes are starting points to tune by eye, not quotes.
 - **ArtStation Magazine "Natural materials" (2022)**: a roundup linking the
   two ArtStation posts above plus a sand scan WIP and a frozen lake
   breakdown (not read in depth).
-- **Adobe Tile Sampler reference**: the page wouldn't load (403 to the
-  fetcher, blank in the browser). The parameter knowledge in the recipes
-  (pattern input atlas and random pick, scale/position/rotation/luminance
-  random, mask map and threshold, mask random, scale and vector map
-  inputs, Max/Add blending) is from general Designer knowledge, not that
-  page.
+- **Adobe Tile Sampler reference**: provided as page text by the user;
+  summarized in `recipes.md` ("Tile Sampler, the reference").
+- **Graph screenshots** (provided by the user): Meere's cracks, multi-
+  directional warp, grass blade, lowpass and water-level graphs; Habibi's
+  full rocky-ground graph (layout, ground, large and mid stones, cliff,
+  Shape Splatter stone scattering, surface detail, world-unit outputs,
+  colour palette, albedo). Transcribed in `recipes.md` ("From real
+  production graphs").

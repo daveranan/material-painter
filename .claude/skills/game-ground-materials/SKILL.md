@@ -157,6 +157,29 @@ view. Compare to the brief's reference and the previous screenshot; fix
 the biggest problem first (scale and tiling, then height read, then color
 range, then detail).
 
+## Roadmap: what production graphs need that MP lacks
+
+From the Meere and Habibi graphs (`references/recipes.md`), in the order
+that unlocks the most:
+1. **Tile Sampler upgrade**: up to six pattern inputs with random pick, a
+   mask map (threshold, bounding-box sampling), scale and rotation maps,
+   luminance random as per-instance height, a per-instance ID output.
+2. **Distance** (nearest-source propagation: cracks, Voronoi chunks).
+3. **Flood Fill** and its outputs: random grey, gradient (per-shape tilt),
+   bounding box. Every stone layer in both graphs uses it.
+4. **Highpass, Non-Uniform Blur, Non-Uniform and Multi-Directional Warp**.
+5. **Auto Levels** as min/max stretch (needs a min/max reduction like the
+   `@mean` one; today's `auto_level` only centres).
+6. **Height blend as a graph op**, and layered scattering that settles each
+   stone layer around the last (AO/shadow of the previous layer as mask).
+7. **Normal to Height, Shadows, Facing Normal**, world-unit normal and AO.
+
+And the authoring format (planned): a **material script**, plain text
+with one named step per line (`stones = tile_sampler(...) | blur(2)`), as
+the source of truth instead of node JSON. It compiles onto the same GPU
+ops, the Designer canvas becomes a view of it, and any named step can be
+rendered on its own for review.
+
 ## Gaps in MP today and what to do instead
 
 Missing compared with Substance (see `references/recipes.md` for
