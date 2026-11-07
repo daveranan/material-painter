@@ -91,8 +91,8 @@ material (features)" size=1024` writes `<project>_ColorHeight.png` (sRGB color,
 height in A), `<project>_NormalMasks.png` (DirectX normal XY, mask1, mask2),
 `<project>_AO.png` (ambient occlusion from the final height at the real tile
 and relief; white open), `<project>_Displacement.png` (16-bit grey, the
-displacement layers, or the height without any, low-passed to ~10 cm, 0.5 at
-the mean, 0..1 spanning `features.displacement_m`, default 0.2; manifest
+displacement layers, or the height without any, rounded by a ~1.8 cm blur,
+the soil's median at 0.5, 0..1 spanning `features.displacement_m`, default 0.2; manifest
 `version` 2 and `displacement_m`) and `<project>.material.json` (feature names, tile
 and relief in metres, `rest_height`: the main feature's median height 0..1,
 which displacement should lift from, and what every channel holds). The AO

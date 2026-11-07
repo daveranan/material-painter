@@ -141,12 +141,19 @@ rise there. Helldivers 2's ground sets solve this, and so do ours now:
   with the blend height. Make it with a **Displacement layer** (a fill with
   `displacement: true`; colour and roughness off, height on): only these
   layers draw in the displacement pass, where 0..1 spans the features'
-  `displacement_m` (0.25: HD2's scale). Put in it only big forms: rolling
-  mounds and hollows 0.3-2 m across (noise scale 2 and 6 on a 3 m tile),
-  plus soft swells under roots and stones 10 cm and up. Aim for a 15-25 cm
-  range with nothing clipped (keep the raw sum under 1). The export
-  low-passes it to ~10 cm, recentres it on 0.5, writes 16 bits and adds the
-  forms' slopes to the normal map. Preview with `preview_settings
+  `displacement_m` (0.3 for our forest set). **The features carry it**:
+  each root and stone gets a rounded profile from its distance to its own
+  edge (`distance(invert(mask), max_distance=0.012-0.02) | levels(gamma=2.5)`,
+  times the stone's own profile so touching stones stay separate bumps), so
+  wide pieces stand tall and thin ones barely rise. Targets, per feature
+  mask: roots p50 6-8 cm along their length, stones 5-10 cm scaled with
+  size, soil 0, mounds and ruts +-2 cm only (wide mounds are an invisible
+  slope and eat the range). Nothing under ~8 cm wide. No clipping: the soil
+  sits at 0.5, so the tallest piece must stay under displacement_m / 2;
+  raise displacement_m and scale the layer down rather than clip. The
+  export rounds it (about a 1.8 cm Gaussian), sets the soil's median to
+  0.5, writes 16 bits and adds the forms' slopes to the normal map. Measure
+  each feature's lift from the exported map after every change. Preview with `preview_settings
   show_displacement=true`. With the displacement apart, the blend height
   (ColorHeight alpha) can carry full HD2-style detail again: tapered,
   stacked pieces, moderate contrast, not soft swells.

@@ -48,7 +48,7 @@ pub enum Source {
     Features,
     /// The soft displacement map a game moves its vertex grid with: the
     /// displacement layers (or, without any, the height), low-passed so
-    /// nothing is narrower than ~10 cm, 0.5 at the mean, 0..1 spanning the
+    /// it rounds on a 5 cm grid, 0.5 at the soil, 0..1 spanning the
     /// features' `displacement_m`.
     Displacement,
     /// Ambient occlusion from the final height: contact shading where raised
@@ -736,16 +736,17 @@ fn box_blur_wrap(v: &[f32], res: usize, radius: usize) -> Vec<f32> {
     rows_t(&rows_t(v))
 }
 
-/// The displacement in metres, mean 0, per texel: the displacement pass
-/// (0..1 spanning `displacement_m`) or, without displacement layers, the
-/// height (0..1 spanning `relief_m`), low-passed (three box blurs, about a
-/// 3 cm Gaussian) so nothing narrower than ~10 cm (two cells of a 5 cm
-/// grid) is left to zigzag.
+/// The displacement in metres per texel, 0 at the soil (see
+/// `ground_level`): the displacement pass (0..1 spanning `displacement_m`)
+/// or, without displacement layers, the height (0..1 spanning `relief_m`),
+/// low-passed (three box blurs, about a 1.8 cm Gaussian: a 10 cm root keeps
+/// most of its rise as a rounded ridge, nothing sharp is left to zigzag on
+/// a 5 cm grid).
 fn displacement_metres(s: &Snapshot) -> Vec<f32> {
     soft_metres(s, s.displacement.is_some())
 }
 
-/// The height alone in metres, low-passed and mean 0 like the displacement.
+/// The height alone in metres, low-passed and levelled like the displacement.
 fn soft_height_metres(s: &Snapshot) -> Vec<f32> {
     soft_metres(s, false)
 }
@@ -762,8 +763,24 @@ fn soft_metres(s: &Snapshot, from_pass: bool) -> Vec<f32> {
     for _ in 0..3 {
         m = box_blur_wrap(&m, res, radius);
     }
-    let mean = (m.iter().map(|&v| v as f64).sum::<f64>() / m.len().max(1) as f64) as f32;
-    m.iter().map(|&v| v - mean).collect()
+    let level = ground_level(s, &m);
+    m.iter().map(|&v| v - level).collect()
+}
+
+/// Level ground in a soft height: the median over the main feature (the
+/// soil), or over everything without features, so the soil sits at 0 and
+/// the features rise above it however much of the tile they cover.
+fn ground_level(s: &Snapshot, m: &[f32]) -> f32 {
+    let mut v: Vec<f32> = match &s.features {
+        Some((p, _)) => m.iter().zip(&p.data).filter(|(_, w)| 1.0 - w[0] - w[1] > 0.5).map(|(h, _)| *h).collect(),
+        None => Vec::new(),
+    };
+    if v.len() < 16 {
+        v = m.to_vec();
+    }
+    let mid = v.len() / 2;
+    v.select_nth_unstable_by(mid, |a, b| a.total_cmp(b));
+    v[mid]
 }
 
 // ------------------------------------------------------------------ evaluation

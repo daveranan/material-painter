@@ -276,8 +276,8 @@ fn height_detail_leaves_height() {
 }
 
 /// A displacement layer draws only in the displacement pass: the material's
-/// height ignores it, the exported Displacement map follows it (soft, mean
-/// 0.5), and the viewport is left as it was.
+/// height ignores it, the exported Displacement map follows it (soft, the
+/// soil at 0.5), and the viewport is left as it was.
 #[test]
 #[ignore]
 fn displacement_layer_exports_apart() {
@@ -332,9 +332,12 @@ fn displacement_layer_exports_apart() {
     export::export(&snap, &template, &settings).expect("exports");
     let disp = image::open(root.join("Mound_Displacement.png")).unwrap().to_luma16();
     let v: Vec<f32> = disp.pixels().map(|p| p.0[0] as f32 / 65535.0).collect();
-    let mean = v.iter().sum::<f32>() / v.len() as f32;
-    let (lo, hi) = v.iter().fold((1f32, 0f32), |(a, b), &x| (a.min(x), b.max(x)));
-    assert!((mean - 0.5).abs() < 0.01, "displacement mean at level ground: {mean}");
+    let mut sorted = v.clone();
+    sorted.sort_by(f32::total_cmp);
+    let median = sorted[sorted.len() / 2];
+    let (lo, hi) = (sorted[0], sorted[sorted.len() - 1]);
+    // All soil (the only feature): its median is level ground.
+    assert!((median - 0.5).abs() < 0.01, "soil median at level ground: {median}");
     assert!(hi - lo > 0.1, "the mound shows in the displacement: {lo}..{hi}");
 }
 
