@@ -29,6 +29,7 @@ mod select;
 mod spp;
 mod spp_import;
 mod textures;
+mod terrain;
 mod theme;
 mod undo;
 mod viewport;

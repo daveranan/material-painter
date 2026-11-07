@@ -30,6 +30,8 @@ pub(super) enum Pane {
     /// Shader Maker: the code (or the start page).
     ShaderCode,
     ShaderPreview,
+    /// The terrain blend preview (materials on a heightmap, the game's splat and blend).
+    Terrain,
 }
 
 impl Pane {
@@ -51,13 +53,14 @@ impl Pane {
             Pane::ShaderList => (i::FOLDER, "Shaders"),
             Pane::ShaderCode => (i::MAGIC_WAND, "Code"),
             Pane::ShaderPreview => (i::APERTURE, "Preview"),
+            Pane::Terrain => (i::APERTURE, "Terrain"),
         };
         format!("{icon}  {name}")
     }
 
     /// Viewports fill their tab edge to edge; panels get padding.
     fn padded(self) -> bool {
-        !matches!(self, Pane::View3d | Pane::View2d | Pane::DesignView | Pane::Graph)
+        !matches!(self, Pane::View3d | Pane::View2d | Pane::DesignView | Pane::Graph | Pane::Terrain)
     }
 }
 
@@ -74,8 +77,9 @@ fn panes(ws: Workspace) -> &'static [Pane] {
             Pane::MeshSet,
             Pane::Preview,
             Pane::Shelf,
+            Pane::Terrain,
         ],
-        Workspace::Designer => &[Pane::DesignView, Pane::Graph, Pane::NodeSettings],
+        Workspace::Designer => &[Pane::DesignView, Pane::Graph, Pane::NodeSettings, Pane::Terrain],
         Workspace::ShaderMaker => &[Pane::ShaderList, Pane::ShaderCode, Pane::ShaderPreview],
     }
 }
@@ -93,8 +97,9 @@ fn default_tree(ws: Workspace) -> Tree<Pane> {
         Workspace::Paint => {
             let v3 = t.insert_pane(Pane::View3d);
             let v2 = t.insert_pane(Pane::View2d);
+            let terrain = t.insert_pane(Pane::Terrain);
             let v3 = t.insert_tab_tile(vec![v3]);
-            let v2 = t.insert_tab_tile(vec![v2]);
+            let v2 = t.insert_tab_tile(vec![v2, terrain]);
             let views = t.insert_horizontal_tile(vec![v3, v2]);
             let shelf = t.insert_pane(Pane::Shelf);
             let shelf = t.insert_tab_tile(vec![shelf]);
@@ -115,7 +120,8 @@ fn default_tree(ws: Workspace) -> Tree<Pane> {
         }
         Workspace::Designer => {
             let view = t.insert_pane(Pane::DesignView);
-            let view = t.insert_tab_tile(vec![view]);
+            let terrain = t.insert_pane(Pane::Terrain);
+            let view = t.insert_tab_tile(vec![view, terrain]);
             let graph = t.insert_pane(Pane::Graph);
             let graph = t.insert_tab_tile(vec![graph]);
             let node = t.insert_pane(Pane::NodeSettings);
@@ -164,12 +170,33 @@ fn valid(tree: &Tree<Pane>, ws: Workspace) -> bool {
         && tree.tiles.tiles().filter(|t| matches!(t, Tile::Pane(_))).count() == panes(ws).len()
 }
 
+/// A layout saved before the Terrain pane existed gets it as a tab beside
+/// the 2D view (Material Paint) or the material view (Material Designer).
+fn with_terrain(mut tree: Tree<Pane>, ws: Workspace) -> Tree<Pane> {
+    if !panes(ws).contains(&Pane::Terrain) || tree.tiles.find_pane(&Pane::Terrain).is_some() {
+        return tree;
+    }
+    let beside = if ws == Workspace::Paint { Pane::View2d } else { Pane::DesignView };
+    let Some(pane) = tree.tiles.find_pane(&beside) else { return tree };
+    let Some(parent) = tree.tiles.parent_of(pane) else { return tree };
+    let terrain = tree.tiles.insert_pane(Pane::Terrain);
+    if let Some(Tile::Container(Container::Tabs(tabs))) = tree.tiles.get_mut(parent) {
+        tabs.add_child(terrain);
+    }
+    tree
+}
+
 impl Docks {
     pub fn load() -> Docks {
         let saved: Option<Vec<Tree<Pane>>> =
             layout_path().and_then(|p| std::fs::read_to_string(p).ok()).and_then(|t| serde_json::from_str(&t).ok());
         let trees = Workspace::ALL.map(|ws| {
-            saved.as_ref().and_then(|s| s.get(index(ws)).cloned()).filter(|t| valid(t, ws)).unwrap_or_else(|| default_tree(ws))
+            saved
+                .as_ref()
+                .and_then(|s| s.get(index(ws)).cloned())
+                .map(|t| with_terrain(t, ws))
+                .filter(|t| valid(t, ws))
+                .unwrap_or_else(|| default_tree(ws))
         });
         Docks { trees, dirty: false }
     }
@@ -227,6 +254,7 @@ impl Behavior<Pane> for DockBehavior<'_> {
             Pane::ShaderList => app.shader_list(ui),
             Pane::ShaderCode => app.shader_code_pane(ui),
             Pane::ShaderPreview => app.shader_preview_pane(ui),
+            Pane::Terrain => app.terrain_pane(ui),
         };
         let t0 = std::time::Instant::now();
         if pane.padded() {

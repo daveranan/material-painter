@@ -872,7 +872,44 @@ pub fn export(s: &Snapshot, template: &Template, settings: &Settings) -> Result<
     if only_baked && !s.has_bake {
         return Err("Bake mesh maps first.".into());
     }
+    let images = build_maps(s, template, settings)?;
     std::fs::create_dir_all(&settings.folder).map_err(|e| format!("Cannot create folder: {e}"))?;
+    let mut files: Vec<PathBuf> = template
+        .maps
+        .par_iter()
+        .zip(images.par_iter())
+        .map(|(map, img)| {
+            let path = settings.folder.join(settings.file_name(map));
+            write(img, map, settings, &path).map_err(|e| format!("Failed to write {}: {e}", path.display()))?;
+            Ok(path)
+        })
+        .collect::<Result<_, String>>()?;
+    let uses_features = template.maps.iter().any(|m| m.chans[..m.layout.channels()].iter().any(|c| c.src == Source::Features));
+    if let Some((_, features)) = s.features.as_ref().filter(|_| uses_features) {
+        files.push(write_manifest(template, settings, features, settings.size.unwrap_or(s.res))?);
+    }
+    Ok(files)
+}
+
+/// The two maps the terrain preview reads, laid out like "Game material
+/// (features)" but without the feature masks (so untagged documents work):
+/// sRGB color + height, then the DirectX normal's xy.
+pub fn preview_template() -> Template {
+    use Source::*;
+    Template {
+        name: "Terrain preview".into(),
+        maps: vec![
+            OutputMap::packed("$project_ColorHeight", Layout::Rgba, [Chan::of(BaseColor, 0), Chan::of(BaseColor, 1), Chan::of(BaseColor, 2), Chan::of(Height, 0)]),
+            OutputMap::packed("$project_NormalMasks", Layout::Rgba, [Chan::of(NormalDx, 0), Chan::of(NormalDx, 1), C0, C0]),
+        ],
+        builtin: true,
+    }
+}
+
+/// Every map of `template` as straight-alpha float images at the output
+/// size, in template order, without writing anything (export and the
+/// terrain preview's live material both use it).
+pub fn build_maps(s: &Snapshot, template: &Template, settings: &Settings) -> Result<Vec<ImageBuffer<Rgba<f32>, Vec<f32>>>, String> {
     let res = s.res;
     let n = (res * res) as usize;
     let padding = match settings.padding {
@@ -898,7 +935,7 @@ pub fn export(s: &Snapshot, template: &Template, settings: &Settings) -> Result<
         return Err("This template exports feature masks: name the texture set's features and tag layers with them first.".into());
     }
 
-    let mut files: Vec<PathBuf> = template
+    template
         .maps
         .par_iter()
         .map(|map| {
@@ -944,15 +981,9 @@ pub fn export(s: &Snapshot, template: &Template, settings: &Settings) -> Result<
                     }
                 }
             }
-            let path = settings.folder.join(settings.file_name(map));
-            write(&img, map, settings, &path).map_err(|e| format!("Failed to write {}: {e}", path.display()))?;
-            Ok(path)
+            Ok(img)
         })
-        .collect::<Result<_, String>>()?;
-    if let Some((_, features)) = s.features.as_ref().filter(|_| uses_features) {
-        files.push(write_manifest(template, settings, features, out_size)?);
-    }
-    Ok(files)
+        .collect()
 }
 
 /// The material's name: the project's, with the texture set's when the

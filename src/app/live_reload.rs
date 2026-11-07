@@ -100,10 +100,37 @@ fn disk_fingerprint(path: &Path) -> Result<Fingerprint, String> {
     let mut files = Vec::with_capacity(refs.len());
     for rel in refs {
         // A missing file still fingerprints (as empty); loading reports it.
-        let bytes = data_path(&dir, rel).ok().and_then(|p| std::fs::read(p).ok()).unwrap_or_default();
+        let path = data_path(&dir, rel).ok();
+        let mut bytes = path.as_ref().and_then(|p| std::fs::read(p).ok()).unwrap_or_default();
+        // A script's includes count as part of it: editing a shared library
+        // reloads every graph whose script includes it.
+        if rel.ends_with(".mat") {
+            for inc in script_includes(&dir, &bytes, 0) {
+                bytes.extend(std::fs::read(&inc).unwrap_or_default());
+            }
+        }
         files.push((rel, bytes));
     }
     Ok(fingerprint(&text, files.iter().map(|(r, b)| (*r, b.as_slice()))))
+}
+
+/// The files a material script includes (`include "path"`, relative to the
+/// data folder, read only; may point beside the project), nested ones too.
+fn script_includes(dir: &Path, script: &[u8], depth: u32) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if depth > 8 {
+        return out;
+    }
+    for line in String::from_utf8_lossy(script).lines() {
+        let Some(rest) = line.trim().strip_prefix("include ") else { continue };
+        let rest = rest.split('#').next().unwrap_or("").trim();
+        let Some(rel) = rest.strip_prefix('"').and_then(|r| r.strip_suffix('"')) else { continue };
+        let p = dir.join(rel);
+        let text = std::fs::read(&p).unwrap_or_default();
+        out.push(p);
+        out.extend(script_includes(dir, &text, depth + 1));
+    }
+    out
 }
 
 impl LiveProject {
@@ -147,7 +174,7 @@ impl LiveProject {
         let (Some(parent), dir) = (path.parent(), data_dir_of(path)) else { return };
         let _ = std::fs::create_dir_all(&dir);
         let (tx, rx) = mpsc::channel();
-        let (manifest, data) = (path.to_path_buf(), dir.clone());
+        let (manifest, data, folder) = (path.to_path_buf(), dir.clone(), parent.to_path_buf());
         let ctx = self.ctx.clone();
         let w = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
             let Ok(e) = res else { return };
@@ -155,7 +182,9 @@ impl LiveProject {
                 return;
             }
             // Temporary files of atomic writes don't count, their rename does.
-            let relevant = |p: &PathBuf| (p == &manifest || p.starts_with(&data)) && !p.extension().is_some_and(|x| x == "tmp");
+            // Shared script libraries live beside the project: any `.mat` under its folder counts.
+            let script = |p: &PathBuf| p.extension().is_some_and(|x| x == "mat") && p.starts_with(&folder);
+            let relevant = |p: &PathBuf| (p == &manifest || p.starts_with(&data) || script(p)) && !p.extension().is_some_and(|x| x == "tmp");
             if e.paths.iter().any(relevant) {
                 let _ = tx.send(());
                 if let Some(ctx) = &ctx {
@@ -164,7 +193,8 @@ impl LiveProject {
             }
         });
         if let Ok(mut w) = w {
-            let ok = w.watch(parent, notify::RecursiveMode::NonRecursive).is_ok() && w.watch(&dir, notify::RecursiveMode::Recursive).is_ok();
+            // The project's folder recursively: its data folder and any shared script library beside it.
+            let ok = w.watch(parent, notify::RecursiveMode::Recursive).is_ok();
             if ok {
                 self._watcher = Some(w);
                 self.changes = Some(rx);

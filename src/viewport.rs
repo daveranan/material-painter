@@ -93,7 +93,7 @@ impl ViewMode {
 }
 
 /// Right-handed perspective with [0, 1] depth (wgpu convention).
-fn perspective_rh(fov_y: f32, aspect: f32, near: f32, far: f32) -> Mat4 {
+pub(crate) fn perspective_rh(fov_y: f32, aspect: f32, near: f32, far: f32) -> Mat4 {
     let f = 1.0 / (fov_y * 0.5).tan();
     let r = far / (near - far);
     Mat4::from_cols(
@@ -104,7 +104,7 @@ fn perspective_rh(fov_y: f32, aspect: f32, near: f32, far: f32) -> Mat4 {
     )
 }
 
-fn look_at_rh(eye: Vec3, center: Vec3, up: Vec3) -> Mat4 {
+pub(crate) fn look_at_rh(eye: Vec3, center: Vec3, up: Vec3) -> Mat4 {
     let f = (center - eye).normalize();
     let s = f.cross(up).normalize();
     let u = s.cross(f);

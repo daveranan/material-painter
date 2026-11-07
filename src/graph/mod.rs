@@ -48,6 +48,9 @@ pub struct Graph {
     pub script_file: Option<String>,
     /// The script's named steps and the node each ended at.
     pub steps: Vec<(String, u64)>,
+    /// The folder the script's relative image and include paths resolve in
+    /// (the project's data folder), kept so saving can recompile it.
+    pub script_base: Option<PathBuf>,
 }
 
 impl Graph {
@@ -61,6 +64,7 @@ impl Graph {
             script: None,
             script_file: None,
             steps: Vec::new(),
+            script_base: None,
         }
     }
 
@@ -183,7 +187,7 @@ impl Graph {
         // A script graph saves its script while the nodes still match it
         // (positions aside); edited on the canvas, it saves its nodes.
         if let Some(src) = &self.script {
-            if script::compile(src, lib, None).is_ok_and(|g| g.res == self.res && same_nodes(&g, self)) {
+            if script::compile(src, lib, self.script_base.as_deref()).is_ok_and(|g| g.res == self.res && same_nodes(&g, self)) {
                 return match &self.script_file {
                     Some(f) => json!({"name": self.name, "script_file": f}),
                     None => json!({"name": self.name, "script": src}),
@@ -227,6 +231,7 @@ impl Graph {
             }
             g.script = Some(src.to_string());
             g.script_file = v["script_file"].as_str().map(str::to_string);
+            g.script_base = base.map(Path::to_path_buf);
             return Ok(g);
         }
         let mut g = Graph::new(v["name"].as_str().unwrap_or("Graph"));

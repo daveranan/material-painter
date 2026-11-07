@@ -546,6 +546,32 @@ pub fn tool_list() -> Vec<Value> {
                 "step": {"type": "string", "description": "A name assigned in the script, e.g. 'stones'"}
             }), &[]),
         ),
+        tool(
+            "terrain_preview",
+            "Terrain blend preview: up to four feature materials on a heightmap, placed by the game's splat (slot 0 base soil, 1 drifts, 2 patches, 3 slopes and outcrops) and blended by the game's height rule with anti-tiling. Every argument is optional and sticks; returns a render (PNG) and the preview's state. Also shown live in the Terrain tab.",
+            schema(json!({
+                "slots": {"type": "array", "description": "Up to 4 entries: \"live\" (the open document), a path to a game export's <name>.material.json, or null (empty)"},
+                "heightmap": {"type": "string", "description": "\"sample\", a stamp name from the stamps folder (e.g. 'Hill 1R'), or a greyscale image path"},
+                "stamps_folder": {"type": "string", "description": "A landscape stamp folder with a Library.json (remembered)"},
+                "footprint": {"type": "number", "description": "Ground size in metres (a heightmap file's; stamps carry their own)"},
+                "amplitude": {"type": "number", "description": "Ground height in metres, black to white"},
+                "blend_depth": {"type": "number", "description": "The game's blend depth (look.y), default 0.12"},
+                "anti_tiling": {"type": "boolean"},
+                "show_weights": {"type": "boolean", "description": "Draw the blended weights as flat colours (slot 0 red, 1 green, 2 blue, 3 yellow)"},
+                "splat_scale": {"type": "number", "description": "Scales the splat pattern's sizes (1 = the game's)"},
+                "camera": {"type": "string", "enum": ["player", "close", "overview"]},
+                "yaw": {"type": "number", "description": "Camera yaw, radians"},
+                "pitch": {"type": "number", "description": "Camera pitch, radians"},
+                "distance": {"type": "number", "description": "Camera distance, metres"},
+                "x": {"type": "number", "description": "Camera target x, metres"},
+                "z": {"type": "number", "description": "Camera target z, metres"},
+                "sun_azimuth": {"type": "number"},
+                "sun_elevation": {"type": "number"},
+                "width": {"type": "integer", "description": "Render width (default 1280)"},
+                "height": {"type": "integer", "description": "Render height (default 720)"},
+                "render": {"type": "boolean", "description": "Return a render (default true)"}
+            }), &[]),
+        ),
     ]
 }
 

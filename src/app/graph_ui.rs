@@ -91,6 +91,9 @@ pub(super) struct GraphStore {
     /// Keeps the user node folder watched; changes arrive on `changes`.
     _watcher: Option<notify::RecommendedWatcher>,
     changes: Option<mpsc::Receiver<()>>,
+    /// Graphs of the open project that didn't load (a script error), kept
+    /// so `get_state` and the status line report them.
+    pub load_errors: Vec<String>,
 }
 
 fn graphs_dir() -> Option<PathBuf> {
@@ -149,6 +152,7 @@ impl GraphStore {
             gallery: Default::default(),
             _watcher: watcher,
             changes,
+            load_errors: Vec::new(),
         };
         store.reload_shelf(ctx);
         store
@@ -198,6 +202,7 @@ impl GraphStore {
             renderer.free_texture(&tex);
         }
         self.docs.clear();
+        self.load_errors.clear();
         self.editor.doc = None;
         self.editor.selected = None;
     }
@@ -514,7 +519,7 @@ impl PainterApp {
             for li in 0..engine.layers.len() {
                 let l = &engine.layers[li];
                 let Content::Fill(f) = &l.content else { continue };
-                let Some(id) = f.graph.filter(|_| l.images.iter().all(Option::is_none)) else { continue };
+                let Some(id) = f.graph.filter(|_| l.images[..4].iter().all(Option::is_none)) else { continue };
                 let Some(d) = docs.iter_mut().find(|d| d.id == id && !d.shading) else { continue };
                 let version = engine.maps_version;
                 {

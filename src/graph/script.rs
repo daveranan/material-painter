@@ -41,11 +41,43 @@ pub fn compile(source: &str, lib: &Library, base: Option<&Path>) -> Result<Graph
     let mut c = Compiler { lib, base, graph: Graph::new("Script"), fns: HashMap::new(), globals: HashMap::new(), steps: Vec::new() };
     let prelude = parse(&tokenize(PRELUDE).map_err(|e| format!("prelude: {e}"))?).map_err(|e| format!("prelude: {e}"))?;
     c.run(&prelude, true)?;
-    let stmts = parse(&tokenize(source)?)?;
+    let source = expand_includes(source, base, 0)?;
+    let stmts = parse(&tokenize(&source)?)?;
     c.run(&stmts, false)?;
     layout(&mut c.graph);
     c.graph.steps = c.steps;
     Ok(c.graph)
+}
+
+/// Replaces each `include "path"` line with that file's text (its own
+/// includes expanded too), so materials can share a library of steps and
+/// `fn` layers. Paths are relative to `base`, the project's data folder,
+/// like image paths. Included text keeps no line numbers of its own: an
+/// error inside it is reported at the including line's file position.
+fn expand_includes(src: &str, base: Option<&Path>, depth: u32) -> Result<String, String> {
+    if !src.lines().any(|l| l.trim_start().starts_with("include ")) {
+        return Ok(src.to_string());
+    }
+    if depth > 8 {
+        return Err("include: nested more than 8 deep (an include loop?)".into());
+    }
+    let mut out = String::with_capacity(src.len());
+    for (i, line) in src.lines().enumerate() {
+        let t = line.trim();
+        let Some(rest) = t.strip_prefix("include ") else {
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        };
+        let rest = rest.split('#').next().unwrap_or("").trim();
+        let path = rest.strip_prefix('"').and_then(|r| r.strip_suffix('"')).ok_or_else(|| format!("line {}: include needs a path in quotes", i + 1))?;
+        let base = base.ok_or_else(|| format!("line {}: include needs a project data folder (scripts in a text project)", i + 1))?;
+        let file = base.join(path);
+        let text = std::fs::read_to_string(&file).map_err(|e| format!("line {}: include \"{path}\": {e}", i + 1))?;
+        out.push_str(&expand_includes(&text, Some(base), depth + 1).map_err(|e| format!("in \"{path}\": {e}"))?);
+        out.push('\n');
+    }
+    Ok(out)
 }
 
 // ------------------------------------------------------------------ tokens
@@ -841,6 +873,22 @@ output base_color = gradient_map(height, dark=#4a3b2a, light=#c2ab86)
         assert_eq!(blur.links.get("input"), Some(&ts.id));
         let gm = g.nodes.iter().find(|n| n.def == "gradient_map").unwrap();
         assert_eq!(gm.params.get("dark"), Some(&Value::Color([0x4a as f32 / 255.0, 0x3b as f32 / 255.0, 0x2a as f32 / 255.0])));
+    }
+
+    #[test]
+    fn includes_share_steps_and_saving_keeps_a_bitmap_script() {
+        let dir = std::env::temp_dir().join(format!("mp_script_include_{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("lib")).unwrap();
+        std::fs::write(dir.join("lib/ground.mat"), "fn bumps(s) {\n  return noise(perlin, scale=s)\n}\nsoil = #6a5038\n").unwrap();
+        let src = "include \"lib/ground.mat\"\nh = bumps(5)\nscan = bitmap(image=\"scans/x.jpg\")\noutput height = h\noutput base_color = mix(scan, soil, h)\n";
+        let lib = lib();
+        assert!(compile(src, &lib, None).unwrap_err().contains("data folder"));
+        let g = Graph::from_json_in(&serde_json::json!({"name": "G", "script": src, "script_file": "scripts/g.mat"}), &lib, Some(&dir)).unwrap();
+        assert!(g.nodes.iter().any(|n| n.def == "noise" && n.params.get("scale") == Some(&Value::Int(5))));
+        // Saving recompiles in the same folder, so the absolute bitmap path
+        // matches and the project keeps pointing at the script file.
+        assert_eq!(g.to_json(&lib), serde_json::json!({"name": "G", "script_file": "scripts/g.mat"}));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

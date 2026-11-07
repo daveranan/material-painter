@@ -48,6 +48,7 @@ mod shelf_previews;
 mod mode_icons;
 mod texture_sets;
 mod mesh_set;
+mod terrain_ui;
 
 use export_ui::{ExportDialog, open_in_file_browser};
 use graph_ui::GraphStore;
@@ -468,6 +469,8 @@ pub struct PainterApp {
     prefs_ui: PrefsUi,
     /// Material graphs: the node library, the graphs layers use, the editor.
     graphs: GraphStore,
+    /// The terrain blend preview pane's state (made when the pane first shows).
+    terrain: terrain_ui::TerrainState,
     workspace: Workspace,
     /// The docked panel layouts of the workspaces.
     docks: dock::Docks,
@@ -1666,6 +1669,7 @@ impl PainterApp {
             prefs,
             prefs_ui: PrefsUi { open: false, page: prefs::Page::General },
             graphs: GraphStore::new(&cc.egui_ctx),
+            terrain: Default::default(),
             workspace: Workspace::Paint,
             docks: dock::Docks::load(),
             drew_3d: false,
@@ -1818,6 +1822,9 @@ impl PainterApp {
                     match out_of_memory_guard(&rs.device, || entry.upload(&rs.device, &rs.queue)) {
                         Ok((maps, report)) => {
                             self.status = format!("Loaded {} cached mesh maps ({}², from {}).", report.baked.count_ones(), report.resolution, report.source);
+                            if let Some(e) = self.graphs.load_errors.first() {
+                                self.status = format!("A material graph didn't load: {e}");
+                            }
                             if let Some(e) = self.set_engine_mut(self.sets.baking) {
                                 e.set_maps(maps, Arc::new(report));
                             }

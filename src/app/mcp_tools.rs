@@ -139,6 +139,20 @@ impl PainterApp {
     }
 
     fn run_tool(&mut self, tool: &str, args: &Value, ctx: &egui::Context) -> Reply {
+        // MCP calls run before the frame's graph update: tools that read the
+        // material bring the material graphs up to date first, so a render or
+        // export right after opening or editing a project never captures
+        // layers whose graph outputs haven't been pushed yet.
+        if matches!(tool, "render" | "render_view" | "export_textures" | "script_step" | "get_layer_thumbnail") {
+            self.update_graphs();
+        }
+        // The selection blink (a tint over the selected layer for a moment
+        // after selecting, e.g. right after a project opens) is UI feedback,
+        // never part of a render: end it before rendering.
+        if matches!(tool, "render" | "render_view") {
+            self.highlight = self.highlight.map(|(id, _)| (id, std::time::Instant::now() - std::time::Duration::from_secs(10)));
+            self.engine.highlight = 0.0;
+        }
         match self.try_tool(tool, args, ctx) {
             Ok(r) => r,
             Err(e) => Reply::Now(Err(e)),
@@ -1061,6 +1075,105 @@ impl PainterApp {
                 }))
             }
             "screenshot_app" => Reply::AfterScreenshot,
+            "terrain_preview" => {
+                let f = |k: &str| args.get(k).and_then(Value::as_f64).map(|v| v as f32);
+                let b = |k: &str| args.get(k).and_then(Value::as_bool);
+                if let Some(folder) = str_arg(args, "stamps_folder") {
+                    self.prefs.terrain_stamps = folder.to_string();
+                    let _ = self.prefs.save();
+                }
+                if let Some(slots) = args.get("slots").and_then(Value::as_array) {
+                    for (k, v) in slots.iter().enumerate().take(crate::terrain::SLOTS) {
+                        let source = super::terrain_ui::slot_source(v)?;
+                        self.set_terrain_slot(k, source).map_err(|e| format!("slot {k}: {e}"))?;
+                    }
+                }
+                if let Some(h) = str_arg(args, "heightmap") {
+                    if h.eq_ignore_ascii_case("sample") {
+                        let img = image::load_from_memory(include_bytes!("../../assets/terrain/sample_height.png")).map_err(|e| e.to_string())?;
+                        let rs = self.rs.clone();
+                        let t = self.terrain.preview.get_or_insert_with(|| crate::terrain::TerrainPreview::new(&rs));
+                        let ground = crate::terrain::Ground { name: "Sample".into(), footprint_m: f("footprint").unwrap_or(160.0), amplitude_m: f("amplitude").unwrap_or(9.0) };
+                        t.set_height(&rs.queue, &img, ground);
+                    } else if let Some(i) = self.terrain_stamps().iter().position(|s| s.name.eq_ignore_ascii_case(h)) {
+                        self.set_terrain_stamp(i)?;
+                    } else {
+                        let p = std::path::Path::new(h);
+                        if !p.exists() {
+                            let names: Vec<String> = self.terrain_stamps().iter().take(12).map(|s| s.name.clone()).collect();
+                            return Err(format!("heightmap '{h}': not a file or a stamp name (stamps: {}...)", names.join(", ")));
+                        }
+                        self.set_terrain_heightmap(p, f("footprint").unwrap_or(160.0), f("amplitude").unwrap_or(9.0))?;
+                    }
+                }
+                let rs = self.rs.clone();
+                let t = self.terrain.preview.get_or_insert_with(|| crate::terrain::TerrainPreview::new(&rs));
+                if str_arg(args, "heightmap").is_none() {
+                    if let Some(v) = f("footprint") {
+                        t.ground.footprint_m = v.max(1.0);
+                    }
+                    if let Some(v) = f("amplitude") {
+                        t.ground.amplitude_m = v.max(0.0);
+                    }
+                }
+                let s = &mut t.settings;
+                if let Some(v) = f("blend_depth") {
+                    s.blend_depth = v.clamp(0.001, 1.0);
+                }
+                if let Some(v) = b("anti_tiling") {
+                    s.anti_tiling = v;
+                }
+                if let Some(v) = b("show_weights") {
+                    s.show_weights = v;
+                }
+                if let Some(v) = f("splat_scale") {
+                    s.splat_scale = v.clamp(0.05, 20.0);
+                }
+                if let Some(v) = f("sun_azimuth") {
+                    s.sun_azimuth = v;
+                }
+                if let Some(v) = f("sun_elevation") {
+                    s.sun_elevation = v.clamp(1.0, 89.0);
+                }
+                if let Some(c) = str_arg(args, "camera") {
+                    t.camera_preset(c);
+                }
+                if let Some(v) = f("yaw") {
+                    t.cam.yaw = v;
+                }
+                if let Some(v) = f("pitch") {
+                    t.cam.pitch = v.clamp(0.02, 1.55);
+                }
+                if let Some(v) = f("distance") {
+                    t.cam.dist = v.clamp(0.3, 2000.0);
+                }
+                if f("x").is_some() || f("z").is_some() {
+                    let (x, z) = (f("x").unwrap_or(t.cam.target.x), f("z").unwrap_or(t.cam.target.z));
+                    t.cam.target = glam::Vec3::new(x, t.ground_y(x, z), z);
+                }
+                let source = |s: &crate::terrain::SlotSource| match s {
+                    crate::terrain::SlotSource::Empty => Value::Null,
+                    crate::terrain::SlotSource::Live => json!("live"),
+                    crate::terrain::SlotSource::File(p) => json!(p.display().to_string()),
+                };
+                let state = json!({
+                    "slots": (0..crate::terrain::SLOTS).map(|k| json!({
+                        "role": crate::terrain::SLOT_ROLES[k],
+                        "source": source(&t.sources[k]),
+                        "material": t.slots[k].as_ref().map(|i| json!({"name": i.name, "tile_m": i.tile_m, "relief_m": i.relief_m})),
+                    })).collect::<Vec<_>>(),
+                    "ground": {"name": t.ground.name, "footprint_m": t.ground.footprint_m, "amplitude_m": t.ground.amplitude_m},
+                    "settings": {"blend_depth": t.settings.blend_depth, "anti_tiling": t.settings.anti_tiling, "show_weights": t.settings.show_weights, "splat_scale": t.settings.splat_scale},
+                    "camera": {"x": t.cam.target.x, "z": t.cam.target.z, "yaw": t.cam.yaw, "pitch": t.cam.pitch, "distance": t.cam.dist},
+                });
+                if b("render") == Some(false) {
+                    return Ok(json_text(state));
+                }
+                let w = args.get("width").and_then(Value::as_u64).unwrap_or(1280).clamp(16, 4096) as u32;
+                let h = args.get("height").and_then(Value::as_u64).unwrap_or(720).clamp(16, 4096) as u32;
+                let (px, w, h) = t.render_image(&rs.device, &rs.queue, [w, h]);
+                Reply::Now(png(&px, w, h).map(|p| vec![Out::Png(p), Out::Text(state.to_string())]))
+            }
             "script_step" => {
                 let scripts: Vec<(u64, Vec<String>)> = self.script_graphs();
                 let id = match args.get("graph").and_then(Value::as_u64) {
@@ -1272,6 +1385,7 @@ impl PainterApp {
             "project": self.project_path.as_ref().map(|p| p.display().to_string()),
             "unsaved_changes": self.is_modified(),
             "live_reload": self.live_reload_json(),
+            "graph_errors": self.graphs.load_errors,
             "status": self.status,
         })
     }

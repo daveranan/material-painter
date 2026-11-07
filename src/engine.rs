@@ -1937,10 +1937,13 @@ impl Engine {
     /// (derived data: no history entry).
     pub fn set_graph_images(&mut self, idx: usize, outputs: [Option<Arc<Tex>>; 4], name: &str) {
         let Some(layer) = self.layers.get_mut(idx) else { return };
-        // Graphs output the four paint channels; normal and emission images stay unset.
+        // Graphs output the four paint channels. A normal image the layer
+        // already has (a scan's own normal) stays: the graph cleans the scan's
+        // color and height, the scan keeps its fine normal detail.
         let [a, b, c, d] = outputs;
         let [a, b, c, d] = [a, b, c, d].map(|o| o.map(|tex| FillImage { tex, name: name.to_string(), encoded: Arc::new(Vec::new()), text: None }));
-        layer.images = [a, b, c, d, None, None];
+        let normal = layer.images[NORMAL_CH].take();
+        layer.images = [a, b, c, d, normal, None];
         self.mark_dirty();
     }
 

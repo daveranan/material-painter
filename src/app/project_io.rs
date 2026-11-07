@@ -897,13 +897,14 @@ impl PainterApp {
                     "layers": mask_layers_json(&m.layers),
                 })
             });
-            // A graph's outputs are rendered again on load, not stored.
+            // A graph's outputs are rendered again on load, not stored; a
+            // normal image beside them is the layer's own and is kept.
             let from_graph = matches!(&l.content, Content::Fill(p) if p.graph.is_some());
             let images: Vec<Value> = l
                 .images
                 .iter()
                 .enumerate()
-                .map(|(k, im)| (k, im.as_ref().filter(|_| !from_graph)))
+                .map(|(k, im)| (k, im.as_ref().filter(|_| !from_graph || k == crate::engine::NORMAL_CH)))
                 .map(|(k, im)| {
                     im.map_or(Value::Null, |im| {
                         let mut v = json!({"name": im.name, "data": w.encoded(&im.encoded, &format!("{base}_image{k}"))});
@@ -1332,7 +1333,7 @@ impl PainterApp {
                 Ok(g) => {
                     self.graphs.insert(&self.rs, g, Some(id));
                 }
-                Err(e) => self.status = format!("A material graph didn't load: {e}"),
+                Err(e) => self.graphs.load_errors.push(format!("graph {id}: {e}")),
             }
         }
         for (k, sv) in set_values.iter().enumerate().take(set_count) {

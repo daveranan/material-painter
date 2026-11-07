@@ -73,6 +73,8 @@ pub struct Preferences {
     pub bake_match_by_name: bool,
     // Export
     pub export_folder: String,
+    /// A landscape stamp folder (with a `Library.json`) the terrain preview lists heightmaps from.
+    pub terrain_stamps: String,
     pub export_template: String,
     pub export_format: Format,
     pub export_depth: Depth,
@@ -121,6 +123,7 @@ impl Default for Preferences {
             bake_quality: Quality::Standard,
             bake_match_by_name: true,
             export_folder: std::env::current_dir().map(|p| p.join("export").display().to_string()).unwrap_or_default(),
+            terrain_stamps: String::new(),
             export_template: "Unreal Engine (packed ORM)".into(),
             export_format: Format::Png,
             export_depth: Depth::U8,
@@ -179,6 +182,7 @@ impl Preferences {
             "bake_quality": self.bake_quality.name(),
             "bake_match_by_name": self.bake_match_by_name,
             "export_folder": self.export_folder,
+            "terrain_stamps": self.terrain_stamps,
             "export_template": self.export_template,
             "export_format": self.export_format.name(),
             "export_depth": self.export_depth.name(),
@@ -226,6 +230,7 @@ impl Preferences {
             bake_quality: v["bake_quality"].as_str().and_then(|n| Quality::ALL.into_iter().find(|q| q.name() == n)).unwrap_or(d.bake_quality),
             bake_match_by_name: b("bake_match_by_name", d.bake_match_by_name),
             export_folder: s("export_folder", &d.export_folder),
+            terrain_stamps: s("terrain_stamps", &d.terrain_stamps),
             export_template: s("export_template", &d.export_template),
             export_format: v["export_format"].as_str().and_then(Format::from_name).unwrap_or(d.export_format),
             export_depth: v["export_depth"]
