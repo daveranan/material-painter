@@ -11,6 +11,10 @@ results fail on restraint and scale, not on missing features: too much grime,
 wear everywhere, height noise on every surface, details sized for a different
 object.
 
+For ground and terrain materials, also load `game-ground-materials`. When
+adjusting color in Material Painter, use the OKLCH nodes (`hcl_adjust`,
+`hcl_flatten`, `match_mean`), not HSV: an HSV hue turn changes brightness.
+
 Read `references/pbr-values.md` for the numbers, `references/normals-height.md`
 before touching height or normal channels, and `references/large-objects.md`
 for anything big (ships, buildings, vehicles, machines). Sources are listed in

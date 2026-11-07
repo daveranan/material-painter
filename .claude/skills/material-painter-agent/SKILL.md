@@ -55,6 +55,15 @@ it that way. Never split a textured trimesh into submeshes (each copy holds
 the full texture).
 
 ## Building the stack
+Color work on any scan or image layer goes through Material Designer's
+color nodes, not the HSV `hsl` node: `hcl_adjust` (hue moves keep
+lightness), `hcl_flatten` (narrow a scan's range toward its average),
+`match_mean` (make two sources one color), `auto_level` (centre noises and
+roughness maps; never height), `color_to_mask` (split a feature out by
+color). Build a material's height, masks and color as a Designer graph when
+it is procedural; keep the layer stack for combining materials (height
+blend, feature tags).
+
 Quick structure through the CLI, then detail in the JSON:
 - `mp add_layer kind=smart preset="Painted Steel Worn"` gives a folder of
   masked fill layers (base, chips, scratches, grime, dust, micro layers).
@@ -256,6 +265,8 @@ S2, as a comparison sheet). Lessons:
   smeared. Exports and the path tracer still get the UV-space result.
 
 ## Game ground materials (feature masks, CLI handoff)
+For anything ground or terrain, load the `game-ground-materials` skill
+first: brief, height-first build, scan cleanup chain, review loop.
 For games that grade ground per feature (soil, moss, pebbles...): build the
 material from simple scans on a Plane (one fill each, `update_layer images=`
 with color, roughness, height, normal), let upper scans rise through by
