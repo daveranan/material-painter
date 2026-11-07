@@ -380,8 +380,6 @@ enum Action {
     AddGraphMask,
     /// Opens the selected layer's graph in the Material Graph window.
     EditGraph,
-    GraphUndo,
-    GraphRedo,
     /// Opens a custom node in the code editor.
     GraphEditCode(String),
     /// Copies a node into the user folder as a custom node and opens it.
@@ -2030,13 +2028,11 @@ impl PainterApp {
                     }
                 }
                 Action::Undo => {
-                    self.switch_for_history(false);
-                    self.engine.undo(&mut self.undo);
+                    self.history_step(false);
                     self.after_history_step();
                 }
                 Action::Redo => {
-                    self.switch_for_history(true);
-                    self.engine.redo(&mut self.undo);
+                    self.history_step(true);
                     self.after_history_step();
                 }
                 Action::AddPaint => {
@@ -2276,8 +2272,6 @@ impl PainterApp {
                 }
                 Action::AddGraphMask => self.add_graph_mask(),
                 Action::EditGraph => self.edit_selected_graph(),
-                Action::GraphUndo => self.graph_undo(false),
-                Action::GraphRedo => self.graph_undo(true),
                 Action::GraphEditCode(id) => self.open_code(&id),
                 Action::GraphCopyNode(id) => self.new_custom_node(Some(&id), true),
                 Action::GraphRefresh(id) => self.refresh_graph(id),
@@ -2349,6 +2343,8 @@ impl PainterApp {
             _ => self.save_dialog(),
         };
         let Some(path) = path else { return false };
+        // A graph edit still in progress (a focused name field) goes into the file too.
+        self.record_graph_edits();
         match self.save_project(&path) {
             Ok(()) => true,
             Err(e) => {
@@ -2489,6 +2485,24 @@ impl PainterApp {
         }
     }
 
+    /// Undoes (or redoes) one step: on the texture set it edits, with the
+    /// engine applying layer edits and the app graph edits. Graph edits
+    /// still in progress are recorded first, so they are what gets undone.
+    fn history_step(&mut self, redo: bool) {
+        self.record_graph_edits();
+        self.switch_for_history(redo);
+        let done = |s: &UndoStack| if redo { &s.undo } else { &s.redo }.last().map(|e| e.serial);
+        let top = done(&self.undo);
+        if redo {
+            self.engine.redo(&mut self.undo);
+        } else {
+            self.engine.undo(&mut self.undo);
+        }
+        if done(&self.undo) != top {
+            self.graph_history_step(!redo);
+        }
+    }
+
     /// Keeps the selection valid after undo/redo changed the layer stack.
     fn after_history_step(&mut self) {
         if self.selected != NO_LAYER {
@@ -2518,15 +2532,14 @@ impl PainterApp {
             if i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::O)) {
                 self.pending.push(Action::OpenProject(None));
             }
-            // Over the graph editor, undo and redo act on the graph.
-            let graph = self.graphs.editor.hovered;
+            // Graph edits share the history with everything else.
             if i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::SHIFT, Key::Z))
                 || i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::Y))
             {
-                self.pending.push(if graph { Action::GraphRedo } else { Action::Redo });
+                self.pending.push(Action::Redo);
             }
             if i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::Z)) {
-                self.pending.push(if graph { Action::GraphUndo } else { Action::Undo });
+                self.pending.push(Action::Undo);
             }
             if i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::G)) {
                 if self.workspace == Workspace::Designer {
@@ -6365,6 +6378,7 @@ impl eframe::App for PainterApp {
         }
         self.sync_brush_tip();
         self.sync_brush_grain();
+        self.commit_graph_edits(&ctx);
         { let t_ = Instant::now(); self.update_graphs(); if self.profile { self.prof.push(("update_graphs".into(), t_.elapsed().as_secs_f32() * 1000.0)); } }
         { let t_ = Instant::now(); self.update_preview_shader(); if self.profile { self.prof.push(("update_preview_shader".into(), t_.elapsed().as_secs_f32() * 1000.0)); } }
         { let t_ = Instant::now(); self.update_cage_preview(&ctx); if self.profile { self.prof.push(("update_cage_preview".into(), t_.elapsed().as_secs_f32() * 1000.0)); } }

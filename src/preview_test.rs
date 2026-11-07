@@ -1002,6 +1002,94 @@ fn graph_presets_render() {
     sheet.save(dir.join("presets.png")).unwrap();
 }
 
+/// Graph edits in the running app: one undo step per interaction (none
+/// while the pointer is held), undone and redone with the keyboard from the
+/// Designer or the paint workspace, re-rendering the graph each time.
+#[test]
+#[ignore]
+fn graph_undo_in_the_app() {
+    use crate::app::{PainterApp, Workspace};
+    use crate::graph::Value;
+    use egui::{Key, Modifiers};
+    let mut setup = egui_wgpu::WgpuSetupCreateNew::without_display_handle();
+    setup.device_descriptor = Arc::new(|adapter| wgpu::DeviceDescriptor {
+        label: Some("ui test device"),
+        required_limits: adapter.limits(),
+        ..Default::default()
+    });
+    let mut harness = egui_kittest::Harness::builder()
+        .with_size([1600.0, 1000.0])
+        .with_pixels_per_point(1.0)
+        .with_accessibility_check(false)
+        .wgpu_setup(egui_wgpu::WgpuSetup::CreateNew(setup))
+        .build_eframe(|cc| PainterApp::new(cc).expect("app starts"));
+    harness.run_steps(4);
+    harness.state_mut().test_close_welcome();
+    harness.state_mut().set_workspace(Workspace::Designer);
+    harness.state_mut().test_add_preset(0);
+    harness.run_steps(10);
+    let (id, start, undo0, _, pixels0) = harness.state_mut().test_graph_state();
+    let pixels0 = pixels0.expect("the preset renders a base color");
+
+    // A slider drag: a new value every frame while the button is held,
+    // one step once it is released.
+    let (node, param) = start
+        .nodes
+        .iter()
+        .find_map(|n| {
+            let lib = crate::graph::Library::load(None);
+            let def = lib.find(&n.def)?;
+            let p = def.params.iter().find(|p| matches!(p.default, Value::Float(_)) && n.def != "output")?;
+            Some((n.id, p.name.clone()))
+        })
+        .expect("a node with a number parameter");
+    let held = egui::pos2(800.0, 995.0);
+    harness.event(egui::Event::PointerMoved(held));
+    harness.event(egui::Event::PointerButton { pos: held, button: egui::PointerButton::Primary, pressed: true, modifiers: Modifiers::NONE });
+    // The harness feeds one kind of event per frame: let the press land.
+    harness.run_steps(2);
+    for f in 0..5 {
+        harness.state_mut().test_edit_graph(id, |g| _ = g.node_mut(node).unwrap().params.insert(param.clone(), Value::Float(0.9 - f as f32 * 0.1)));
+        harness.run_steps(1);
+    }
+    assert_eq!(harness.state_mut().test_graph_state().2, undo0, "nothing recorded mid-drag");
+    harness.event(egui::Event::PointerButton { pos: held, button: egui::PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE });
+    harness.run_steps(6);
+    let (_, edited, undo1, _, pixels1) = harness.state_mut().test_graph_state();
+    assert_eq!(undo1.len(), undo0.len() + 1, "{undo1:?}");
+    assert_eq!(undo1.last().unwrap(), &format!("Change {}", param.replace('_', " ")));
+    let pixels1 = pixels1.unwrap();
+    assert_ne!(pixels1, pixels0, "the edit changes the render");
+
+    // Deleting a node, then undoing both steps with Ctrl+Z.
+    harness.state_mut().test_edit_graph(id, |g| g.remove(node));
+    harness.run_steps(4);
+    assert_eq!(harness.state_mut().test_graph_state().2.last().unwrap(), "Delete node");
+    harness.key_press_modifiers(Modifiers::COMMAND, Key::Z);
+    harness.run_steps(4);
+    assert_eq!(harness.state_mut().test_graph_state().1, edited);
+    harness.key_press_modifiers(Modifiers::COMMAND, Key::Z);
+    harness.run_steps(6);
+    let (_, g, undo, redo, pixels) = harness.state_mut().test_graph_state();
+    assert_eq!(g, start, "undone to the preset");
+    assert_eq!(undo, undo0);
+    assert_eq!(redo.len(), 2);
+    assert_eq!(pixels.unwrap(), pixels0, "undo renders the graph again");
+
+    // Redo from the paint workspace: one history for the whole document.
+    harness.state_mut().set_workspace(Workspace::Paint);
+    harness.run_steps(2);
+    harness.key_press_modifiers(Modifiers::COMMAND | Modifiers::SHIFT, Key::Z);
+    harness.run_steps(6);
+    let (_, g, _, _, pixels) = harness.state_mut().test_graph_state();
+    assert_eq!(g, edited);
+    assert_eq!(pixels.unwrap(), pixels1, "redo renders the graph again");
+    harness.key_press_modifiers(Modifiers::COMMAND, Key::Y);
+    harness.run_steps(4);
+    let (_, g, _, redo, _) = harness.state_mut().test_graph_state();
+    assert!(g.node(node).is_none() && redo.is_empty());
+}
+
 /// Screenshots of the real UI, rendered offscreen by egui_kittest (no
 /// window): every workspace, written to `target/bake_test/ui/`.
 #[test]
