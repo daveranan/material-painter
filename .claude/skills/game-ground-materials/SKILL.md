@@ -80,6 +80,21 @@ forms read at the brief's camera distances. In MP: a Plane, Displacement
 - **Fix the scan height range.** Scanned atlases and scans often have a
   tiny height range: Levels them to the brief's relief before blending, or
   they disappear under procedural layers.
+- **Size raised features for the game's displacement grid** (about 5 cm
+  between vertices). Roots, branches and rocks wider than ~5 cm go in
+  height (roots 6-10 cm wide standing 5-8 cm); anything thinner (twigs,
+  grit, small pebbles) is flat texture with a hair of height, or it falls
+  between vertices and reads as a painted pattern. Thin detail looks 3D only
+  when big shapes beside it carry the relief.
+- **Contact shading in the material.** Darken each raised feature's low
+  flanks and a ring of soil beside it (AO from its own height); the game's
+  shadow map is far too coarse for centimetre shadows.
+- **Low contrast between features.** Roots and stones near the soil's
+  value read as shape and shadow; bright sticks on dark soil read as a
+  pattern.
+- **Whole-number repeats only.** A layer tiling or bitmap repeat of 1.5 breaks
+  the material at its tile border. Change feature size with integer repeats
+  (or a larger `tile_m`), never a fractional tiling.
 - **Check tiling at 3x3** (2D view, or `tiling` 3 on a test layer). A
   material that only looks right at 1x has a seam or a stand-out feature
   the eye will find repeating in game.
