@@ -473,6 +473,10 @@ pub struct FillParams {
     /// Height blend: the layer shows only where its height rises above the
     /// stack below, with an edge this soft (height units); 0 is off.
     pub height_blend: f32,
+    /// Height as normal detail: the layer's height slopes go into the normal
+    /// channel and its height into nothing, so fine detail (grain, litter,
+    /// bark) shades without moving a game's displacement or height blend.
+    pub height_detail: bool,
 }
 
 /// The order is the shader's projection index (`composite.wgsl`).
@@ -574,6 +578,7 @@ impl Default for FillParams {
             decal: crate::decal::Decal::default(),
             runoff: None,
             height_blend: 0.0,
+            height_detail: false,
         }
     }
 }
@@ -3391,11 +3396,14 @@ impl Engine {
                 if layer.images[EMISSION_CH].is_some() {
                     bits |= 64;
                 }
+                if f.height_detail {
+                    bits |= 128;
+                }
                 let lin = |c: f32| if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) };
                 let e = f.emission.map(lin).map(|c| c * f.emission_strength);
                 u.emis = [e[0], e[1], e[2], f.emission_strength];
                 let on = |b: bool| if b { 1.0 } else { 0.0 };
-                u.ex = [on(f.normal_on), on(f.emission_on), f.normal_strength, on(f.normal_dx)];
+                u.ex = [on(f.normal_on || f.height_detail), on(f.emission_on), f.normal_strength, on(f.normal_dx)];
                 u.var1 = [f.seed, f.part_var, f.projection as u32 as f32, bits as f32];
                 u.img = [f.tiling, f.rotation, f.offset[0], f.offset[1]];
                 u.dc = f.decal.uniform(f.rotation);
@@ -3628,7 +3636,7 @@ impl Engine {
 
         // Normal and emission cost memory traffic in every pass: only
         // composite them when some layer writes them.
-        let extra = self.layers.iter().any(|l| matches!(&l.content, Content::Fill(f) if f.normal_on || f.emission_on));
+        let extra = self.layers.iter().any(|l| matches!(&l.content, Content::Fill(f) if f.normal_on || f.emission_on || f.height_detail));
         if extra != self.extra_channels {
             self.extra_channels = extra;
             self.full_dirty = true;

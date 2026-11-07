@@ -255,3 +255,34 @@ colour variation), **Color Parametrization by pattern index** (a clean
 per-instance ID for masks and colour), **Max** blending (stones don't add
 through each other). MP's `tile_sampler` today has one pattern on a grid,
 size/position/rotation/brightness random, gaps, Max/Add.
+
+## HD2 split in material scripts (soft height, detail as normal)
+
+The forest biome library (`out/forest_biome/lib/ground.mat`, shared with
+`include "../lib/ground.mat"`) is the worked example. The three pieces:
+
+```
+# Ground layer (main feature, exports the height): soft soil plus swells.
+fn soil_soft() {
+  low = noise(perlin, scale=3, octaves=2, roughness=0.4, seed=101) | auto_levels
+  mid = noise(perlin, scale=10, octaves=2, roughness=0.45, seed=102) | auto_levels
+  return low * 0.14 + mid * 0.05 + 0.06
+}
+# A feature's crisp height above the soil, blurred wide and gained so it
+# survives the game's 7-9 cm mip (radius in texels; 2048 px per 3 m: 14 = 2 cm).
+fn swell(f, s, radius, gain) {
+  return clamp01((clamp01(f - s) | blur(radius=radius)) * gain)
+}
+output height = soil_soft() + max(swell(stone_h, s, 28, 1.5), swell(root_h, s, 40, 2.0))
+
+# Feature layer (height_detail on): crisp near-binary mask that agrees with
+# the crisp height, which only shades the normal map.
+roots = (wide * patch) | histogram_scan(position=0.5, contrast=0.95)
+root_h = 0.15 + (distance(invert(roots), mode=distance, max_distance=0.02) | levels(gamma=2.2)) * 0.7
+output height = root_h
+output mask = roots
+```
+
+A "Ground detail" layer (colour and roughness off, `height_detail`, normal
+strength ~2) carries soil grain, litter, gravel and pebbles as normal only.
+Check with `python tools/game_sim.py <export> <material>` after each export.

@@ -81,11 +81,11 @@ forms read at the brief's camera distances. In MP: a Plane, Displacement
   tiny height range: Levels them to the brief's relief before blending, or
   they disappear under procedural layers.
 - **Size raised features for the game's displacement grid** (about 5 cm
-  between vertices). Roots, branches and rocks wider than ~5 cm go in
-  height (roots 6-10 cm wide standing 5-8 cm); anything thinner (twigs,
-  grit, small pebbles) is flat texture with a hair of height, or it falls
-  between vertices and reads as a painted pattern. Thin detail looks 3D only
-  when big shapes beside it carry the relief.
+  between vertices, sampled at a 7-9 cm mip; see 2b). Roots, branches and
+  rocks wider than ~5 cm carry a soft swell in the displacement height
+  (roots 6-10 cm wide standing 5-8 cm); anything thinner (twigs, grit,
+  small pebbles) is normal detail only. Thin detail looks 3D only when big
+  shapes beside it carry the relief.
 - **Contact shading in the material.** Darken each raised feature's low
   flanks and a ring of soil beside it (AO from its own height); the game's
   shadow map is far too coarse for centimetre shadows.
@@ -106,6 +106,47 @@ In MP the stack is: one fill per element on a Plane, `height_blend` 0.02-0.1
 on each element that should rise through, masks from Designer graphs or
 smart masks, each layer tagged with its feature. Within a Designer graph,
 use `math` Max/Min and `blend` Lighten/Darken for height combining.
+
+## 2b. Split displacement from detail (the HD2 texture set)
+
+What reaches the screen in the game is not the height you painted: it loads
+the material at 1024 and samples the height at the mip its ~5 cm vertex
+grid picks (`lod = log2(step * 1.5 / texel)`; for a 3 m tile that is mip
+~4.7, 7-9 cm per texel). Crisp 6 cm roots and stones lose 60-80% of their
+rise there. Helldivers 2's ground sets solve this, and so do ours now:
+
+- **One soft height for displacement.** A single bottom layer (main
+  feature, usually "Ground") owns the exported height: low, flat soil
+  mounds (`soil_soft`: 1 m and 30 cm noise, 0.08-0.2) plus a **swell**
+  under every big feature: the feature's crisp height above the soil,
+  blurred 4-6 cm and gained so it keeps its rise through the mip
+  (`swell(f, s, radius, gain)`; radius 14-40 texels at 2048 per 3 m,
+  gain 1.5-2.4). Blobs wider than the pieces, never the pieces themselves.
+- **All detail as normal.** Every other layer turns on **Height as normal**
+  (`height_detail: true`): its height shades the normal map at the export's
+  normal-from-height scale and writes no height. A "Ground detail" layer
+  (soil grain, twig litter, gravel, pebbles; colour off, normal strength
+  ~2) plus one layer per feature whose crisp height gives the sharp edges.
+- **Crisp, chunky masks.** Each feature layer's mask is near-binary
+  (`histogram_scan` contrast 0.9+ at the end) and agrees with its height:
+  if the height builds a root only where a value passes 0.5, the mask must
+  cut at the same 0.5. Soft grey masks make the colour, the masks and the
+  displacement disagree (roots in the mask where the height has none).
+- **A separate AO map.** The game template writes `$project_AO`, ambient
+  occlusion from the final height at the material's real tile and relief
+  (white open). Don't bake strong contact AO into colour as well; keep
+  colour contrast moderate.
+- **Rest height.** The manifest's `rest_height` is the main feature's
+  median height (0..1, as stored). Engines should lift displacement from it,
+  not the tile mean, so soil sits at rest and features rise above it.
+- Exported fills: `height` 1.0 (0.5 halves the exported range), metallic
+  off, `tiling` 1, whole-number bitmap repeats only.
+
+Verify against the game, not the 2D view: `python tools/game_sim.py
+<export folder> <name>...` reports each feature's lift above `rest_height`
+after the game's mip, in cm. Aim for features p50 ≥ 2.5 cm, p90 4-7 cm,
+soil within ±1 cm of rest. Below that, widen or gain the swell; never add
+crisp height (it vanishes in the mip and fights the normal map).
 
 ## 3. Masks come from the height
 
@@ -143,7 +184,7 @@ variation small. Exaggerated or contrasty color breaks under grading.
   5. `auto_level` scan roughness maps and noises before blending (never
      height).
 - Curvature and AO into color only at very low strength (edge lift, crevice
-  darkening a few percent); the game adds its own AO from mask 1.
+  darkening a few percent); the exported AO map carries the contact shading.
 - Check value: no albedo under ~0.04 or over ~0.85 linear-ish
   (`pbr-texturing-craft/references/pbr-values.md`); dry soil and sand are
   brighter than people paint them.
@@ -188,7 +229,8 @@ gradient tilt, size, position per shape); `highpass`; `nonuniform_blur`;
 Still missing: layered scattering that settles each stone layer around the
 last automatically (do it by hand: mask the next tile sampler with the
 `shadows` or `ambient_occlusion` of the layers so far), Normal to Height,
-a non-uniform directional warp, world-unit normal and AO, a graph normal
+a non-uniform directional warp, world-unit normal (AO at world scale is the
+export's AO map), a graph normal
 output. Each new node becomes callable from material scripts as soon as it exists
 (the script language calls any node by its id).
 

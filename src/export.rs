@@ -46,6 +46,10 @@ pub enum Source {
     /// Where the texture set's features show (see `engine::Features`):
     /// feature 1, feature 2 and the main feature, summing to 1.
     Features,
+    /// Ambient occlusion from the final height: contact shading where raised
+    /// pieces meet the ground, at the material's physical scale (the
+    /// features' tile and relief); white is open.
+    Occlusion,
     Zero,
     One,
 }
@@ -65,7 +69,7 @@ impl Source {
             Source::Emissive,
         ];
         v.extend((0..MAPS.len()).map(Source::Mesh));
-        v.extend([Source::WorldNormal, Source::Position, Source::Features, Source::Zero, Source::One]);
+        v.extend([Source::WorldNormal, Source::Position, Source::Features, Source::Occlusion, Source::Zero, Source::One]);
         v
     }
 
@@ -85,6 +89,7 @@ impl Source {
             Source::WorldNormal => "World space normal".into(),
             Source::Position => "Position".into(),
             Source::Features => "Feature masks (1, 2, main)".into(),
+            Source::Occlusion => "Ambient occlusion (from height)".into(),
             Source::Zero => "Black (0)".into(),
             Source::One => "White (1)".into(),
         }
@@ -302,6 +307,7 @@ pub fn builtin_templates() -> Vec<Template> {
             vec![
                 OutputMap::packed("$project_ColorHeight", Layout::Rgba, [Chan::of(BaseColor, 0), Chan::of(BaseColor, 1), Chan::of(BaseColor, 2), Chan::of(Height, 0)]),
                 OutputMap::packed("$project_NormalMasks", Layout::Rgba, [Chan::of(NormalDx, 0), Chan::of(NormalDx, 1), Chan::of(Features, 0), Chan::of(Features, 1)]),
+                OutputMap::gray("$project_AO", Chan::of(Occlusion, 0)),
             ],
         ),
         t(
@@ -547,8 +553,8 @@ pub fn template_from(v: &Value) -> Option<Template> {
 // ------------------------------------------------------------------ readback
 
 /// A texture read back as f32 RGBA, whatever its format.
-struct Plane {
-    data: Vec<[f32; 4]>,
+pub(crate) struct Plane {
+    pub(crate) data: Vec<[f32; 4]>,
 }
 
 fn read_plane(device: &wgpu::Device, queue: &wgpu::Queue, tex: &Tex) -> Plane {
@@ -607,7 +613,7 @@ pub struct Snapshot {
     color: Plane,
     rough: Plane,
     metal: Plane,
-    height: Plane,
+    pub(crate) height: Plane,
     /// Painted normal detail (tangent xy at 0.5 + 0.5 n) and emission (linear).
     normal: Plane,
     emission: Plane,
@@ -764,10 +770,50 @@ impl Sources<'_> {
                     .collect(),
                 None => vec![[0.0, 0.0, 1.0]; n],
             },
+            Source::Occlusion => {
+                let (tile, relief) = s.features.as_ref().map_or((2.0, 0.1), |(_, f)| (f.tile_m, f.relief_m));
+                height_occlusion(s, tile, relief).into_iter().map(|a| [a; 3]).collect()
+            }
             Source::Zero => vec![[0.0; 3]; n],
             Source::One => vec![[1.0; 3]; n],
         }
     }
+}
+
+/// Ambient occlusion from the height alone, tiling: for each texel, how
+/// much of the sky the surrounding heights hide, sampled along 8 directions
+/// out to ~6 cm. Heights are in metres (height x relief) over a texel of
+/// tile / res metres, so the shading follows the real slopes a game draws.
+fn height_occlusion(m: &Snapshot, tile_m: f32, relief_m: f32) -> Vec<f32> {
+    let r = m.res as i64;
+    let texel = tile_m.max(1e-3) / m.res as f32;
+    // Metres: the exported height (raw * 0.5 + 0.5) times the relief.
+    let h = |x: i64, y: i64| (m.height.data[(y.rem_euclid(r) * r + x.rem_euclid(r)) as usize][0] * 0.5 + 0.5) * relief_m;
+    let reach = (0.06 / texel).clamp(2.0, 96.0);
+    let steps: Vec<f32> = (1..=6).map(|k| reach * (k as f32 / 6.0).powf(1.6)).collect();
+    let dirs: Vec<(f32, f32)> = (0..8).map(|k| {
+        let a = k as f32 * std::f32::consts::FRAC_PI_4 + 0.3;
+        (a.cos(), a.sin())
+    }).collect();
+    (0..(r * r) as usize)
+        .into_par_iter()
+        .map(|i| {
+            let (x, y) = ((i as i64) % r, (i as i64) / r);
+            let h0 = h(x, y);
+            let mut open = 0.0;
+            for &(dx, dy) in &dirs {
+                // Highest elevation angle seen along this direction.
+                let mut horizon = 0.0f32;
+                for &d in &steps {
+                    let q = h((x as f32 + dx * d).round() as i64, (y as f32 + dy * d).round() as i64);
+                    horizon = horizon.max((q - h0) / (d * texel));
+                }
+                // Fraction of this direction's sky still visible.
+                open += 1.0 - (horizon.atan() / std::f32::consts::FRAC_PI_2).clamp(0.0, 1.0);
+            }
+            (open / dirs.len() as f32).powf(1.5)
+        })
+        .collect()
 }
 
 /// Final tangent-space normal, encoded 0..1: baked normal plus painted
@@ -886,9 +932,27 @@ pub fn export(s: &Snapshot, template: &Template, settings: &Settings) -> Result<
         .collect::<Result<_, String>>()?;
     let uses_features = template.maps.iter().any(|m| m.chans[..m.layout.channels()].iter().any(|c| c.src == Source::Features));
     if let Some((_, features)) = s.features.as_ref().filter(|_| uses_features) {
-        files.push(write_manifest(template, settings, features, settings.size.unwrap_or(s.res))?);
+        files.push(write_manifest(template, settings, features, settings.size.unwrap_or(s.res), rest_height(s))?);
     }
     Ok(files)
+}
+
+/// Where the material's ground sits (0..1 height): the median height of the
+/// main feature (the soil), or of everything without features. A game lifts
+/// the ground by height minus this, so dense raised features (a rock bed)
+/// stand up from the soil instead of the soil sinking below their average.
+fn rest_height(s: &Snapshot) -> f32 {
+    let mut h: Vec<f32> = match &s.features {
+        Some((p, _)) => s.height.data.iter().zip(&p.data).filter(|(_, w)| 1.0 - w[0] - w[1] > 0.5).map(|(h, _)| h[0]).collect(),
+        None => Vec::new(),
+    };
+    if h.len() < 16 {
+        h = s.height.data.iter().map(|v| v[0]).collect();
+    }
+    let mid = h.len() / 2;
+    h.select_nth_unstable_by(mid, |a, b| a.total_cmp(b));
+    // The exported height channel is raw * 0.5 + 0.5 (see Source::Height).
+    h[mid] * 0.5 + 0.5
 }
 
 /// The two maps the terrain preview reads, laid out like "Game material
@@ -1014,7 +1078,7 @@ fn resize_straight(img: &ImageBuffer<Rgba<f32>, Vec<f32>>, size: u32, filter: im
 /// `$project.material.json` (`$project_$set` with several texture sets) beside a feature export: the features by slot, the
 /// size the textures stand for, and what each file's channels hold, so a game
 /// can set the material up from the files alone.
-fn write_manifest(template: &Template, settings: &Settings, f: &Features, size: u32) -> Result<PathBuf, String> {
+fn write_manifest(template: &Template, settings: &Settings, f: &Features, size: u32, rest: f32) -> Result<PathBuf, String> {
     let chan = |c: &Chan| -> Value {
         let what = match c.src {
             Source::BaseColor => ["base_color.r", "base_color.g", "base_color.b"][c.comp.min(2) as usize].to_string(),
@@ -1022,6 +1086,7 @@ fn write_manifest(template: &Template, settings: &Settings, f: &Features, size: 
             Source::NormalGl => ["normal_gl.x", "normal_gl.y", "normal_gl.z"][c.comp.min(2) as usize].to_string(),
             Source::Features => ["mask1", "mask2", "main"][c.comp.min(2) as usize].to_string(),
             Source::Height => "height".into(),
+            Source::Occlusion => "ao".into(),
             s => format!("{}.{}", s.key().to_lowercase(), c.comp),
         };
         json!(if c.invert { format!("1-{what}") } else { what })
@@ -1042,6 +1107,7 @@ fn write_manifest(template: &Template, settings: &Settings, f: &Features, size: 
         // Rounded so the file reads as typed (f32 noise otherwise).
         "tile_m": (f.tile_m as f64 * 1e4).round() / 1e4,
         "relief_m": (f.relief_m as f64 * 1e4).round() / 1e4,
+        "rest_height": (rest as f64 * 1e4).round() / 1e4,
         "size": size,
         "maps": maps,
     });

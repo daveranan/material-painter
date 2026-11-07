@@ -4224,6 +4224,11 @@ impl PainterApp {
                             .on_hover_text("Show this layer only where it rises above the layers below; the edge softness (0: off)")
                             .changed()
                     });
+                    dirty |= labeled(ui, "Height as normal", |ui| {
+                        ui.checkbox(&mut f.height_detail, "")
+                            .on_hover_text("This layer's height shades the normal map only: fine detail (grain, litter, bark) without moving the height a game displaces or height-blends with")
+                            .changed()
+                    });
                 }
             }
             // Which of the texture set's features this layer is (export masks).

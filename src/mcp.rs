@@ -389,6 +389,7 @@ pub fn tool_list() -> Vec<Value> {
                 "runoff": {"description": "Paint running down from a text decal: {source: that layer's index, length (text heights, default 0.8), seed}; this layer then follows the text's place and letters. null removes it."},
                 "text": {"description": "Text decal: a string, or {text, font (installed font name like bahnschrift, arialbd, impact, or a .ttf path), weight (variable fonts, 100-900), spacing (ems)}. Renders the text into the color image (white; the fill color tints it), keeps the decal's height and fits its width."},
                 "tiling": {"type": "number", "description": "Repeats across UV space, or per world unit for tri-planar (mesh is ~2 units across)"},
+                "height_detail": {"type": "boolean", "description": "This fill's height shades the normal map only (fine detail that must not move the exported height a game displaces or height-blends with)"},
                 "height_blend": {"type": "number", "description": "Show this fill only where its height rises above the layers below; the value is the edge softness in height units (0.02-0.2 typical), 0 = off. The mask still lowers it"},
                 "rotation": {"type": "number", "description": "Degrees"},
                 "offset": {"type": "array", "items": {"type": "number"}, "minItems": 2, "maxItems": 2},

@@ -640,6 +640,23 @@ fn layer_values(c: vec2<i32>, uv: vec2<f32>, p: vec3<f32>, n: vec3<f32>, decal: 
             if (extra && (bits & 32u) != 0u && u.ex.x > 0.5) {
                 sn = fill_normal(c, uv, p, n, texel_world);
             }
+            if ((bits & 136u) == 136u) {
+                // Height as normal detail: the layer's height slopes become a
+                // normal (the export's normal-from-height scale, so it reads
+                // as it would in the height), whiteout-blended over its normal
+                // image; its height writes nothing.
+                let res = f32(textureDimensions(prev_color).x);
+                let e = 1.0 / res;
+                let hx = fill_image(l_height, uv + vec2<f32>(e, 0.0), p, n, texel_world).r - fill_image(l_height, uv - vec2<f32>(e, 0.0), p, n, texel_world).r;
+                let hy = fill_image(l_height, uv + vec2<f32>(0.0, e), p, n, texel_world).r - fill_image(l_height, uv - vec2<f32>(0.0, e), p, n, texel_world).r;
+                let k = u.fill_rmh.z * u.ex.z * res / 256.0;
+                let d = normalize(vec3<f32>(-hx * 0.5 * k, hy * 0.5 * k, 1.0));
+                sn = normalize(vec3<f32>(sn.xy + d.xy, sn.z * d.z));
+            }
+            if ((bits & 128u) != 0u) {
+                // Height as normal detail writes no height, image or value.
+                ah = 0.0;
+            }
             if (extra && (bits & 64u) != 0u && u.ex.y > 0.5) {
                 // sRGB image to linear light, times the strength.
                 se = pow(fill_image(l_emis, uv, p, n, texel_world).rgb, vec3<f32>(2.2)) * u.emis.w;

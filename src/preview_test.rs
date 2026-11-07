@@ -243,6 +243,38 @@ fn export_templates() {
     let _ = Depth::U8;
 }
 
+/// A height-detail fill shades the normal channel only: the height below it
+/// stays exactly as it was (HD2-style split of displacement and detail).
+#[test]
+#[ignore]
+fn height_detail_leaves_height() {
+    use crate::engine::{FillParams, MatValues};
+    use crate::export;
+    let mesh = Arc::new(crate::mesh::Primitive::Plane.build());
+    let rs = render_state();
+    let gpu_mesh = GpuMesh::new(&rs.device, &mesh);
+    let mut engine = Engine::new(&rs, &gpu_mesh, (mesh.bounds_min, mesh.bounds_max), 128);
+    let mut undo = crate::undo::UndoStack::default();
+    while !engine.layers.is_empty() {
+        engine.delete_layer(0, &mut undo);
+    }
+    let fill = |height: f32| FillParams {
+        mat: MatValues { enabled: [true, true, false, true], color: [0.4; 3], rough: 0.7, metal: 0.0, height },
+        ..FillParams::default()
+    };
+    engine.add_fill_layer(0, None, "Base".into(), fill(0.3), &mut undo);
+    engine.mark_dirty();
+    engine.composite();
+    let before = export::snapshot(&engine, &rs.device, &rs.queue, mesh.clone()).height.data[64 * 128 + 64][0];
+    let mut detail = fill(0.9);
+    detail.height_detail = true;
+    engine.add_fill_layer(1, None, "Detail".into(), detail, &mut undo);
+    engine.mark_dirty();
+    engine.composite();
+    let after = export::snapshot(&engine, &rs.device, &rs.queue, mesh).height.data[64 * 128 + 64][0];
+    assert!((before - after).abs() < 1e-3, "height moved: {before} -> {after}");
+}
+
 /// A ground tile made of three features exports the game layout: masks say
 /// where each tagged layer still shows (layers above cover those below,
 /// untagged layers change nothing), and the manifest names the features.
@@ -298,7 +330,10 @@ fn feature_material_export() {
         use_baked_normal: false,
     };
     let files = export::export(&snap, &template, &settings).expect("exports");
-    assert_eq!(files.len(), 3, "two maps and the manifest: {files:?}");
+    assert_eq!(files.len(), 4, "three maps and the manifest: {files:?}");
+    // A flat tile is open everywhere: its AO is white.
+    let ao = image::open(root.join("RockMoss_AO.png")).unwrap().to_luma8();
+    assert!(ao.get_pixel(res / 2, res / 2).0[0] > 250, "flat AO is open");
     let b = image::open(root.join("RockMoss_NormalMasks.png")).unwrap().to_rgba8();
     let p = b.get_pixel(res / 2, res / 2).0;
     // Pebbles (0.5) cover half of the moss (0.6): moss 0.3, pebbles 0.5; the
@@ -309,6 +344,9 @@ fn feature_material_export() {
     assert_eq!(manifest["features"]["mask2"], "pebbles");
     assert_eq!(manifest["maps"][1]["channels"][2], "mask1");
     assert_eq!(manifest["relief_m"], 0.05);
+    // The rest height: the main feature's median height, as stored (0..1).
+    let rest = manifest["rest_height"].as_f64().expect("rest_height");
+    assert!((0.0..=1.0).contains(&rest), "rest height in 0..1: {rest}");
 
     // Without tags the template refuses rather than writing empty masks.
     for l in &mut engine.layers {

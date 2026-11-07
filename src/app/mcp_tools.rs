@@ -356,8 +356,9 @@ impl PainterApp {
                 if let Some(b) = blend {
                     layer.blend = b;
                 }
-                const FILL_KEYS: [&str; 26] = [
+                const FILL_KEYS: [&str; 27] = [
                     "height_blend",
+                    "height_detail",
                     "runoff",
                     "decal",
                     "decal_at",
@@ -434,6 +435,9 @@ impl PainterApp {
                         }
                         if let Some(v) = f32_arg(args, "height_blend") {
                             f.height_blend = v.max(0.0);
+                        }
+                        if let Some(v) = args.get("height_detail").and_then(Value::as_bool) {
+                            f.height_detail = v;
                         }
                         if let Some(v) = f32_arg(args, "rotation") {
                             f.rotation = v;

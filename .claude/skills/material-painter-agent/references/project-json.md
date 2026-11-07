@@ -76,15 +76,22 @@ where it is. Export with the "Game material (features)" template.
 // in a layer (a folder's tag covers its contents; untagged layers change nothing):
 "feature": "dirt",            // a name from "features", or 0 / 1 / 2
 // in a fill (any layer that should rise through the one below by height):
-"height_blend": 0.06          // edge softness in height units; 0 = off; the mask still lowers it
+"height_blend": 0.06,         // edge softness in height units; 0 = off; the mask still lowers it
+"height_detail": true         // "Height as normal": this fill's height shades the normal map
+                              // only and writes no height (fine detail that must not move
+                              // the displacement height); MCP set_layer height_detail=true
 ```
 Mask 1 and 2 are where each feature *shows* after layers above cover it
-(they sum to at most 1; main is the rest). Put the crevice feature in mask1:
-the game derives AO from it. `mp export_textures folder=DIR preset="Game
+(they sum to at most 1; main is the rest). Ground sets keep the exported
+height soft (one bottom layer) and put every other layer's height in the
+normal map with `height_detail` (see `game-ground-materials` §2b). `mp export_textures folder=DIR preset="Game
 material (features)" size=1024` writes `<project>_ColorHeight.png` (sRGB color,
-height in A), `<project>_NormalMasks.png` (DirectX normal XY, mask1, mask2) and
-`<project>.material.json` (feature names, tile and relief in metres, and what
-every channel holds).
+height in A), `<project>_NormalMasks.png` (DirectX normal XY, mask1, mask2),
+`<project>_AO.png` (ambient occlusion from the final height at the real tile
+and relief; white open) and `<project>.material.json` (feature names, tile
+and relief in metres, `rest_height`: the main feature's median height 0..1,
+which displacement should lift from, and what every channel holds). The AO
+is also a custom-template source: "Ambient occlusion (from height)".
 
 ## Files
 Blob paths are relative to `name.data/`. Paint textures are PNG (edit them

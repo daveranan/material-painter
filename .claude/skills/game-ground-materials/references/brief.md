@@ -41,7 +41,7 @@ sides can read it:
     "displacement_m": 0.25,
     "compression": "BC7",
     "roughness": "per feature from palette",
-    "ao": "from mask1"
+    "ao": "AO map (from height)"
   },
   "references": ["refs/beach_01.jpg", "refs/riverbed_scan_preview.jpg"],
   "current": {"screenshot": "shots/before_ground.png", "problems": "pebbles float, sand too yellow under Surface palette"},
@@ -58,8 +58,10 @@ bland (chroma under ~0.06) and say so.
 
 The "Game material (features)" export (see `material-painter-agent`'s
 project-json reference): `<material>_ColorHeight.png`,
-`<material>_NormalMasks.png`, `<material>.material.json` (feature names,
-tile_m, relief_m, channel layout), into the game's ground-materials folder.
+`<material>_NormalMasks.png`, `<material>_AO.png`, `<material>.material.json`
+(feature names, tile_m, relief_m, rest_height, channel layout), into the
+game's ground-materials folder. The game should lift displacement from
+`rest_height` (not the tile mean) and shade with the AO map.
 Plus the MP project (`<material>.json` + `.data/`) so any later pass edits
 the same stack.
 
